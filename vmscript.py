@@ -3,13 +3,15 @@ import sys
 import os
 import shutil
 
-vbox_cmd = None
-vbox_path_wsl = "/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe"
+# vbox_cmd = None
+# vbox_path_wsl = "/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe"
 
-if os.path.exists(vbox_path_wsl):
-    vbox_cmd = vbox_path_wsl
-else:
-    vbox_cmd = shutil.which("VBoxManage")
+# if os.path.exists(vbox_path_wsl):
+#     vbox_cmd = vbox_path_wsl
+# else:
+#     vbox_cmd = shutil.which("VBoxManage")
+
+vbox_cmd = r"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"
 
 if not vbox_cmd:
     print("Error: 'VBoxManage' not found.")
