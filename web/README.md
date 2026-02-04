@@ -2,6 +2,24 @@ This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-
 
 ## Getting Started
 
+### Postgres with Docker
+
+From the `web` directory, start Postgres:
+
+```bash
+docker compose up -d db
+```
+
+Then run migrations:
+
+```bash
+npm run db:migrate
+```
+
+The database is configured using `web/.env` (DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME).
+
+### App dev server
+
 First, run the development server:
 
 ```bash
