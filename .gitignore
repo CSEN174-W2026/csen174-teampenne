@@ -66,3 +66,13 @@ Thumbs.db
 *.pem
 coverage/
 *.tsbuildinfo
+
+
+# Ignore Python bytecode and cache
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.env
+.DS_Store
+.vscode/
