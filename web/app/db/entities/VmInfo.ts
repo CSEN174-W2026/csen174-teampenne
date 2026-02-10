@@ -8,6 +8,12 @@ export class VmInfo {
   @Property({ length: 128 })
   name!: string;
 
+  @Property({ length: 128, default: "127.0.0.1" })
+  host!: string;
+
+  @Property({ type: "int", default: 8001 })
+  port!: number;
+
   @Property({ type: "float", default: 0 })
   cpuUsage!: number;
 
@@ -19,10 +25,4 @@ export class VmInfo {
 
   @Property({ type: "int", default: 0 })
   diskGb!: number;
-
-  @Property({ defaultRaw: "current_timestamp" })
-  createdAt: Date = new Date();
-
-  @Property({ defaultRaw: "current_timestamp", onUpdate: () => new Date() })
-  updatedAt: Date = new Date();
 }

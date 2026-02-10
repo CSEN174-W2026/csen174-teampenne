@@ -1,0 +1,1297 @@
+Objective List: 1) Reduce Mean Latency
+Optimize: average response time across jobs.
+Needs (values):
+PlacementResult.observed_latency_ms (per job)
+
+
+Helpful policies:
+Least-loaded: usually reduces average latency under uneven load.
+
+
+Latency-aware (if you add it later): choose node with best predicted completion time.
+
+
+Can hurt:
+Round robin under skewed/bursty load (can send jobs into long queues).
+
+
+Random (baseline; can be quite bad).
+
+
+
+2) Reduce Tail Latency (p95 / p99)
+Optimize: worst-case experience / “slow outliers” (important in real systems).
+Needs:
+per-job latency list → compute p95 or p99 from observed_latency_ms
+
+
+(optional) job “size” / service_time estimate to identify stragglers
+
+
+Helpful policies:
+Least-loaded often helps (avoids piling onto an overloaded node).
+
+
+Shortest-job-first / size-aware (if you add): route large jobs away from busy nodes.
+
+
+Can hurt:
+Round robin (can create outliers during bursts).
+
+
+Greedy mean-latency can sometimes increase tail if it sacrifices a few jobs badly.
+
+
+Great for explanations: “We switched because p95 got worse even though mean stayed okay.”
+
+3) Maximize Throughput (jobs/sec)
+Optimize: total completed jobs per unit time.
+Needs:
+Either:
+
+
+job completion timestamps (started_at_ms, finished_at_ms) OR
+
+
+count of completed jobs + elapsed window time
+
+
+Optional: node service rate estimate / CPU utilization (later)
+
+
+Helpful policies:
+Least-loaded (keeps all nodes busy, reduces idle time).
+
+
+Work-stealing / fill-fastest (later) where you push to nodes that finish sooner.
+
+
+Can hurt:
+Fairness-focused policies might reduce throughput by spreading load inefficiently.
+
+
+Strict round robin can underutilize if nodes have different speeds.
+
+
+
+4) Fairness Across Users (or Job Classes)
+Optimize: prevent one user (or job class) from being consistently slowed down.
+This one is excellent for your “send as user profile” feature.
+Needs:
+each job must have a user_id or class label (job.metadata["user"])
+
+
+per-job latency
+
+
+a fairness metric, e.g.:
+
+
+difference between users’ mean latencies
+
+
+Jain’s fairness index over per-user throughput/latency
+
+
+Helpful policies:
+Round robin often improves fairness (equal share).
+
+
+Weighted round robin if you want priorities.
+
+
+Can hurt:
+Least-loaded can accidentally starve some users if their jobs arrive in bursts or are “big”.
+
+
+Shortest-job-first can starve long jobs (unfair across job sizes).
+
+
+Great for explainability: “We sacrificed some latency to keep user A from being consistently worse off.”
+
+🧠 5) SLA Violation Minimization
+(“Meet deadlines / service guarantees”)
+Optimize
+Minimize the number of jobs that exceed a latency threshold (e.g., 100 ms).
+Needs
+observed_latency_ms
+
+
+a threshold (e.g., SLA_LIMIT_MS)
+
+
+Metric example:
+violations = count(latency > SLA_LIMIT)
+reward = -violations
+
+Why this is cool
+This goal behaves very differently from mean latency.
+A policy might:
+keep average latency okay
+
+
+but create a few very slow jobs → many SLA violations
+
+
+Great explanation:
+“We switched because policy X caused too many deadline misses.”
+
+
+
+👥 6) Prevent Starvation (Fair Queueing Style)
+Optimize
+Minimize the maximum waiting time across jobs.
+Needs
+per-job wait time (can approximate from latency)
+
+
+Metric:
+reward = -max_latency
+
+This is extreme fairness: nobody should suffer very long waits.
+This strongly conflicts with throughput and mean-latency goals.
+⚖️ 7) Latency Variance / Stability
+(“Avoid jittery performance”)
+Optimize
+Minimize variance or standard deviation of latency.
+Needs
+per-job latency list
+
+
+Metric:
+variance = variance(latencies)
+reward = -variance
+
+Why it's different
+Mean latency might be good, but if results swing wildly:
+some jobs 10 ms
+
+
+some 200 ms
+
+
+That’s bad UX. This goal prefers consistent performance.
+Policies that behave differently
+Round robin → often more stable
+
+
+Greedy/least-loaded → might create bursts and spikes
+🧮 8) Job Completion Time (Flow Time)
+(Close to latency, but slightly different)
+Optimize
+Minimize sum of completion times rather than mean latency.
+This emphasizes getting jobs done quickly overall rather than fairness.
+Needs
+completion timestamps
+
+
+Difference from mean latency
+It favors policies that quickly finish many small jobs, possibly at the expense of a few large ones.
+9) Load Balance / Avoid Hotspots (not as good if it’s just 3 nodes)
+Optimize: keep node utilization balanced (educational + easy to visualize).
+Needs:
+NodeSnapshot.queue_length or estimated utilization
+
+
+optional: CPU%, memory%, network saturation (later with VMs)
+
+
+You can define the “cost” as variance/standard deviation of queue lengths across nodes.
+Helpful policies:
+Least-loaded is basically a load balancer.
+
+
+Round robin also balances if nodes are equal speed.
+
+
+Can hurt:
+Latency-aware might concentrate jobs on the “fastest” node and create hotspots.
+
+
+Random can be uneven in small batches.
+
+
+This goal gives very clean visual graphs: “queues stayed balanced” vs “one node got overloaded.”
+
+
+
+The rest of these below are more optional than the ones above
+10) Minimize Rejections / Drop Rate (Capacity Goal)
+Optimize: keep the system from rejecting jobs when queues fill up.
+Needs (VM or sim):
+a max queue size per node (or max in-flight)
+
+
+a rejected flag returned from place_job when capacity is exceeded
+
+
+Metric:
+drop_rate = rejected_jobs / total_jobs
+
+
+reward = -drop_rate or -(#rejected)
+
+
+Helpful policies:
+Least-loaded usually helps.
+
+
+Random can cause avoidable rejections.
+
+
+Why it’s distinct: it’s about availability/capacity, not latency.
+
+11) Minimize Queueing Delay (Separate from service time)
+Optimize: time spent waiting before execution starts.
+Needs:
+started_at_ms and “arrival time” (agent can record arrival when it sends)
+
+
+queueing delay = started_at - arrival_sent_time
+
+
+Why it’s different: two systems can have similar total latency, but one has huge waiting and tiny service time (bad “responsiveness” feel).
+Helpful policies:
+Least-loaded helps
+
+
+policies that spread bursts help
+
+
+This is still easy but a distinct lens.
+
+12) Prioritize Interactive Jobs (Multi-class / Weighted Objective)
+Optimize: keep “interactive” jobs fast even if “batch” jobs slow down.
+Needs:
+job class label: job.metadata["class"] in {"interactive","batch"}
+
+
+per-job latency
+
+
+Metric idea:
+weighted reward:
+ reward=−(wi⋅meanLatencyInteractive+wb⋅meanLatencyBatch)reward = - (w_i \cdot meanLatencyInteractive + w_b \cdot meanLatencyBatch)reward=−(wi​⋅meanLatencyInteractive+wb​⋅meanLatencyBatch)
+ where wi>wbw_i > w_bwi​>wb​
+
+
+Helpful policies:
+“priority-aware” policy (later)
+
+
+even with basic policies, the goal itself is different and explainable
+
+
+Why it’s distinct: it’s not generic fairness; it’s intentional priority.
+
+13) Minimize Node Overload Events (Threshold-based)
+Optimize: avoid any node going above a “danger” threshold.
+Needs:
+NodeSnapshot.queue_length or CPU%
+
+
+overload threshold (e.g., queue_length > 20)
+
+
+Metric:
+count overload events across time windows
+
+
+reward = negative overload events
+
+
+Why it’s different from load balance: load balance is about spread, overload events are about staying under a safe limit.
+Great for explanations:
+“We switched because node C exceeded safe queue depth 3 times.”
+
+
+Jobs/Workload Info: 1) Tiny / Interactive (“mice”)
+What it represents: quick web requests, small RPC calls
+ Typical size: 5–50 ms (or 10–100 ms if you want more visible differences)
+How I’d implement this on VMs
+In the job payload, include service_time_ms sampled from a small range (e.g., 20–80ms).
+
+
+The VM node service does:
+
+
+enqueue the job (so queueing can happen)
+
+
+when it reaches the worker, sleep(service_time_ms / node_speed)
+
+
+return timestamps + measured latency
+
+
+Key detail: for tiny jobs, queueing dominates, so you’ll see big effects when a node gets backed up.
+Why it matters:
+extremely sensitive to queueing
+
+
+good for SLA and tail latency demos
+
+
+Good for goals: Mean latency, Tail latency, SLA, Stability
+ Policies that help: Least-loaded, tail-guard
+ Policies that can hurt: unfair policies can starve other job classes/users
+
+2) Medium (“normal”)
+What it represents: typical tasks
+ Typical size: 50–300 ms (or 100–500 ms)
+How I’d implement this on VMs
+Same VM handler as above, but sample service_time_ms from a mid range.
+
+
+Keep these as the “majority” workload when you want stable averages.
+
+
+Example payload:
+{ "job_id":"J42", "service_time_ms":180, "class":"normal", "user":"A" }
+
+Why it matters: forms your baseline workload.
+
+3) Large / Batch (“elephants”)
+What it represents: big jobs, background tasks
+ Typical size: 300 ms – 5 s (for demos: 500–2000 ms)
+How I’d implement this on VMs
+Sample service_time_ms from a large range.
+
+
+VM node service runs the same worker loop, but sleeps longer.
+
+
+To keep the demo responsive, cap max size (e.g., 2s).
+
+
+Important VM note: large jobs will block the worker, creating queue buildup behind them. This is exactly what you want to demonstrate tail latency and fairness effects.
+Why it matters:
+creates queues
+
+
+causes tail latency spikes
+
+
+interacts strongly with fairness (large jobs can dominate a user’s experience)
+
+
+Good for goals: Throughput, Flow time (if handled well), Load balance
+ Policies that help: Size-aware/MECT
+ Policies that hurt: Round robin under heterogeneity; fairness-aware may slow throughput
+
+4) Heavy-tailed / Mixed sizes (realistic: “mice + elephants”)
+This is the most realistic pattern in distributed systems: many tiny jobs, few huge ones.
+How I’d implement this on VMs
+You implement this in the workload generator (agent side), not on the VM:
+For each new job, sample service_time_ms from a mixture distribution:
+
+
+80% tiny: 10–50 ms
+
+
+15% medium: 50–300 ms
+
+
+5% large: 500–2000 ms
+
+
+Then send that one job to the chosen VM node with that service_time_ms.
+
+
+VM side stays simple: it just “executes” whatever service time it was told.
+Why it matters: tail latency becomes meaningful, policies differ clearly.
+Good for goals: Tail latency, SLA, Flow time
+ Policies that help: Tail-guard, size-aware, MECT
+ Policies that hurt: naive RR can create stragglers
+
+5) Deadline/SLA jobs (time constraint)
+Same as above, but you attach a deadline.
+Fields:
+deadline_ms or sla_threshold_ms
+
+
+optionally “value” if deadline met
+
+
+How I’d implement this on VMs
+Two easy approaches:
+A) Agent-side SLA checking (simplest, recommended)
+VM runs the job normally and returns observed_latency_ms.
+
+
+Agent computes:
+
+
+violation = observed_latency_ms > sla_threshold_ms
+
+
+This keeps VMs dumb and makes unit tests easy.
+
+
+B) Node-side SLA checking (optional)
+VM returns a boolean sla_met based on its own measured time.
+
+
+Agent still logs/aggregates.
+
+
+Why it matters: lets you optimize for “violations,” not just average latency.
+
+6) Priority classes (interactive vs batch)
+This is still about “time”, but adds importance.
+Fields:
+class: "interactive" or "batch"
+
+
+optional weight w in reward
+
+
+How I’d implement this on VMs
+Again, simplest is to keep VMs dumb:
+Agent includes "class": "interactive" in job JSON.
+
+
+VM treats all jobs the same unless you want priority queueing.
+
+
+You have two implementation options:
+A) Priority is only in the goal/reward (simplest)
+VM runs FIFO.
+
+
+Agent computes weighted reward, e.g. interactive latency counts 3×.
+
+
+B) Priority queueing on the VM (more “real systems”)
+VM maintains two queues: interactive and batch
+
+
+worker always drains interactive first (or does weighted fair queueing)
+
+
+Option A is easier and still demonstrates the tradeoff clearly.
+Why it matters: creates natural conflicts: optimizing interactive latency often hurts throughput and fairness.
+
+Minimal VM node service behavior that supports all of these
+To make all six job types work cleanly on VMs, each node just needs:
+Queue / in-flight tracking
+
+
+A worker loop that processes jobs FIFO (or optional priority FIFO)
+
+
+Sleep-based execution: sleep(service_time_ms / node_speed)
+
+
+Return timing data
+
+Files: agentic_controller.py
+This file is the brain of your system. It represents the control plane that observes the state of all nodes and makes decisions about where jobs should go. Conceptually, this is your “agent” — it gathers telemetry (CPU, memory, queue length, latency, throughput, etc.) from each node and then applies scheduling logic (your policies and goals) to choose actions. It sits above the nodes and does not execute jobs itself; instead, it reasons about the cluster and tells nodes what to do.
+In terms of flow, the controller typically:
+Discovers nodes (often via virtualbox.py)
+Pulls current metrics using NodeClient
+Applies policies from policies.py
+Chooses a node
+Submits jobs to that node
+This is where your “agentic” aspect lives — multi-metric reasoning, tradeoffs, and future learning logic all belong here.
+
+node_worker.py
+This file implements the node-side server. Each VM runs one copy of this, and it simulates (or executes) work. It exposes a FastAPI service with endpoints like /metrics and /submit. When the controller sends a job, this file is responsible for queueing it, running it (currently simulated via asyncio.sleep()), and updating internal state such as in_flight, queue length, latency history, and throughput.
+Even though some parts are simulated, this file is modeling the runtime behavior of a compute node. It blends real OS telemetry (via psutil) with system-level state (job queue, EWMA latency, job completion history). This separation makes the system realistic while still controllable for experimentation.
+
+node_client.py
+This file is the network interface between the controller and nodes. It wraps HTTP requests so the controller doesn’t have to deal with raw REST calls. Instead of writing requests.get(...) everywhere, the controller just calls client.get_metrics(node) or client.submit_job(node, job).
+This abstraction is important because it isolates communication logic from scheduling logic. If you later changed from HTTP to gRPC, or added retries, authentication, or logging, you’d update this file without touching the controller logic.
+
+state_types.py
+This file defines the shared data structures used across the entire system. It contains dataclasses like NodeSnapshot and JobRequest, which represent the state of a node and the structure of a job. These act as the language spoken between the controller, client, and nodes.
+The purpose of centralizing these definitions is consistency. Instead of passing around loose dictionaries, the whole system uses structured objects. This reduces bugs, makes code more readable, and clearly defines what “node state” and “job” mean in your architecture.
+
+virtualbox.py
+This file is responsible for node discovery. Rather than hardcoding IPs, it uses VBoxManage commands to:
+Find running VMs
+Read their CPU and memory allocations
+Query each VM’s IP address
+It then constructs NodeSnapshot objects for each machine. This is your system’s bridge between infrastructure (VirtualBox) and your control logic. It makes your cluster dynamic rather than manually configured.
+
+policies.py (not finished yet)
+This file contains the decision logic used by the controller. Each function here represents a scheduling strategy — for example, lowest CPU, shortest queue, latency-aware routing, or multi-objective scoring.
+By separating policies from the controller, you keep the system modular. The controller orchestrates, but the “how to choose” logic lives here. This makes it easy to test policies independently and compare strategies.
+
+goals.py (not finished yet)
+This file defines the objectives the system is trying to achieve, such as minimizing latency, maximizing throughput, or balancing load. Goals are conceptually different from policies — goals define what success means, while policies define how to act.
+In an agentic system, goals can influence policy weighting or future learning components. This file gives your project a clear notion of system purpose, not just mechanics.
+
+test_node_client.py
+This test validates that the controller–node communication pipeline works. It constructs a NodeSnapshot, pulls metrics, submits a job, and pulls metrics again. This proves:
+The node server is reachable
+Metrics are parsed correctly
+Jobs can be submitted
+This is a component-level integration test for the networking layer.
+
+test_nodes_e2e.py
+This is an end-to-end cluster test
+test_nodes_e2e
+. It discovers all running VMs, contacts each one, submits a job, and observes metrics before and after. It validates the entire pipeline: discovery → networking → node execution → metrics update.
+This test ensures the whole system behaves like a distributed cluster rather than just individual pieces.
+
+test_discovery.py
+This test focuses only on virtualbox.py. It ensures that running VMs are correctly detected and turned into NodeSnapshot objects. This confirms your system can dynamically adapt to infrastructure changes.
+
+test_controller_smoke.py
+This is a smoke test for the controller logic. It runs a minimal scheduling loop and ensures no crashes occur. It doesn’t deeply validate policy correctness, but verifies the controller can observe nodes and take action without failing.
+
+main.py (not finished yet)
+This file typically acts as an entry point for running the controller system in a loop. It initializes components (discovery, client, policies) and begins the control cycle. Think of it as the runtime launcher for your distributed agent.
+
+
+Agent Learning Methods: 
+1️⃣ Sample-Average Bandit (Incremental Mean)
+This is the simplest and the usual baseline.
+How it learns
+For each policy ppp:
+Q_p = \frac{\text{total reward from p}}{\text{# times p used}}
+After each batch (or k jobs):
+Qp←Qp+1Np(r−Qp)Q_p \leftarrow Q_p + \frac{1}{N_p}(r - Q_p)Qp​←Qp​+Np​1​(r−Qp​)
+where:
+rrr = observed reward
+
+
+NpN_pNp​ = number of times policy p was used
+
+
+Intuition
+“What’s the average performance of this policy so far?”
+Pros
+Very simple
+
+
+Stable
+
+
+Good if workload is stationary
+
+
+Cons
+Slow to adapt if workload changes (old history dominates)
+
+
+
+2️⃣ Recency-Weighted Bandit (Exponential Moving Average)
+Better when conditions change.
+How it learns
+Instead of averaging all history:
+Qp←Qp+α(r−Qp)Q_p \leftarrow Q_p + \alpha(r - Q_p)Qp​←Qp​+α(r−Qp​)
+where α\alphaα (e.g. 0.1) controls how fast it forgets.
+Intuition
+“Recent performance matters more than old performance.”
+Pros
+Adapts to bursty or changing load
+
+
+Great for your ramp/burst arrival patterns
+
+
+Cons
+Noisier estimates
+
+
+Might overreact to temporary spikes
+
+
+
+3️⃣ UCB (Upper Confidence Bound)
+Still ε-greedy for exploration, but UCB adds directed optimism.
+How it chooses
+During exploitation:
+scorep=Qp+cln⁡tNp\text{score}_p = Q_p + c \sqrt{\frac{\ln t}{N_p}}scorep​=Qp​+cNp​lnt​​
+where:
+QpQ_pQp​ = average reward
+
+
+NpN_pNp​ = times tried
+
+
+ttt = total decisions
+
+
+ccc = exploration strength
+
+
+Intuition
+“Prefer good policies, but also ones we’re uncertain about.”
+Pros
+Systematic exploration of under-tested policies
+
+
+Good when differences are subtle
+
+
+Cons
+Slightly more complex
+
+
+Less intuitive to explain to non-ML audience
+
+
+
+4️⃣ Thompson Sampling (Bayesian Bandit)
+A probabilistic approach.
+How it works
+For each policy, keep a probability distribution of how good it might be.
+At decision time:
+Sample a value from each policy’s distribution
+
+
+Pick the best sample
+
+
+Intuition
+“Act according to probability that a policy is best.”
+Pros
+Often very efficient
+
+
+Naturally balances exploration/exploitation
+
+
+Cons
+Harder math
+
+
+Might be overkill for your project
+
+
+
+5️⃣ Contextual Bandit ⭐ (Very relevant for your system)
+This is the most important extension.
+Difference from basic bandit
+Basic bandit ignores system state.
+Contextual bandit uses features like:
+current queue lengths
+
+
+burstiness level
+
+
+job size distribution
+
+
+node utilization
+
+
+How it works (linear version)
+For each policy, learn:
+r^=wpTx\hat{r} = w_p^T xr^=wpT​x
+where:
+xxx = context vector (system state)
+
+
+wpw_pwp​ = learned weights
+
+
+During exploitation:
+compute predicted reward for each policy given current state
+
+
+pick highest
+
+
+Intuition
+“Which policy works best under these conditions?”
+Pros
+Adapts to load patterns
+
+
+Very “agentic”
+
+
+Great for explainability:
+
+
+ “Under high queue imbalance, least-loaded performs best.”
+
+
+
+Cons
+Slightly more code
+
+
+Need to define context features
+
+
+
+6️⃣ Sliding-Window Bandit
+Only use the last W observations.
+Qp=mean reward over last W usesQ_p = \text{mean reward over last W uses}Qp​=mean reward over last W uses
+Intuition
+“Forget everything older than W decisions.”
+Pros
+Good for non-stationary workloads
+
+
+Simple to implement
+
+
+Cons
+If W too small → noisy
+
+Policies List: Tier 0 — Easiest (no VM stats required)
+
+1) Random
+What it actually does:
+ For every job, pick a node uniformly at random. No memory, no state, no load awareness.
+VM data needed: none
+ Best goals: none (baseline), sometimes helps Fairness by chance
+ Hurts: Mean latency, Tail latency, SLA, Load balance
+Role: exploration baseline and comparison point.
+
+2) Round Robin
+What it actually does:
+ Maintain an index. Send job 1 → node A, job 2 → node B, job 3 → node C, then wrap around. Ignores node state.
+VM data needed: none
+ Best goals: Fairness, Stability/variance, Load balance (if nodes equal)
+ Hurts: Mean/Tail/SLA under bursts or node heterogeneity
+Conflict: fairness vs tail latency.
+
+3) Weighted Round Robin
+What it actually does:
+ Like round robin, but some nodes get more turns based on predefined weights.
+ Example: A, A, B, C if weights = [2,1,1].
+VM data needed: none (weights are config)
+ Best goals: Throughput (favor faster nodes), Fairness (if weights per class), Load balance
+ Hurts: Tail/SLA if workload shifts or weights mismatch reality
+
+Tier 1 — Easy (needs per-node load number)
+
+4) Least-Loaded
+What it actually does:
+ Query each node’s queue length or in-flight job count and pick the smallest.
+VM data needed: queue_length or in_flight_jobs
+ Best goals: Mean latency, Tail latency, SLA, Load balance, often Throughput
+ Hurts: can reduce Fairness
+
+5) Power-of-Two Choices
+What it actually does:
+ Pick 2 random nodes, compare their loads, choose the less loaded of the two.
+VM data needed: same as least-loaded
+ Best goals: Mean latency, Tail latency, Load balance
+ Why it’s great: nearly as good as least-loaded with less coordination.
+
+6) Load Threshold (JSQ with cap)
+What it actually does:
+ Pick least-loaded, but if its queue exceeds a threshold, skip it and try the next best node.
+VM data needed: queue_length
+ Best goals: SLA violations, Tail latency, Anti-starvation
+ Hurts: sometimes Throughput
+
+Tier 2 — Moderate (needs job size or node speed)
+
+7) Fastest-Node Bias
+What it actually does:
+ Prefer nodes known to be faster (static weights or periodic benchmarks). Sends more jobs to those nodes.
+VM data needed: none if preconfigured; optional benchmarking
+ Best goals: Throughput, Flow time
+ Hurts: Load balance, Tail/SLA
+
+8) Size-Aware Routing (SJF-style)
+What it actually does:
+ If job is small → send to lightly loaded node;
+ If job is large → avoid congested nodes or handle differently.
+VM data needed: job size estimate
+ Best goals: Flow time, Mean latency
+ Hurts: Fairness, Anti-starvation
+
+9) Min Estimated Completion Time (MECT)
+What it actually does:
+ For each node, estimate:
+completion_time = current_wait + job_size / node_speed
+
+Choose the smallest.
+VM data needed: queue length + node speed estimate + job size
+ Best goals: Mean latency, Flow time, often Throughput
+ Hurts: Fairness, sometimes Load balance
+
+Tier 3 — Harder (history, learning, class-aware)
+
+10) Latency-Aware (EWMA)
+What it actually does:
+ Keep a moving average of observed latency per node. Prefer nodes that recently performed well.
+VM data needed: none (agent measures latency)
+ Best goals: Mean latency, Tail latency, SLA
+ Hurts: Load balance, Stability
+
+11) Tail-Guard / Straggler-Aware
+What it actually does:
+ Track which nodes recently caused slow jobs or SLA misses. Penalize those nodes temporarily.
+VM data needed: agent-side history
+ Best goals: Tail latency, SLA, Stability
+ Hurts: Throughput
+
+12) Fairness-Aware Scheduler
+What it actually does:
+ Track per-user performance. Prefer decisions that improve the worst-off user or keep users balanced.
+VM data needed: job user/class label
+ Best goals: Fairness, Anti-starvation, Stability
+ Hurts: Throughput, sometimes Mean/Tail latency
+
+Optimization Goals: 1. Core variables distributed systems try to optimize or influence
+Think of these as objectives (what you care about) and constraints (what must not be violated).
+A. Performance-related variables (most common)
+These are the easiest to reason about and to simulate.
+1) Latency
+End-to-end response time (mean, median, tail: p95/p99)
+
+
+Queueing delay
+
+
+Network hop delay
+
+
+Typical strategies
+Route to least-loaded node
+
+
+Co-locate data with compute
+
+
+Reduce fan-out
+
+
+Cache hot data
+
+
+Prefer local vs remote nodes
+
+
+VM simulation?
+✅ Very easy
+
+
+You can simulate load, queues, and delays reliably.
+
+
+
+2) Throughput
+Requests/sec
+
+
+Jobs/sec
+
+
+Data processed/sec
+
+
+Typical strategies
+Parallelism
+
+
+Batching
+
+
+Load balancing
+
+
+Increasing replica count
+
+
+VM simulation?
+✅ Easy
+
+
+Especially good for demonstrating scaling behavior.
+
+
+
+3) Tail latency (p95/p99)
+The “slowest” requests that hurt user experience
+
+
+Typical strategies
+Replication + hedged requests
+
+
+Avoid stragglers
+
+
+Timeout-based rerouting
+
+
+VM simulation?
+⚠️ Moderate
+
+
+You can simulate stragglers, but you must intentionally inject variance.
+
+
+
+B. Resource efficiency variables
+These are very realistic for your project.
+4) CPU utilization
+Average load
+
+
+Queue depth
+
+
+Context switching
+
+
+Strategies
+Load-aware scheduling
+
+
+CPU pinning
+
+
+Avoid oversubscription
+
+
+VM simulation?
+✅ Easy
+
+
+psutil / node_exporter works great.
+
+
+
+5) Memory utilization
+RSS
+
+
+Cache pressure
+
+
+Swap activity
+
+
+Strategies
+Memory-aware placement
+
+
+Avoid co-locating memory-heavy jobs
+
+
+Cache eviction policies
+
+
+VM simulation?
+✅ Easy
+
+
+
+6) Disk / IO utilization
+Read/write bandwidth
+
+
+IOPS
+
+
+Queue depth
+
+
+Strategies
+Route high-IO jobs to IO-rich nodes
+
+
+Throttle writers
+
+
+Separate compute-heavy vs IO-heavy tasks
+
+
+VM simulation?
+⚠️ Mostly easy
+
+
+Disk contention is realistic, but host caching can hide some effects unless stressed.
+
+
+
+7) Network bandwidth
+Bytes/sec
+
+
+Packet rate
+
+
+Strategies
+Locality-aware routing
+
+
+Compression
+
+
+Traffic shaping
+
+
+VM simulation?
+⚠️ Moderate
+
+
+Works well inside host-only networks, but real WAN effects are harder.
+
+
+
+C. Reliability & correctness variables
+These make your project feel “real,” but are harder to simulate deeply.
+8) Fault tolerance
+Node failure
+
+
+Network partition
+
+
+Process crash
+
+
+Strategies
+Replication
+
+
+Failover
+
+
+Leader election
+
+
+Heartbeats
+
+
+VM simulation?
+✅ Easy at a basic level
+
+
+Kill a VM or process, simulate partition by disabling network.
+
+
+
+9) Availability
+Uptime
+
+
+Request success rate
+
+
+Strategies
+Redundancy
+
+
+Fast failover
+
+
+Graceful degradation
+
+
+VM simulation?
+✅ Easy
+
+
+
+10) Consistency (for stateful systems)
+Strong vs eventual consistency
+
+
+Staleness
+
+
+Strategies
+Quorums
+
+
+Version vectors
+
+
+CRDTs
+
+
+VM simulation?
+⚠️ Hard
+
+
+Requires stateful workloads and careful modeling.
+
+
+
+D. Cost & sustainability variables
+These are excellent for edTech, but some parts are harder to simulate.
+11) Energy consumption
+Power usage
+
+
+Carbon footprint
+
+
+Strategies
+Consolidation
+
+
+Power-aware scheduling
+
+
+Turn off idle nodes
+
+
+VM simulation?
+❌ Not truly
+
+
+You can approximate using CPU utilization as a proxy (which is acceptable if explained honestly).
+
+
+
+12) Monetary cost
+$/request
+
+
+$/hour per node
+
+
+Strategies
+Spot vs on-demand
+
+
+Bin packing
+
+
+Auto-scaling
+
+
+VM simulation?
+❌ Not real
+
+
+But very easy to model abstractly (fixed “cost per node”).
+
+
+
+E. Fairness & user-centric variables
+These are subtle but very explainable.
+13) Fairness
+Equal resource share
+
+
+No starvation
+
+
+Strategies
+Round robin
+
+
+Weighted fair scheduling
+
+
+Quotas
+
+
+VM simulation?
+✅ Easy
+
+
+
+14) SLA / QoS adherence
+Latency budgets
+
+
+Error budgets
+
+
+Strategies
+Priority queues
+
+
+Admission control
+
+
+Preemption
+
+
+VM simulation?
+✅ Easy
+
+
+
+2. Are there many optimization strategies per variable?
+Yes — and this is where your policy agent shines.
+For the same variable, you can have conflicting strategies:
+Example: Latency
+Strategy A: route to least-loaded node
+
+
+Strategy B: route to closest node
+
+
+Strategy C: replicate + hedge
+
+
+Strategy D: reserve capacity for high-priority users
+
+
+Each has trade-offs:
+Better latency vs higher cost
+
+
+Better tail latency vs more network traffic
+
+
+Fairness vs performance
+
+
+This lets you:
+Offer policy presets in the UI
+
+
+Show why different strategies choose different nodes
+
+
+
+3. What is NOT easily simulatable on VMs?
+Be honest about these in your report:
+Variable
+Why it’s hard
+True energy usage
+Host abstracts power draw
+Hardware heterogeneity
+VMs often look similar
+Real WAN latency
+Same-host networks are too “clean”
+Multi-tenant interference
+No noisy neighbors unless simulated
+Thermal throttling
+Hidden by hypervisor
+
+4. What variables I’d recommend YOU focus on
+Given your goals and tools:
+Primary
+Latency
+
+
+CPU utilization
+
+
+IO utilization
+
+
+SLA violations
+
+
+Secondary
+Fairness
+
+
+Cost (abstract)
+
+
+Reliability (basic failures)
+
+
+Avoid (or model abstractly)
+True power consumption
+
+
+Deep consistency semantics
+
+
+
+GIve me a step by step guide on how to create an app that implements what was listed above to create a agentic distributed systems maanger
