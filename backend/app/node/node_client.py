@@ -7,7 +7,7 @@ from typing import Optional, Dict, Any
 
 import requests
 
-from state_types import NodeSnapshot, JobRequest
+from app.state_types import NodeSnapshot, JobRequest
 
 
 class NodeClient:
