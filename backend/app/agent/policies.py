@@ -8,7 +8,7 @@ from dataclasses import dataclass # For simple data structures
 from typing import List, Optional, Dict, Protocol # For defining interfaces
 import random
 import math
-from state_types import NodeSnapshot, JobRequest
+from app.state_types import NodeSnapshot, JobRequest
 
 
 

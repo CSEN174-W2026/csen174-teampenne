@@ -2,7 +2,7 @@ import time
 import pytest
 
 from state_types import JobRequest, NodeSnapshot
-from agent.agent import ManagerAgent
+from backend.app.agent.manager_agent import ManagerAgent
 
 
 # ------------------------------
@@ -19,6 +19,9 @@ def make_nodes():
     return [
         NodeSnapshot(name="n1", host="127.0.0.1", port=8001),
         NodeSnapshot(name="n2", host="127.0.0.1", port=8002),
+        NodeSnapshot(name="n3", host="127.0.0.1", port=8003),
+        NodeSnapshot(name="n4", host="127.0.0.1", port=8004),
+        NodeSnapshot(name="n5", host="127.0.0.1", port=8005),
     ]
 
 
