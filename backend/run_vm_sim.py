@@ -31,7 +31,7 @@ def main():
     nodes: List[NodeSnapshot] = [
         NodeSnapshot(
             name="n1",
-            host="192.168.1.61",  # <-- your VM IP
+            host="192.168.1.61", 
             port=5001,
             cpus=2,
             memory_mb=2048,

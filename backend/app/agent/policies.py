@@ -47,27 +47,26 @@ def _job_size(job: JobRequest) -> int:
 """---------Tier-0: no VM Stats Required ------------"""
 
 class RandomPolicy:
-    """A simple routing policy that randomly selects a node from the list of available nodes."""
     name = "random"
 
-    def __init__(self,seed: Optional[int] = None):
-        self.random = random.Random(seed) # Use a random seed for reproducibility
-    
-    def choose_node(self, nodes: List[NodeSnapshot]) -> NodeSnapshot:
-        _require_nodes(nodes) # Ensure there are nodes to choose from
-        return self.random.choice(nodes) # Randomly select and return a node
+    def __init__(self, seed: Optional[int] = None):
+        self.random = random.Random(seed)
+
+    def choose_node(self, nodes: List[NodeSnapshot], job: JobRequest) -> NodeSnapshot:
+        _require_nodes(nodes)
+        return self.random.choice(nodes)
+
 
 class RoundRobinPolicy:
-    """A routing policy that selects nodes in a round-robin fashion."""
     name = "round_robin"
 
     def __init__(self):
-        self._index = 0 # Keep track of the last index used for round-robin
-    
-    def choose_node(self, nodes: List[NodeSnapshot]) -> NodeSnapshot:
-        _require_nodes(nodes) # Ensure there are nodes to choose from
-        node = nodes[self._index % len(nodes)] # Select the next node in round-robin order
-        self._index += 1 # Move to the next index for the next call
+        self._index = 0
+
+    def choose_node(self, nodes: List[NodeSnapshot], job: JobRequest) -> NodeSnapshot:
+        _require_nodes(nodes)
+        node = nodes[self._index % len(nodes)]
+        self._index += 1
         return node
     
 class WeightedRoundRobinPolicy:
@@ -341,14 +340,30 @@ def build_policies(
     """
     Returns a dict policy_name -> policy_instance
     """
+    if(wrr_weights is not None):
+        return{
+            RandomPolicy(seed=seed).name: RandomPolicy(seed=seed),
+            RoundRobinPolicy().name: RoundRobinPolicy(),
+            WeightedRoundRobinPolicy(wrr_weights or {}).name: WeightedRoundRobinPolicy(wrr_weights or {"vm-1": 1}),
+            LeastLoadedPolicy().name: LeastLoadedPolicy(),
+            PowerOfTwoChoicesPolicy(seed=seed).name: PowerOfTwoChoicesPolicy(seed=seed),
+            LoadThresholdPolicy(threshold=8).name: LoadThresholdPolicy(threshold=8),
+            FastestNodeBiasPolicy(seed=seed, fallback_weights=wrr_weights).name: FastestNodeBiasPolicy(seed=seed, fallback_weights=wrr_weights),
+            SizeAwareRoutingPolicy(small_ms=200, big_threshold=6).name: SizeAwareRoutingPolicy(small_ms=200, big_threshold=6),
+            MECTPolicy(avg_service_ms=120.0).name: MECTPolicy(avg_service_ms=120.0),
+            LatencyAwareEWMAPolicy().name: LatencyAwareEWMAPolicy(),
+            TailGuardPolicy().name: TailGuardPolicy(),
+            FairnessAwarePolicy(alpha=0.02).name: FairnessAwarePolicy(alpha=0.02),
+        }
+
     return {
         RandomPolicy(seed=seed).name: RandomPolicy(seed=seed),
         RoundRobinPolicy().name: RoundRobinPolicy(),
-        WeightedRoundRobinPolicy(wrr_weights or {}).name: WeightedRoundRobinPolicy(wrr_weights or {"vm-1": 1}),
+        # WeightedRoundRobinPolicy(wrr_weights or {}).name: WeightedRoundRobinPolicy(wrr_weights or {"vm-1": 1}),
         LeastLoadedPolicy().name: LeastLoadedPolicy(),
         PowerOfTwoChoicesPolicy(seed=seed).name: PowerOfTwoChoicesPolicy(seed=seed),
         LoadThresholdPolicy(threshold=8).name: LoadThresholdPolicy(threshold=8),
-        FastestNodeBiasPolicy(seed=seed, fallback_weights=wrr_weights).name: FastestNodeBiasPolicy(seed=seed, fallback_weights=wrr_weights),
+        # FastestNodeBiasPolicy(seed=seed, fallback_weights=wrr_weights).name: FastestNodeBiasPolicy(seed=seed, fallback_weights=wrr_weights),
         SizeAwareRoutingPolicy(small_ms=200, big_threshold=6).name: SizeAwareRoutingPolicy(small_ms=200, big_threshold=6),
         MECTPolicy(avg_service_ms=120.0).name: MECTPolicy(avg_service_ms=120.0),
         LatencyAwareEWMAPolicy().name: LatencyAwareEWMAPolicy(),
