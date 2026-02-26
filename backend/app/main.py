@@ -6,6 +6,7 @@ import uuid
 
 from api_models import RunConfig, RunStartResponse, RunStatusResponse
 from run_engine import RunEngine, RunState
+from run_store import RunStore
 
 app = FastAPI(title="Agentic Distributed Systems Manager")
 
@@ -21,7 +22,8 @@ app.add_middleware(
 )
 
 _RUNS: Dict[str, RunState] = {}
-_ENGINE = RunEngine()
+_STORE = RunStore()
+_ENGINE = RunEngine(store=_STORE)
 
 @app.get("/health")
 def health():
@@ -47,6 +49,22 @@ def get_events(run_id: str, limit: int = 200):
     if not st:
         raise HTTPException(status_code=404, detail="run not found")
     return {"run_id": run_id, "events": st.events[-max(1, min(limit, 5000)):]}
+
+
+@app.get("/runs/{run_id}/db")
+def get_persisted_run(run_id: str):
+    run = _STORE.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="run not found in database")
+    return run
+
+
+@app.get("/runs/{run_id}/db/events")
+def get_persisted_events(run_id: str, limit: int = 200):
+    run = _STORE.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="run not found in database")
+    return {"run_id": run_id, "events": _STORE.get_run_events(run_id, limit=limit)}
 
 @app.get("/nodes/discover")
 def discover_nodes_endpoint():

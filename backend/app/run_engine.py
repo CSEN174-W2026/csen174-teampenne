@@ -8,7 +8,8 @@ from api_models import RunConfig, RunStatusResponse
 from state_types import JobRequest, NodeSnapshot
 from node.node_client import NodeClient
 from node.virtualbox import discover_nodes
-from agent.agent import ManagerAgent
+from agent.manager_agent import ManagerAgent
+from run_store import RunStore
 
 @dataclass
 class RunState:
@@ -34,6 +35,9 @@ class RunState:
         )
 
 class RunEngine:
+    def __init__(self, store: RunStore | None = None):
+        self.store = store or RunStore()
+
     def _make_nodes(self, cfg: RunConfig) -> List[NodeSnapshot]:
         if cfg.nodes:
             return [NodeSnapshot(**n.model_dump()) for n in cfg.nodes]
@@ -73,6 +77,15 @@ class RunEngine:
         st = runs[run_id]
         rng = random.Random(cfg.workload.seed)
         client = NodeClient(timeout_s=2.0)
+        self.store.create_run(
+            run_id=run_id,
+            source="api",
+            status="running",
+            goal_kind=cfg.goal_kind,
+            learner_kind=cfg.learner_kind,
+            config=cfg.model_dump(),
+            total_jobs=cfg.workload.jobs,
+        )
 
         agent = ManagerAgent(
             learner_kind=cfg.learner_kind,
@@ -87,6 +100,13 @@ class RunEngine:
             if not nodes_base:
                 st.status = "failed"
                 st.summary = {"error": "no nodes discovered/provided"}
+                self.store.finalize_run(
+                    run_id=run_id,
+                    status=st.status,
+                    processed_jobs=st.processed_jobs,
+                    summary=st.summary,
+                    error=st.summary["error"],
+                )
                 return
 
             for i in range(cfg.workload.jobs):
@@ -99,6 +119,13 @@ class RunEngine:
                 if not live:
                     st.status = "failed"
                     st.summary = {"error": "all nodes unreachable"}
+                    self.store.finalize_run(
+                        run_id=run_id,
+                        status=st.status,
+                        processed_jobs=st.processed_jobs,
+                        summary=st.summary,
+                        error=st.summary["error"],
+                    )
                     return
 
                 user = rng.choice(cfg.workload.users)
@@ -139,6 +166,24 @@ class RunEngine:
                     "metadata": job.metadata,
                 })
                 st.processed_jobs += 1
+                self.store.append_job_event(
+                    run_id=run_id,
+                    idx=i,
+                    job_id=job.job_id,
+                    user_id=user,
+                    policy_name=outcome.policy_name,
+                    node_name=outcome.node_name,
+                    target_host=target.host,
+                    target_port=target.port,
+                    success=outcome.success,
+                    latency_ms=lat,
+                    reward=reward,
+                    sla_violation=lat > sla,
+                    metadata=job.metadata or {},
+                    decision_context=decision.context or {},
+                    learner_stats=agent.learner_stats(),
+                )
+                self.store.update_run_progress(run_id, st.processed_jobs)
 
             # Final aggregate
             lats = sorted(e["latency_ms"] for e in st.events) if st.events else [0.0]
@@ -155,6 +200,19 @@ class RunEngine:
                 "agent_summary": agent.summary(),
             }
             st.status = "completed"
+            self.store.finalize_run(
+                run_id=run_id,
+                status=st.status,
+                processed_jobs=st.processed_jobs,
+                summary=st.summary,
+            )
         except Exception as ex:
             st.status = "failed"
             st.summary = {"error": str(ex)}
+            self.store.finalize_run(
+                run_id=run_id,
+                status=st.status,
+                processed_jobs=st.processed_jobs,
+                summary=st.summary,
+                error=str(ex),
+            )
