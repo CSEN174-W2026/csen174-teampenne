@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass # Define simple "data container" classes
 from typing import List, Dict, Optional, Any, Tuple
 import time
 import math
@@ -23,7 +23,10 @@ ManagerAgent is a "manager brain" that:
 4. Updates the learner
 """
 
-@dataclass(frozen=True)
+
+
+# When you dispatch a job, we must remember what policy we used and what node you sent it to, so that when the outcome comes back, we can update the right policy in the learner.
+@dataclass(frozen=True) # Object is immutable after creation
 class Decision:
     """
     Records what manager decided for a job request aka at dispatch time.
@@ -41,13 +44,15 @@ class Decision:
 # This context will be fed into the learner
 def default_context_builder(nodes: List[NodeSnapshot], job_request: JobRequest) -> Dict[str, float]:
     """
-    This is used for contextual bandits learning method
+    Turn the current system state into a numeric feature dictionary (context vector)
+    Mainly used by contextual bandit learners -> can be ignored by non-contextual learners
     """
     n = max(len(nodes), 1)  # Avoid division by zero
 
     loads: List[float] = []
     cpus: List[float] = []
     
+    # Collect load and CPU per node
     for node in nodes:
         q = getattr(node, "queue_len", None)
         f = getattr(node, "in_flight", None)
@@ -101,20 +106,20 @@ class ManagerAgent:
             context_builder=default_context_builder,
             history_size: int = 300,
     ):
-        self.policies: Dict[str, RoutingPolicy] = policies or build_policies(seed) 
+        self.policies: Dict[str, RoutingPolicy] = policies or build_policies(seed) # If caller passes policies, use them, otherwise build default ones
         
         learner_kwargs = learner_kwargs or {}
-        self.learner: Learner = make_learner(learner_kind, seed=seed, **learner_kwargs)
+        self.learner: Learner = make_learner(learner_kind, seed=seed, **learner_kwargs) # Initialize the learner
 
         goal_kwargs = goal_kwargs or {}
         self.goal: Goal = make_goal(goal_kind, **goal_kwargs)
 
-        self.latency_clip_ms = latency_clip_ms
-        self.context_builder = context_builder
+        self.latency_clip_ms = latency_clip_ms # Cap insane latencies
+        self.context_builder = context_builder # Function to build context vector from system state
 
         self._pending: Dict[str, Decision] = {}  # job_id -> Decision
         self._outcomes: List[Outcome] = []  # most recent outcomes, for diagnostics
-        self._history_size = int(history_size)
+        self._history_size = int(history_size) # how many past outcomes to remember for diagnostics
 
     # Return list of policy names (arms)
     def policy_names(self) -> List[str]:
@@ -129,7 +134,7 @@ class ManagerAgent:
         context = self.context_builder(nodes, job)
         arms = self.policy_names()
 
-        policy_name = self.learner.choose_arm(arms, context=context)
+        policy_name = self.learner.choose_arm(arms, context=context) # Learner chooses which policy to use based on the arms and context
         policy = self.policies[policy_name]
 
         chosen = policy.choose_node(nodes, job)
@@ -143,10 +148,10 @@ class ManagerAgent:
             context=context,
             user_id=getattr(job, "user_id", None),
         )
-        self._pending[job.job_id] = d
+        self._pending[job.job_id] = d # Remember the decision for this job so we can update the learner later when the outcome comes back
         return d
     
-    # Observe the outcome of a completed job, update learner
+    # Observe the outcome of a completed job, update learner --> when job is finished
     def observe(
         self,
         job_id: str,
@@ -162,7 +167,7 @@ class ManagerAgent:
         if job_id not in self._pending:
             raise KeyError(f"Unknown job_id={job_id}. Did you call route() first?")
 
-        d = self._pending.pop(job_id)
+        d = self._pending.pop(job_id) # Remove from pending
 
         lat = float(latency_ms)
         if math.isnan(lat) or lat < 0:
@@ -179,7 +184,7 @@ class ManagerAgent:
             extra_info=extra or {},
         )
 
-        reward = float(self.goal.reward(o))
+        reward = float(self.goal.reward(o)) # Compute reward based on the outcome
         self.learner.update(d.policy_name, reward, context=d.context)
 
         self._outcomes.append(o)

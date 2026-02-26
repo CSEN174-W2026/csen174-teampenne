@@ -1,10 +1,8 @@
 import pytest
 
 from app.state_types import NodeSnapshot, JobRequest
-
-# pick ONE of these based on your repo
 from app.agent.manager_agent import ManagerAgent
-# from app.agent.agent import ManagerAgent
+
 
 
 class DummyPolicy:
@@ -87,7 +85,7 @@ def test_observe_without_route_raises_or_handles_gracefully():
         policies={"p": DummyPolicy("n1")},
     )
 
-    # Depending on your design, this may raise or return something special.
+    # Depending on the design, this may raise or return something special.
     # Accept either "raises" or "no crash".
     try:
         _ = agent.observe("j999", success=True, latency_ms=10)

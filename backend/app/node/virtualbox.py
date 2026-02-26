@@ -1,6 +1,6 @@
 import subprocess
 import re
-from state_types import NodeSnapshot
+from app.state_types import NodeSnapshot
 
 VBOX = r"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe" # Absolute path to VBoxManage on Windows
 
