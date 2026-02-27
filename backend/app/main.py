@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from fastapi import Body
 
 from app.agent.manager_agent import ManagerAgent
 from app.state_types import JobRequest, NodeSnapshot
@@ -296,6 +297,50 @@ def agent_learner_stats(cfg: AgentConfig):
     )
     return agent.learner_stats()
 
+@app.post("/agents/latency_stats")
+def agent_latency_stats(cfg: AgentConfig):
+    agent = get_agent(
+        learner_kind=cfg.learner_kind,
+        goal_kind=cfg.goal_kind,
+        seed=cfg.seed,
+        learner_kwargs=cfg.learner_kwargs,
+        goal_kwargs=cfg.goal_kwargs,
+    )
+    return agent.latency_stats()
+
+
+@app.post("/agents/summary")
+def agent_summary(cfg: AgentConfig):
+    agent = get_agent(
+        learner_kind=cfg.learner_kind,
+        goal_kind=cfg.goal_kind,
+        seed=cfg.seed,
+        learner_kwargs=cfg.learner_kwargs,
+        goal_kwargs=cfg.goal_kwargs,
+    )
+    return agent.summary()
+
+
+@app.post("/agents/stats")
+def agent_stats(cfg: AgentConfig):
+    """
+    One call for frontend: learner stats + latency stats + summary + pending
+    """
+    agent = get_agent(
+        learner_kind=cfg.learner_kind,
+        goal_kind=cfg.goal_kind,
+        seed=cfg.seed,
+        learner_kwargs=cfg.learner_kwargs,
+        goal_kwargs=cfg.goal_kwargs,
+    )
+    return {
+        "learner": agent.learner_stats(),
+        "latency": agent.latency_stats(),
+        "summary": agent.summary(),
+        "pending_job_ids": agent.pending_job_ids(),
+        "time_ms": now_ms(),
+    }
+
 
 @app.post("/agents/pending")
 def agent_pending(cfg: AgentConfig):
@@ -329,3 +374,14 @@ def list_agents():
             for k in keys
         ],
     }
+
+
+
+@app.post("/reset")
+def reset_all():
+    global OBSERVE_DEUP
+    with AGENTS_LOCK:
+        AGENTS.clear()
+    with OBSERVE_LOCK:
+        OBSERVE_DEUP.clear()
+    return {"ok": True, "time_ms": now_ms()}

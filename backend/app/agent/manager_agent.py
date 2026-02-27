@@ -108,6 +108,16 @@ class ManagerAgent:
     ):
         self.policies: Dict[str, RoutingPolicy] = policies or build_policies(seed) # If caller passes policies, use them, otherwise build default ones
         
+        policy_allowlist = None
+        if learner_kwargs and isinstance(learner_kwargs.get("policy_allowlist"), list):
+            policy_allowlist = set(str(x) for x in learner_kwargs["policy_allowlist"])
+
+        if policy_allowlist:
+            self.policies = {k: v for k, v in self.policies.items() if k in policy_allowlist}
+            if not self.policies:
+                raise ValueError("policy_allowlist removed all policies; check names")
+            
+        
         learner_kwargs = learner_kwargs or {}
         self.learner: Learner = make_learner(learner_kind, seed=seed, **learner_kwargs) # Initialize the learner
 
@@ -192,6 +202,19 @@ class ManagerAgent:
             self._outcomes.pop(0)
 
         return o, reward
+
+    def latency_stats(self) -> Dict[str, dict]:
+        acc = {}
+        for o in self._outcomes:
+            p = o.policy_name
+            a = acc.setdefault(p, {"n": 0, "total_latency_ms": 0.0, "avg_latency_ms": 0.0})
+            a["n"] += 1
+            a["total_latency_ms"] += float(o.latency_ms)
+
+        for p, a in acc.items():
+            if a["n"] > 0:
+                a["avg_latency_ms"] = a["total_latency_ms"] / a["n"]
+        return acc
 
     def learner_stats(self) -> Dict[str, dict]:
         return self.learner.stats()
