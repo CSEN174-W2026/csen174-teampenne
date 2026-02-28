@@ -167,6 +167,16 @@ export function Simulation() {
   const [isRunning, setIsRunning] = useState(false);
   const [isAgentControlled, setIsAgentControlled] = useState(false);
   const [policy, setPolicy] = useState<Policy>("round-robin");
+
+  // DISPLAY as the current routing strategy
+  // - In manual mode: follows `policy`
+  // - In agent mode: updated from backend submit response decision
+  const [currentRouteStrategy, setCurrentRouteStrategy] = useState<Policy>("round-robin");
+
+  // track which node was chosen by the backend for the last submitted job
+  const [lastChosenNodeId, setLastChosenNodeId] = useState<string | null>(null);
+  const [lastChosenNodeLabel, setLastChosenNodeLabel] = useState<string>("—");
+
   const [simulationSpeed, setSimulationSpeed] = useState(1);
 
   const [nodes, setNodes] = useState<NodeUI[]>([
@@ -273,6 +283,9 @@ export function Simulation() {
 
   const submitOneJob = useCallback(
     async (metadata: Json = {}) => {
+      const manualPolicyBackend =
+        POLICY_OPTIONS.find((p) => p.ui === policy)?.backend ?? "round_robin";
+
       const job = {
         job_id: mkJobId(),
         user_id: userId,
@@ -281,19 +294,68 @@ export function Simulation() {
           cpu_intensity: manualTask.cpu,
           mem_hint: manualTask.mem,
           duration_hint: manualTask.duration,
-          manual_policy: isAgentControlled ? null : policy,
+
+          //  backend expects underscore keys
+          manual_policy: isAgentControlled ? null : manualPolicyBackend,
+
           ...metadata,
         },
       };
 
       try {
-        await submitJob({ config: agentConfig, job });
+        //  capture response so we can display the backend’s chosen policy
+        const resp: any = await submitJob({ config: agentConfig, job });
         setSubmittedJobs((p) => p + 1);
-      } catch {
-        // ignore
+
+        //  extract chosen node from response and store for UI highlight
+        const host = resp?.decision?.node?.host ?? resp?.decision?.host ?? null;
+        const port = resp?.decision?.node?.port ?? resp?.decision?.port ?? null;
+        const nodeName =
+          resp?.decision?.node?.name ??
+          resp?.decision?.node_name ??
+          null;
+
+        if (host && port != null) {
+          const id = `${host}:${port}`;
+          setLastChosenNodeId(id);
+          setLastChosenNodeLabel(nodeName ? `${nodeName} (${id})` : id);
+        } else if (nodeName) {
+          // fallback if backend only returns a name/id
+          setLastChosenNodeId(nodeName);
+          setLastChosenNodeLabel(nodeName);
+        } else {
+          setLastChosenNodeId(null);
+          setLastChosenNodeLabel("—");
+        }
+
+        //  Update the displayed route strategy
+        if (isAgentControlled) {
+          const chosen =
+            resp?.decision?.policy ??
+            resp?.decision?.policy_name ??
+            resp?.decision?.policy_kind ??
+            null;
+
+          const ui = typeof chosen === "string" ? backendKeyToUiPolicy(chosen) : null;
+          if (ui) setCurrentRouteStrategy(ui);
+        } else {
+          // manual mode: show the manual pick
+          setCurrentRouteStrategy(policy);
+        }
+      } catch (e) {
+        console.error("submitJob failed:", e);
       }
     },
-    [agentConfig, manualTask.cpu, manualTask.mem, manualTask.duration, isAgentControlled, policy, serviceTimeMsFromCpu]
+    [
+      agentConfig,
+      manualTask.cpu,
+      manualTask.mem,
+      manualTask.duration,
+      isAgentControlled,
+      policy,
+      POLICY_OPTIONS,
+      serviceTimeMsFromCpu,
+    ]
   );
 
   const spikeLoad = useCallback(async () => {
@@ -307,14 +369,15 @@ export function Simulation() {
     // 1) Nodes
     try {
       const nodesResp = await getNodes();
-      const mapped: NodeUI[] = (nodesResp.nodes || []).map((n: any, idx: number) => {
+      const mapped: NodeUI[] = (nodesResp.nodes || []).map((n: any) => {
         const cpuPct = safePct(n.cpu_pct);
         const memPct = safePct(n.mem_pct);
         const cpuCap = 100;
         const memCap = 100;
 
         return {
-          id: `${n.host}:${n.port}:${idx}`,
+          //  stable id so it matches lastChosenNodeId = "host:port"
+          id: `${n.host}:${n.port}`,
           name: (n.name ?? `${n.host}:${n.port}`).toLowerCase(),
           cpuCapacity: cpuCap,
           memCapacity: memCap,
@@ -421,6 +484,12 @@ export function Simulation() {
     simStartMsRef.current = null;
 
     setPolicy("round-robin");
+    setCurrentRouteStrategy("round-robin"); //  reset display
+
+    //  reset chosen-node display
+    setLastChosenNodeId(null);
+    setLastChosenNodeLabel("—");
+
     setPolicyStats({
       "round-robin": { policy: "round-robin", completedTasks: 0, totalLatency: 0, avgLatency: 0, recentLatency: [], reward: 0, selectionPct: 0 },
       "least-loaded": { policy: "least-loaded", completedTasks: 0, totalLatency: 0, avgLatency: 0, recentLatency: [], reward: 0, selectionPct: 0 },
@@ -435,8 +504,10 @@ export function Simulation() {
     });
     setNodes((prev) => prev.map((x) => ({ ...x, status: "offline", cpuUsed: 0, memUsed: 0, tasks: [] })));
 
-    // If you added backend reset:
-    resetManager().catch(() => {});
+    // Backend reset + repoll so UI matches backend immediately
+    resetManager()
+      .then(() => pollManager())
+      .catch((e) => console.error("Backend reset failed:", e));
   };
 
   const chartData = useMemo(() => {
@@ -487,6 +558,14 @@ export function Simulation() {
             onClick={() => {
               setIsAgentControlled(!isAgentControlled);
               if (!isRunning) setIsRunning(true);
+
+              // keep UI consistent when toggling
+              if (!isAgentControlled) {
+                // turning ON agent: don’t overwrite; backend will update on submit
+              } else {
+                // turning OFF agent: display manual policy
+                setCurrentRouteStrategy(policy);
+              }
             }}
             className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-all ${
               isAgentControlled
@@ -596,6 +675,7 @@ export function Simulation() {
             )}
           </AnimatePresence>
 
+          {/* --- EVERYTHING BELOW IS YOUR ORIGINAL JSX, only tiny display changes later --- */}
           <div className="bg-neutral-900 border border-neutral-800 rounded-2xl p-6">
             <div className="flex items-center gap-2 mb-6">
               <Network className="w-5 h-5 text-purple-400" />
@@ -718,7 +798,10 @@ export function Simulation() {
                   <button
                     key={p}
                     disabled={isAgentControlled}
-                    onClick={() => setPolicy(p)}
+                    onClick={() => {
+                      setPolicy(p);
+                      if (!isAgentControlled) setCurrentRouteStrategy(p);
+                    }}
                     className={`text-left px-3 py-2 rounded-lg text-sm capitalize transition-all border ${
                       policy === p && !isAgentControlled
                         ? "bg-indigo-500/10 text-indigo-400 border-indigo-500/30"
@@ -802,10 +885,23 @@ export function Simulation() {
                   <Network className="w-8 h-8 text-white" />
                 </div>
                 <div className="text-center">
-                  <span className={`text-[10px] font-bold uppercase tracking-widest ${isAgentControlled ? "text-purple-400" : "text-indigo-400"}`}>
+                  <span
+                    className={`text-[10px] font-bold uppercase tracking-widest ${
+                      isAgentControlled ? "text-purple-400" : "text-indigo-400"
+                    }`}
+                  >
                     Current Route Strategy
                   </span>
-                  <h4 className="text-lg font-bold capitalize">{policy.replace("-", " ")}</h4>
+
+                  {/*  display backend-chosen strategy, not manual policy */}
+                  <h4 className="text-lg font-bold capitalize">
+                    {currentRouteStrategy.replace("-", " ")}
+                  </h4>
+
+                  {/*show chosen node */}
+                  <p className="text-[11px] text-neutral-400 mt-1">
+                    Last routed to: <span className="font-mono text-white">{lastChosenNodeLabel}</span>
+                  </p>
                 </div>
               </Motion.div>
             </div>
@@ -833,7 +929,11 @@ export function Simulation() {
               {nodes.map((node) => (
                 <div
                   key={node.id}
-                  className="bg-neutral-900/80 backdrop-blur-sm border border-neutral-800 rounded-xl p-4 transition-all hover:border-neutral-700"
+                  className={`bg-neutral-900/80 backdrop-blur-sm border rounded-xl p-4 transition-all ${
+                    lastChosenNodeId && node.id === lastChosenNodeId
+                      ? "border-emerald-400 shadow-lg shadow-emerald-500/20 ring-2 ring-emerald-500/20"
+                      : "border-neutral-800 hover:border-neutral-700"
+                  }`}
                 >
                   <div className="flex justify-between items-start mb-4">
                     <div>
@@ -842,8 +942,16 @@ export function Simulation() {
                         {node.status === "offline" ? "Offline" : "Active"}
                       </p>
                     </div>
-                    <div className="p-1.5 rounded-lg bg-neutral-800/50 border border-neutral-700/50">
-                      <Cpu className="w-3 h-3 text-neutral-500" />
+
+                    <div className="flex items-center gap-2">
+                      {lastChosenNodeId && node.id === lastChosenNodeId && (
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                          CHOSEN
+                        </span>
+                      )}
+                      <div className="p-1.5 rounded-lg bg-neutral-800/50 border border-neutral-700/50">
+                        <Cpu className="w-3 h-3 text-neutral-500" />
+                      </div>
                     </div>
                   </div>
 
@@ -874,6 +982,7 @@ export function Simulation() {
             </div>
           </div>
 
+          {/* ---- YOUR LEADERBOARD + DIAGNOSTICS PANELS (UNCHANGED) ---- */}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
             <div className="md:col-span-2 bg-neutral-900 border border-neutral-800 rounded-2xl p-6">
               <div className="flex items-center justify-between mb-6">
