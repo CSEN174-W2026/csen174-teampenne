@@ -385,3 +385,41 @@ def reset_all():
     with OBSERVE_LOCK:
         OBSERVE_DEUP.clear()
     return {"ok": True, "time_ms": now_ms()}
+
+
+
+@app.post("/agents/explanations/recent")
+def agent_explanations_recent(cfg: AgentConfig, limit: int = 50):
+    agent = get_agent(
+        learner_kind=cfg.learner_kind,
+        goal_kind=cfg.goal_kind,
+        seed=cfg.seed,
+        learner_kwargs=cfg.learner_kwargs,
+        goal_kwargs=cfg.goal_kwargs,
+    )
+    # requires you added agent.explainer
+    return {"events": agent.explainer.recent_events(limit=limit), "time_ms": now_ms()}
+
+
+@app.post("/agents/explanations/summary")
+def agent_explanations_summary(cfg: AgentConfig):
+    agent = get_agent(
+        learner_kind=cfg.learner_kind,
+        goal_kind=cfg.goal_kind,
+        seed=cfg.seed,
+        learner_kwargs=cfg.learner_kwargs,
+        goal_kwargs=cfg.goal_kwargs,
+    )
+    return {"summary": agent.explainer.summary(), "time_ms": now_ms()}
+
+
+@app.post("/agents/explanations/timeseries")
+def agent_explanations_timeseries(cfg: AgentConfig):
+    agent = get_agent(
+        learner_kind=cfg.learner_kind,
+        goal_kind=cfg.goal_kind,
+        seed=cfg.seed,
+        learner_kwargs=cfg.learner_kwargs,
+        goal_kwargs=cfg.goal_kwargs,
+    )
+    return {"series": agent.explainer.timeseries(), "time_ms": now_ms()}

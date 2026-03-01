@@ -24,6 +24,7 @@ import {
   getStats,
   // (optional) resetManager if you added it
   resetManager,
+  getRecentExplanations,
   type AgentConfig,
 } from "../../lib/api";
 
@@ -80,8 +81,10 @@ function normalizePolicyKey(k: string): string {
 function backendKeyToUiPolicy(k: string): Policy | null {
   const kk = normalizePolicyKey(k);
   if (kk.includes("round") && kk.includes("robin")) return "round-robin";
-  if (kk.includes("least") && (kk.includes("load") || kk.includes("loaded"))) return "least-loaded";
-  if (kk.includes("resource") && (kk.includes("aware") || kk.includes("awareness"))) return "resource-aware";
+  if (kk.includes("least") && (kk.includes("load") || kk.includes("loaded")))
+    return "least-loaded";
+  if (kk.includes("resource") && (kk.includes("aware") || kk.includes("awareness")))
+    return "resource-aware";
   if (kk.includes("random")) return "random";
   return null;
 }
@@ -113,13 +116,17 @@ function buildPolicyStatsFromBackend(
     const ui = backendKeyToUiPolicy(k);
     if (!ui) continue;
 
-    const n = typeof v?.n === "number" ? v.n : 0;
-    const avg = typeof v?.avg_latency_ms === "number" ? v.avg_latency_ms : 0;
-    const total = typeof v?.total_latency_ms === "number" ? v.total_latency_ms : avg > 0 ? avg * n : 0;
+    const n = typeof (v as any)?.n === "number" ? (v as any).n : 0;
+    const avg = typeof (v as any)?.avg_latency_ms === "number" ? (v as any).avg_latency_ms : 0;
+    const total =
+      typeof (v as any)?.total_latency_ms === "number"
+        ? (v as any).total_latency_ms
+        : avg > 0
+          ? avg * n
+          : 0;
 
     const prevStat = next[ui];
-    const recent =
-      avg > 0 ? [...prevStat.recentLatency, avg].slice(-10) : prevStat.recentLatency;
+    const recent = avg > 0 ? [...prevStat.recentLatency, avg].slice(-10) : prevStat.recentLatency;
 
     next[ui] = {
       ...prevStat,
@@ -165,6 +172,14 @@ function buildPolicyStatsFromBackend(
 
 export function Simulation() {
   const [isRunning, setIsRunning] = useState(false);
+
+  // ---- NEW: Explanation modal state ----
+  const [explainOpen, setExplainOpen] = useState(false);
+  const [currentExplanation, setCurrentExplanation] = useState<any | null>(null);
+  const [latestExplanation, setLatestExplanation] = useState<any | null>(null);
+  const lastExplainTmsRef = useRef<number>(0);
+  const resumeRunningRef = useRef<boolean>(false);
+
   const [isAgentControlled, setIsAgentControlled] = useState(false);
   const [policy, setPolicy] = useState<Policy>("round-robin");
 
@@ -180,10 +195,46 @@ export function Simulation() {
   const [simulationSpeed, setSimulationSpeed] = useState(1);
 
   const [nodes, setNodes] = useState<NodeUI[]>([
-    { id: "node-1", name: "us-east-1a", cpuCapacity: 100, memCapacity: 1024, cpuUsed: 0, memUsed: 0, tasks: [], status: "offline" },
-    { id: "node-2", name: "us-east-1b", cpuCapacity: 100, memCapacity: 1024, cpuUsed: 0, memUsed: 0, tasks: [], status: "offline" },
-    { id: "node-3", name: "us-west-2a", cpuCapacity: 150, memCapacity: 2048, cpuUsed: 0, memUsed: 0, tasks: [], status: "offline" },
-    { id: "node-4", name: "eu-central-1", cpuCapacity: 80, memCapacity: 512, cpuUsed: 0, memUsed: 0, tasks: [], status: "offline" },
+    {
+      id: "node-1",
+      name: "us-east-1a",
+      cpuCapacity: 100,
+      memCapacity: 1024,
+      cpuUsed: 0,
+      memUsed: 0,
+      tasks: [],
+      status: "offline",
+    },
+    {
+      id: "node-2",
+      name: "us-east-1b",
+      cpuCapacity: 100,
+      memCapacity: 1024,
+      cpuUsed: 0,
+      memUsed: 0,
+      tasks: [],
+      status: "offline",
+    },
+    {
+      id: "node-3",
+      name: "us-west-2a",
+      cpuCapacity: 150,
+      memCapacity: 2048,
+      cpuUsed: 0,
+      memUsed: 0,
+      tasks: [],
+      status: "offline",
+    },
+    {
+      id: "node-4",
+      name: "eu-central-1",
+      cpuCapacity: 80,
+      memCapacity: 512,
+      cpuUsed: 0,
+      memUsed: 0,
+      tasks: [],
+      status: "offline",
+    },
   ]);
 
   const [incomingJobs, setIncomingJobs] = useState(0);
@@ -191,10 +242,42 @@ export function Simulation() {
   const simStartMsRef = useRef<number | null>(null);
 
   const [policyStats, setPolicyStats] = useState<Record<Policy, PolicyStatUI>>({
-    "round-robin": { policy: "round-robin", completedTasks: 0, totalLatency: 0, avgLatency: 0, recentLatency: [], reward: 0, selectionPct: 0 },
-    "least-loaded": { policy: "least-loaded", completedTasks: 0, totalLatency: 0, avgLatency: 0, recentLatency: [], reward: 0, selectionPct: 0 },
-    "resource-aware": { policy: "resource-aware", completedTasks: 0, totalLatency: 0, avgLatency: 0, recentLatency: [], reward: 0, selectionPct: 0 },
-    random: { policy: "random", completedTasks: 0, totalLatency: 0, avgLatency: 0, recentLatency: [], reward: 0, selectionPct: 0 },
+    "round-robin": {
+      policy: "round-robin",
+      completedTasks: 0,
+      totalLatency: 0,
+      avgLatency: 0,
+      recentLatency: [],
+      reward: 0,
+      selectionPct: 0,
+    },
+    "least-loaded": {
+      policy: "least-loaded",
+      completedTasks: 0,
+      totalLatency: 0,
+      avgLatency: 0,
+      recentLatency: [],
+      reward: 0,
+      selectionPct: 0,
+    },
+    "resource-aware": {
+      policy: "resource-aware",
+      completedTasks: 0,
+      totalLatency: 0,
+      avgLatency: 0,
+      recentLatency: [],
+      reward: 0,
+      selectionPct: 0,
+    },
+    random: {
+      policy: "random",
+      completedTasks: 0,
+      totalLatency: 0,
+      avgLatency: 0,
+      recentLatency: [],
+      reward: 0,
+      selectionPct: 0,
+    },
   });
 
   const [agent, setAgent] = useState<AgentState>({
@@ -255,11 +338,13 @@ export function Simulation() {
   const [tailWeight, setTailWeight] = useState<number>(0.5);
 
   const agentConfig = useMemo<AgentConfig>(() => {
-    const backendPolicies = POLICY_OPTIONS.filter((p) => selectedPolicies.includes(p.ui)).map((p) => p.backend);
+    const backendPolicies = POLICY_OPTIONS.filter((p) => selectedPolicies.includes(p.ui)).map(
+      (p) => p.backend
+    );
 
-    // IMPORTANT: your ManagerAgent only reads learner_kwargs.policy_allowlist (NOT allowed_policies/policy_kinds/etc.)
+    // IMPORTANT: your ManagerAgent only reads learner_kwargs.policy_allowlist
     const learner_kwargs: Json = {
-      policy_allowlist: backendPolicies, // <-- THIS matches manager_agent.py
+      policy_allowlist: backendPolicies,
     };
 
     const goal_kwargs: Json = {};
@@ -295,7 +380,7 @@ export function Simulation() {
           mem_hint: manualTask.mem,
           duration_hint: manualTask.duration,
 
-          //  backend expects underscore keys
+          // backend expects underscore keys
           manual_policy: isAgentControlled ? null : manualPolicyBackend,
 
           ...metadata,
@@ -303,24 +388,20 @@ export function Simulation() {
       };
 
       try {
-        //  capture response so we can display the backend’s chosen policy
+        // capture response so we can display the backend’s chosen policy
         const resp: any = await submitJob({ config: agentConfig, job });
         setSubmittedJobs((p) => p + 1);
 
-        //  extract chosen node from response and store for UI highlight
+        // extract chosen node from response and store for UI highlight
         const host = resp?.decision?.node?.host ?? resp?.decision?.host ?? null;
         const port = resp?.decision?.node?.port ?? resp?.decision?.port ?? null;
-        const nodeName =
-          resp?.decision?.node?.name ??
-          resp?.decision?.node_name ??
-          null;
+        const nodeName = resp?.decision?.node?.name ?? resp?.decision?.node_name ?? null;
 
         if (host && port != null) {
           const id = `${host}:${port}`;
           setLastChosenNodeId(id);
           setLastChosenNodeLabel(nodeName ? `${nodeName} (${id})` : id);
         } else if (nodeName) {
-          // fallback if backend only returns a name/id
           setLastChosenNodeId(nodeName);
           setLastChosenNodeLabel(nodeName);
         } else {
@@ -328,7 +409,7 @@ export function Simulation() {
           setLastChosenNodeLabel("—");
         }
 
-        //  Update the displayed route strategy
+        // Update the displayed route strategy
         if (isAgentControlled) {
           const chosen =
             resp?.decision?.policy ??
@@ -339,7 +420,6 @@ export function Simulation() {
           const ui = typeof chosen === "string" ? backendKeyToUiPolicy(chosen) : null;
           if (ui) setCurrentRouteStrategy(ui);
         } else {
-          // manual mode: show the manual pick
           setCurrentRouteStrategy(policy);
         }
       } catch (e) {
@@ -365,6 +445,58 @@ export function Simulation() {
     }
   }, [submitOneJob]);
 
+  // ---- explanation polling helpers ----
+  const fetchLatestExplanation = useCallback(async () => {
+    try {
+      const data = await getRecentExplanations(agentConfig, 25);
+      const events: any[] = data?.events ?? [];
+
+      // Only use real switch events with text
+      const last =
+        [...events]
+          .sort((a, b) => (a.t_ms ?? 0) - (b.t_ms ?? 0))
+          .reverse()
+          .find((e) => {
+            const hasText = typeof e?.text === "string" && e.text.trim().length > 0;
+            const isSwitch = e?.kind === "switch" || e?.meta?.switched === true;
+            return hasText && isSwitch;
+          }) ?? null;
+
+      return last;
+    } catch (err) {
+      console.error("getRecentExplanations failed:", err);
+      return null;
+    }
+  }, [agentConfig]);
+
+  const maybePauseForExplanation = useCallback(async () => {
+    if (!isRunning) return;
+    if (!isAgentControlled) return;
+    if (explainOpen) return;
+
+    const ev = await fetchLatestExplanation();
+    const t = Number(ev?.t_ms ?? 0);
+    if (!ev || !t) return;
+
+    if (t <= lastExplainTmsRef.current) return;
+
+    // New explanation detected -> pause sim and show modal
+    lastExplainTmsRef.current = t;
+    resumeRunningRef.current = isRunning;
+
+    setLatestExplanation(ev);
+    setCurrentExplanation(ev);
+    setExplainOpen(true);
+    setIsRunning(false);
+  }, [explainOpen, fetchLatestExplanation, isAgentControlled, isRunning]);
+
+  const continueAfterExplanation = useCallback(() => {
+    setExplainOpen(false);
+    setCurrentExplanation(null);
+    if (resumeRunningRef.current) setIsRunning(true);
+    resumeRunningRef.current = false; // ✅ important
+  }, []);
+
   const pollManager = useCallback(async () => {
     // 1) Nodes
     try {
@@ -376,7 +508,6 @@ export function Simulation() {
         const memCap = 100;
 
         return {
-          //  stable id so it matches lastChosenNodeId = "host:port"
           id: `${n.host}:${n.port}`,
           name: (n.name ?? `${n.host}:${n.port}`).toLowerCase(),
           cpuCapacity: cpuCap,
@@ -389,9 +520,14 @@ export function Simulation() {
       });
 
       if (mapped.length > 0) setNodes(mapped);
-      else setNodes((prev) => prev.map((x) => ({ ...x, status: "offline", cpuUsed: 0, memUsed: 0, tasks: [] })));
+      else
+        setNodes((prev) =>
+          prev.map((x) => ({ ...x, status: "offline", cpuUsed: 0, memUsed: 0, tasks: [] }))
+        );
     } catch {
-      setNodes((prev) => prev.map((x) => ({ ...x, status: "offline", cpuUsed: 0, memUsed: 0, tasks: [] })));
+      setNodes((prev) =>
+        prev.map((x) => ({ ...x, status: "offline", cpuUsed: 0, memUsed: 0, tasks: [] }))
+      );
     }
 
     // 2) Stats
@@ -408,7 +544,7 @@ export function Simulation() {
         latencyStats = stats?.latency ?? {};
         summary = stats?.summary ?? {};
       } catch {
-        const p = await getPending();
+        const p = await getPending(agentConfig);
         pendingIds = p.pending_job_ids ?? [];
 
         learnerStats = await getLearnerStats(agentConfig);
@@ -417,19 +553,18 @@ export function Simulation() {
 
       setIncomingJobs(pendingIds.length);
 
-      setPolicyStats((prev) => buildPolicyStatsFromBackend(learnerStats, latencyStats, prev, selectedPolicies));
+      setPolicyStats((prev) =>
+        buildPolicyStatsFromBackend(learnerStats, latencyStats, prev, selectedPolicies)
+      );
 
-      // overall latency should come from summary.mean_latency_ms (ManagerAgent.summary())
-      const backendOverall =
-        typeof summary?.mean_latency_ms === "number"
-          ? summary.mean_latency_ms
-          : 0;
-
+      const backendOverall = typeof summary?.mean_latency_ms === "number" ? summary.mean_latency_ms : 0;
       setOverallAvgLatencyMs(backendOverall);
       if (backendOverall > 0) setOverallLatencyTrail((prev) => [...prev, backendOverall].slice(-25));
 
       setAgent((prev) => {
-        const nextExploration = isAgentControlled ? Math.max(0.05, prev.explorationRate * 0.985) : prev.explorationRate;
+        const nextExploration = isAgentControlled
+          ? Math.max(0.05, prev.explorationRate * 0.985)
+          : prev.explorationRate;
         return {
           ...prev,
           isActive: isAgentControlled,
@@ -438,10 +573,13 @@ export function Simulation() {
           lastDecisionTime: nowMs(),
         };
       });
+
+      // 3) Explanation: if agent produced a new explanation, pause and show it
+      await maybePauseForExplanation();
     } catch {
       setIncomingJobs(0);
     }
-  }, [agentConfig, isAgentControlled, selectedPolicies]);
+  }, [agentConfig, isAgentControlled, selectedPolicies, maybePauseForExplanation]);
 
   const submitIntervalRef = useRef<number | null>(null);
   const pollIntervalRef = useRef<number | null>(null);
@@ -484,9 +622,8 @@ export function Simulation() {
     simStartMsRef.current = null;
 
     setPolicy("round-robin");
-    setCurrentRouteStrategy("round-robin"); //  reset display
+    setCurrentRouteStrategy("round-robin");
 
-    //  reset chosen-node display
     setLastChosenNodeId(null);
     setLastChosenNodeLabel("—");
 
@@ -504,7 +641,6 @@ export function Simulation() {
     });
     setNodes((prev) => prev.map((x) => ({ ...x, status: "offline", cpuUsed: 0, memUsed: 0, tasks: [] })));
 
-    // Backend reset + repoll so UI matches backend immediately
     resetManager()
       .then(() => pollManager())
       .catch((e) => console.error("Backend reset failed:", e));
@@ -522,7 +658,7 @@ export function Simulation() {
     return [...arr].sort((a, b) => {
       const aHas = a.avgLatency > 0;
       const bHas = b.avgLatency > 0;
-      if (aHas && bHas) return a.avgLatency - b.avgLatency; // lower latency better
+      if (aHas && bHas) return a.avgLatency - b.avgLatency;
       if (aHas && !bHas) return -1;
       if (!aHas && bHas) return 1;
       return b.completedTasks - a.completedTasks;
@@ -537,14 +673,104 @@ export function Simulation() {
     return submittedJobs / elapsedS;
   }, [submittedJobs]);
 
-  // best policy by reward (for display)
   const bestByReward = useMemo(() => {
     const active = selectedPolicies.length ? selectedPolicies : (Object.keys(policyStats) as Policy[]);
-    return active.reduce((best, p) => (policyStats[p].reward >= policyStats[best].reward ? p : best), active[0] || "round-robin");
+    return active.reduce(
+      (best, p) => (policyStats[p].reward >= policyStats[best].reward ? p : best),
+      active[0] || "round-robin"
+    );
   }, [policyStats, selectedPolicies]);
 
   return (
     <div className="space-y-8 pb-12">
+      {/* ------------------ Explanation Modal ------------------ */}
+      <AnimatePresence>
+        {explainOpen && currentExplanation ? (
+          <Motion.div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+          >
+            <Motion.div
+              className="w-full max-w-2xl rounded-2xl border border-white/10 bg-neutral-950 shadow-2xl"
+              initial={{ scale: 0.96, y: 10, opacity: 0 }}
+              animate={{ scale: 1, y: 0, opacity: 1 }}
+              exit={{ scale: 0.98, y: 10, opacity: 0 }}
+              transition={{ type: "spring", stiffness: 260, damping: 22 }}
+            >
+              <div className="flex items-center justify-between gap-4 border-b border-white/10 px-5 py-4">
+                <div className="flex items-center gap-2">
+                  <div className="h-2.5 w-2.5 rounded-full bg-emerald-400" />
+                  <div className="text-sm font-semibold">Decision explanation</div>
+                </div>
+                <div className="text-xs text-neutral-400">
+                  {currentExplanation?.kind ? String(currentExplanation.kind).toUpperCase() : "EVENT"} •{" "}
+                  {currentExplanation?.policy ? String(currentExplanation.policy) : "policy"}
+                </div>
+              </div>
+
+              <div className="px-5 py-4 space-y-3">
+                <div className="text-sm leading-relaxed whitespace-pre-wrap">
+                  {currentExplanation?.text ?? "(no explanation text)"}
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs text-neutral-300">
+                  <div className="rounded-xl border border-white/10 bg-white/5 p-3">
+                    <div className="text-neutral-400">Job</div>
+                    <div className="mt-1 font-mono break-all">{currentExplanation?.job_id ?? "—"}</div>
+                  </div>
+                  <div className="rounded-xl border border-white/10 bg-white/5 p-3">
+                    <div className="text-neutral-400">Node</div>
+                    <div className="mt-1 font-mono break-all">{currentExplanation?.node ?? "—"}</div>
+                  </div>
+                  <div className="rounded-xl border border-white/10 bg-white/5 p-3">
+                    <div className="text-neutral-400">Reward / Latency</div>
+                    <div className="mt-1 font-mono">
+                      {typeof currentExplanation?.reward === "number"
+                        ? currentExplanation.reward.toFixed(3)
+                        : "—"}{" "}
+                      /{" "}
+                      {typeof currentExplanation?.latency_ms === "number"
+                        ? Math.round(currentExplanation.latency_ms)
+                        : "—"}
+                      ms
+                    </div>
+                  </div>
+                </div>
+
+                <details className="rounded-xl border border-white/10 bg-white/5 p-3">
+                  <summary className="cursor-pointer text-xs text-neutral-300 select-none">
+                    Raw metadata (for debugging)
+                  </summary>
+                  <pre className="mt-2 max-h-56 overflow-auto text-[11px] leading-snug text-neutral-400">
+                    {JSON.stringify(
+                      {
+                        meta: currentExplanation?.meta,
+                        context: currentExplanation?.context,
+                        learner: currentExplanation?.learner_snapshot,
+                      },
+                      null,
+                      2
+                    )}
+                  </pre>
+                </details>
+              </div>
+
+              <div className="flex items-center justify-end gap-2 border-t border-white/10 px-5 py-4">
+                <button
+                  className="rounded-xl bg-white text-black px-4 py-2 text-sm font-semibold hover:opacity-90"
+                  onClick={continueAfterExplanation}
+                >
+                  Continue
+                </button>
+              </div>
+            </Motion.div>
+          </Motion.div>
+        ) : null}
+      </AnimatePresence>
+
+      {/* ------------------ Original page below ------------------ */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold tracking-tight">Agentic Resource Simulator</h1>
@@ -559,9 +785,8 @@ export function Simulation() {
               setIsAgentControlled(!isAgentControlled);
               if (!isRunning) setIsRunning(true);
 
-              // keep UI consistent when toggling
               if (!isAgentControlled) {
-                // turning ON agent: don’t overwrite; backend will update on submit
+                // turning ON agent: backend will update route strategy on submit
               } else {
                 // turning OFF agent: display manual policy
                 setCurrentRouteStrategy(policy);
@@ -587,7 +812,11 @@ export function Simulation() {
                 : "bg-indigo-600 text-white hover:bg-indigo-700 shadow-lg shadow-indigo-500/20"
             }`}
           >
-            {isRunning ? <Pause className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current" />}
+            {isRunning ? (
+              <Pause className="w-4 h-4 fill-current" />
+            ) : (
+              <Play className="w-4 h-4 fill-current" />
+            )}
             {isRunning ? "Pause" : "Start Sim"}
           </button>
 
@@ -634,13 +863,18 @@ export function Simulation() {
                       <span className="font-mono">{(agent.explorationRate * 100).toFixed(0)}%</span>
                     </div>
                     <div className="h-1 bg-purple-900/50 rounded-full overflow-hidden">
-                      <Motion.div animate={{ width: `${agent.explorationRate * 100}%` }} className="h-full bg-purple-400" />
+                      <Motion.div
+                        animate={{ width: `${agent.explorationRate * 100}%` }}
+                        className="h-full bg-purple-400"
+                      />
                     </div>
                   </div>
 
-                  {/* NEW: show selection frequency + reward */}
+                  {/* show selection frequency + reward */}
                   <div className="space-y-2 pt-2 border-t border-purple-500/20">
-                    <p className="text-[10px] text-purple-400 uppercase font-bold mb-2">Policy Reward + Selection</p>
+                    <p className="text-[10px] text-purple-400 uppercase font-bold mb-2">
+                      Policy Reward + Selection
+                    </p>
 
                     {(selectedPolicies as Policy[]).map((p) => {
                       const s = policyStats[p];
@@ -675,7 +909,7 @@ export function Simulation() {
             )}
           </AnimatePresence>
 
-          {/* --- EVERYTHING BELOW IS YOUR ORIGINAL JSX, only tiny display changes later --- */}
+          {/* --- everything below = your original JSX structure --- */}
           <div className="bg-neutral-900 border border-neutral-800 rounded-2xl p-6">
             <div className="flex items-center gap-2 mb-6">
               <Network className="w-5 h-5 text-purple-400" />
@@ -893,12 +1127,8 @@ export function Simulation() {
                     Current Route Strategy
                   </span>
 
-                  {/*  display backend-chosen strategy, not manual policy */}
-                  <h4 className="text-lg font-bold capitalize">
-                    {currentRouteStrategy.replace("-", " ")}
-                  </h4>
+                  <h4 className="text-lg font-bold capitalize">{currentRouteStrategy.replace("-", " ")}</h4>
 
-                  {/*show chosen node */}
                   <p className="text-[11px] text-neutral-400 mt-1">
                     Last routed to: <span className="font-mono text-white">{lastChosenNodeLabel}</span>
                   </p>
@@ -917,7 +1147,13 @@ export function Simulation() {
                     transition={{ type: "spring", stiffness: 100 }}
                     className="absolute left-1/2 -ml-4"
                   >
-                    <div className={`w-8 h-8 rounded-lg flex items-center justify-center border shadow-sm ${isAgentControlled ? "bg-purple-900/50 border-purple-500/30" : "bg-neutral-800 border-neutral-700"}`}>
+                    <div
+                      className={`w-8 h-8 rounded-lg flex items-center justify-center border shadow-sm ${
+                        isAgentControlled
+                          ? "bg-purple-900/50 border-purple-500/30"
+                          : "bg-neutral-800 border-neutral-700"
+                      }`}
+                    >
                       <Zap className={`w-4 h-4 ${isAgentControlled ? "text-purple-400" : "text-indigo-400"}`} />
                     </div>
                   </Motion.div>
@@ -970,8 +1206,8 @@ export function Simulation() {
                             node.status === "offline"
                               ? "#262626"
                               : isAgentControlled
-                              ? "#a855f7"
-                              : "#6366f1",
+                                ? "#a855f7"
+                                : "#6366f1",
                         }}
                         className="h-full"
                       />
@@ -982,7 +1218,7 @@ export function Simulation() {
             </div>
           </div>
 
-          {/* ---- YOUR LEADERBOARD + DIAGNOSTICS PANELS (UNCHANGED) ---- */}
+          {/* Leaderboard + Diagnostics */}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
             <div className="md:col-span-2 bg-neutral-900 border border-neutral-800 rounded-2xl p-6">
               <div className="flex items-center justify-between mb-6">
@@ -1023,12 +1259,14 @@ export function Simulation() {
                         </td>
 
                         <td className="py-3">
-                          <span className={`text-sm font-medium capitalize ${policy === stat.policy ? "text-indigo-400 font-bold" : "text-neutral-400"}`}>
+                          <span
+                            className={`text-sm font-medium capitalize ${
+                              policy === stat.policy ? "text-indigo-400 font-bold" : "text-neutral-400"
+                            }`}
+                          >
                             {stat.policy.replace("-", " ")}
                           </span>
-                          <div className="text-[10px] text-neutral-600">
-                            selected {stat.selectionPct.toFixed(0)}%
-                          </div>
+                          <div className="text-[10px] text-neutral-600">selected {stat.selectionPct.toFixed(0)}%</div>
                         </td>
 
                         <td className="py-3 text-right text-xs font-mono text-neutral-500">{stat.completedTasks}</td>
@@ -1054,7 +1292,11 @@ export function Simulation() {
                                 <div
                                   key={i}
                                   className={`w-1 h-3 rounded-full ${
-                                    improved == null ? "bg-neutral-700/60" : improved ? "bg-emerald-500/40" : "bg-rose-500/40"
+                                    improved == null
+                                      ? "bg-neutral-700/60"
+                                      : improved
+                                        ? "bg-emerald-500/40"
+                                        : "bg-rose-500/40"
                                   }`}
                                 />
                               );
@@ -1095,6 +1337,31 @@ export function Simulation() {
                   </div>
                 </div>
 
+                {/* Explanation Box (Latest switch) */}
+                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <History className="h-4 w-4 text-neutral-300" />
+                      <div className="text-sm font-semibold">Latest Explanation</div>
+                    </div>
+                    <div className="text-xs text-neutral-400">
+                      {latestExplanation?.policy ? String(latestExplanation.policy) : "—"}
+                    </div>
+                  </div>
+
+                  <div className="mt-3 text-sm leading-relaxed whitespace-pre-wrap text-neutral-200">
+                    {latestExplanation?.text
+                      ? latestExplanation.text
+                      : "No policy switches yet. When the agent switches strategies, you’ll see the explanation here (and the sim will pause)."}
+                  </div>
+
+                  {latestExplanation?.meta?.from_policy && latestExplanation?.meta?.to_policy ? (
+                    <div className="mt-3 text-xs text-neutral-400">
+                      Switch: {String(latestExplanation.meta.from_policy)} → {String(latestExplanation.meta.to_policy)}
+                    </div>
+                  ) : null}
+                </div>
+
                 <div className="space-y-3 mt-auto">
                   <div className="flex justify-between text-xs">
                     <span className="text-neutral-500">System Throughput</span>
@@ -1131,7 +1398,7 @@ export function Simulation() {
             </div>
           </div>
 
-          {/* If you want, add a UI knob for simulationSpeed too */}
+          {/* If you want: add a UI knob for simulationSpeed too */}
         </div>
       </div>
     </div>

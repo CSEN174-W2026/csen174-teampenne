@@ -7,6 +7,7 @@ from app.agent.policies import RoutingPolicy, build_policies
 from app.state_types import JobRequest, NodeSnapshot
 from app.agent.learning_method import Learner, make_learner
 from app.agent.goals import Goal, Outcome, make_goal
+from app.agent.decision_explainer import DecisionExplainer
 
 # from app.agent.policies import RoutingPolicy, build_policies
 # from app.state_types import JobRequest, NodeSnapshot
@@ -120,6 +121,7 @@ class ManagerAgent:
         
         learner_kwargs = learner_kwargs or {}
         self.learner: Learner = make_learner(learner_kind, seed=seed, **learner_kwargs) # Initialize the learner
+        self.explainer = DecisionExplainer(history=max(500, history_size))  # For explaining decisions, keeps a history of outcomes
 
         goal_kwargs = goal_kwargs or {}
         self.goal: Goal = make_goal(goal_kind, **goal_kwargs)
@@ -159,6 +161,15 @@ class ManagerAgent:
             user_id=getattr(job, "user_id", None),
         )
         self._pending[job.job_id] = d # Remember the decision for this job so we can update the learner later when the outcome comes back
+        self.explainer.record_choice(
+            job_id=job.job_id,
+            chosen_policy=policy_name,
+            chosen_node=chosen.name,
+            context=context,
+            learner_stats=self.learner_stats(),
+            learner_name=getattr(self.learner, "name", "unknown"),
+        )
+
         return d
     
     # Observe the outcome of a completed job, update learner --> when job is finished
@@ -196,6 +207,16 @@ class ManagerAgent:
 
         reward = float(self.goal.reward(o)) # Compute reward based on the outcome
         self.learner.update(d.policy_name, reward, context=d.context)
+
+        self.explainer.record_observation(
+            job_id=job_id,
+            policy=d.policy_name,
+            reward=reward,
+            latency_ms=lat,
+            success=bool(success),
+            learner_stats_after=self.learner_stats(),
+            learner_name=getattr(self.learner, "name", "unknown"),
+        )
 
         self._outcomes.append(o)
         if len(self._outcomes) > self._history_size:
