@@ -12,7 +12,8 @@ import {
   Cpu,
   Database,
   Globe,
-  Zap
+  Zap,
+  Rocket
 } from "lucide-react";
 import { useState } from "react";
 import { motion as Motion, AnimatePresence } from "motion/react";
@@ -27,6 +28,7 @@ export function Root() {
     { icon: Activity, label: "Services", path: "/services" },
     { icon: Terminal, label: "System Logs", path: "/logs" },
     { icon: Zap, label: "Simulation", path: "/simulation" },
+    { icon: Rocket, label: "Runs", path: "/runs" },
   ];
 
   return (

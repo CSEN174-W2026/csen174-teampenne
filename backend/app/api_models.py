@@ -36,7 +36,7 @@ class WorkloadConfig(BaseModel):
     jobs: int = Field(default=200, ge=1, le=10000)
     seed: int = 42
     users: List[str] = Field(default_factory=lambda: ["u1", "u2", "u3"]) # default users for fairness-aware policy
-    sla_threshold_ms = Optional[int] = 100
+    sla_threshold_ms: Optional[int] = 100
     
 class RunConfig(BaseModel):
     goal_kind: GoalKind = "min_mean_latency"

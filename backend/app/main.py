@@ -1,8 +1,10 @@
 # Combine everything together in main.py
 from __future__ import annotations
 import json
+import os
 import threading
 import time
+import uuid
 from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -14,6 +16,8 @@ from app.agent.manager_agent import ManagerAgent
 from app.state_types import JobRequest, NodeSnapshot
 from app.node.node_client import NodeClient
 from app.node.virtualbox import discover_nodes
+from app.api_models import RunConfig, RunStartResponse, RunStatusResponse
+from app.run_engine import RunEngine, RunState
 
 
 app = FastAPI(title="CSEN 174 Manager API")
@@ -32,6 +36,8 @@ app.add_middleware(
 
 
 POLL_S = 2.0 # How often to poll nodes for metrics
+METRICS_SINK_URL = os.getenv("METRICS_SINK_URL", "http://127.0.0.1:3000/api/metrics/node-samples")
+METRICS_SINK_TIMEOUT_S = float(os.getenv("METRICS_SINK_TIMEOUT_S", "0.8"))
 OBSERVE_DEUP: Set[str] = set() # To track which nodes we've already observed during discovery
 OBSERVE_LOCK = threading.Lock() # To synchronize access to OBSERVE_DEUP -> protect against race conditions
 
@@ -54,6 +60,9 @@ reuses the same ManagerAgent instance, allowing it to learn and improve over tim
 """
 AGENTS: Dict[Tuple[str, str, str, str, Optional[int]], ManagerAgent] = {}
 AGENTS_LOCK = threading.Lock()
+RUNS: Dict[str, RunState] = {}
+RUNS_LOCK = threading.Lock()
+RUN_ENGINE = RunEngine()
 
 
 
@@ -116,6 +125,46 @@ def live_snapshots() -> List[NodeSnapshot]:
         except Exception as e:
             print(f"[WARN] metrics failed for {n.name}: {e}")
     return snaps
+
+
+def persist_node_samples(snaps: List[NodeSnapshot], captured_at_ms: int) -> None:
+    """
+    Best-effort persistence of live node metrics into Postgres via web API.
+    """
+    if not METRICS_SINK_URL or not snaps:
+        return
+
+    payload = {
+        "samples": [
+            {
+                "nodeName": s.name,
+                "host": s.host,
+                "port": s.port,
+                "cpus": s.cpus,
+                "memoryMb": s.memory_mb,
+                "cpuPct": s.cpu_pct,
+                "memPct": s.mem_pct,
+                "queueLen": s.queue_len,
+                "inFlight": s.in_flight,
+                "ewmaLatencyMs": s.ewma_latency_ms,
+                "p95LatencyMs": s.p95_latency_ms,
+                "completedLast60s": s.completed_last_60s,
+                "nodeSpeed": s.node_speed,
+                "capturedAtMs": captured_at_ms,
+                "source": "backend_nodes_poll",
+                "metadata": {},
+            }
+            for s in snaps
+        ]
+    }
+
+    try:
+        r = requests.post(METRICS_SINK_URL, json=payload, timeout=METRICS_SINK_TIMEOUT_S)
+        if r.status_code >= 400:
+            print(f"[WARN] metrics sink returned {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        # Keep /nodes fast and resilient even if metrics sink is unavailable.
+        print(f"[WARN] metrics sink unreachable: {e}")
 
 # Universal object -> dictionary converter
 # Standardizes everything into JSON-serializable dictionary
@@ -224,7 +273,9 @@ def health():
 @app.get("/nodes")
 def nodes():
     snaps = live_snapshots()
-    return {"count": len(snaps), "nodes": [to_dict(s) for s in snaps], "time_ms": now_ms()}
+    t_ms = now_ms()
+    persist_node_samples(snaps, t_ms)
+    return {"count": len(snaps), "nodes": [to_dict(s) for s in snaps], "time_ms": t_ms}
 
 
 @app.post("/jobs/submit", response_model=SubmitJobResult)
@@ -329,3 +380,24 @@ def list_agents():
             for k in keys
         ],
     }
+
+
+@app.post("/runs/start", response_model=RunStartResponse)
+def start_run(cfg: RunConfig):
+    run_id = str(uuid.uuid4())
+    state = RunState.new(run_id, cfg)
+    with RUNS_LOCK:
+        RUNS[run_id] = state
+
+    t = threading.Thread(target=RUN_ENGINE.execute_run, args=(run_id, cfg, RUNS), daemon=True)
+    t.start()
+    return RunStartResponse(run_id=run_id, status="running")
+
+
+@app.get("/runs/{run_id}", response_model=RunStatusResponse)
+def get_run_status(run_id: str):
+    with RUNS_LOCK:
+        st = RUNS.get(run_id)
+    if st is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return st.to_response()

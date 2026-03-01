@@ -17,6 +17,22 @@ export default defineConfig({
     },
   },
 
+  // Dev proxies avoid CORS when frontend calls backend services.
+  server: {
+    proxy: {
+      '/manager-api': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+        rewrite: (p) => p.replace(/^\/manager-api/, ''),
+      },
+      '/web-api': {
+        target: 'http://localhost:3000',
+        changeOrigin: true,
+        rewrite: (p) => p.replace(/^\/web-api/, ''),
+      },
+    },
+  },
+
   // File types to support raw imports. Never add .css, .tsx, or .ts files to this.
   assetsInclude: ['**/*.svg', '**/*.csv'],
 })

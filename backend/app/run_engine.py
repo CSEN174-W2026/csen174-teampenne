@@ -3,13 +3,18 @@ from dataclasses import dataclass, field
 from typing import Dict, Any, List
 import time
 import random
+import os
+import requests
 
-from api_models import RunConfig, RunStatusResponse
-from state_types import JobRequest, NodeSnapshot
-from node.node_client import NodeClient
-from node.virtualbox import discover_nodes
-from agent.manager_agent import ManagerAgent
-from run_store import RunStore
+from app.api_models import RunConfig, RunStatusResponse
+from app.state_types import JobRequest, NodeSnapshot
+from app.node.node_client import NodeClient
+from app.node.virtualbox import discover_nodes
+from app.agent.manager_agent import ManagerAgent
+from app.run_store import RunStore
+
+RUN_EVENTS_SINK_URL = os.getenv("RUN_EVENTS_SINK_URL", "http://127.0.0.1:3000/api/runs/events")
+RUN_EVENTS_SINK_TIMEOUT_S = float(os.getenv("RUN_EVENTS_SINK_TIMEOUT_S", "1.0"))
 
 @dataclass
 class RunState:
@@ -62,7 +67,6 @@ class RunEngine:
         deadline = time.time() + (timeout_ms / 1000.0)
         while time.time() < deadline:
             # node_worker already exposes /recent_jobs
-            import requests
             url = f"http://{node.host}:{node.port}/recent_jobs?limit=200"
             r = requests.get(url, timeout=client.timeout_s)
             r.raise_for_status()
@@ -72,6 +76,16 @@ class RunEngine:
                     return j
             time.sleep(poll_ms / 1000.0)
         return None
+
+    def _push_event(self, payload: Dict[str, Any]) -> None:
+        if not RUN_EVENTS_SINK_URL:
+            return
+        try:
+            r = requests.post(RUN_EVENTS_SINK_URL, json=payload, timeout=RUN_EVENTS_SINK_TIMEOUT_S)
+            if r.status_code >= 400:
+                print(f"[WARN] run events sink returned {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            print(f"[WARN] run events sink unreachable: {e}")
 
     def execute_run(self, run_id: str, cfg: RunConfig, runs: Dict[str, RunState]):
         st = runs[run_id]
@@ -108,6 +122,23 @@ class RunEngine:
                     error=st.summary["error"],
                 )
                 return
+            self._push_event(
+                {
+                    "kind": "run_started",
+                    "runId": run_id,
+                    "config": cfg.model_dump(),
+                    "nodes": [
+                        {
+                            "name": n.name,
+                            "host": n.host,
+                            "port": n.port,
+                            "cpus": n.cpus,
+                            "memory_mb": n.memory_mb,
+                        }
+                        for n in nodes_base
+                    ],
+                }
+            )
 
             for i in range(cfg.workload.jobs):
                 live = []
@@ -166,6 +197,48 @@ class RunEngine:
                     "metadata": job.metadata,
                 })
                 st.processed_jobs += 1
+                self._push_event(
+                    {
+                        "kind": "iteration",
+                        "runId": run_id,
+                        "idx": i,
+                        "job": {
+                            "job_id": job.job_id,
+                            "user_id": user,
+                            "service_time_ms": svc,
+                            "metadata": job.metadata or {},
+                        },
+                        "outcome": {
+                            "policy_name": outcome.policy_name,
+                            "node_name": outcome.node_name,
+                            "success": outcome.success,
+                        },
+                        "target": {
+                            "host": target.host,
+                            "port": target.port,
+                        },
+                        "latency_ms": lat,
+                        "reward": reward,
+                        "sla_threshold_ms": sla,
+                        "sla_violation": lat > sla,
+                        "learner_stats": agent.learner_stats(),
+                        "live_nodes": [
+                            {
+                                "name": n.name,
+                                "cpu_pct": n.cpu_pct,
+                                "mem_pct": n.mem_pct,
+                                "queue_len": n.queue_len,
+                                "in_flight": n.in_flight,
+                                "ewma_latency_ms": n.ewma_latency_ms,
+                                "p95_latency_ms": n.p95_latency_ms,
+                                "completed_last_60s": n.completed_last_60s,
+                                "node_speed": n.node_speed,
+                            }
+                            for n in live
+                        ],
+                        "captured_at_ms": int(time.time() * 1000),
+                    }
+                )
                 self.store.append_job_event(
                     run_id=run_id,
                     idx=i,
@@ -206,6 +279,14 @@ class RunEngine:
                 processed_jobs=st.processed_jobs,
                 summary=st.summary,
             )
+            self._push_event(
+                {
+                    "kind": "run_finished",
+                    "runId": run_id,
+                    "status": st.status,
+                    "summary": st.summary,
+                }
+            )
         except Exception as ex:
             st.status = "failed"
             st.summary = {"error": str(ex)}
@@ -215,4 +296,12 @@ class RunEngine:
                 processed_jobs=st.processed_jobs,
                 summary=st.summary,
                 error=str(ex),
+            )
+            self._push_event(
+                {
+                    "kind": "run_finished",
+                    "runId": run_id,
+                    "status": st.status,
+                    "summary": st.summary,
+                }
             )

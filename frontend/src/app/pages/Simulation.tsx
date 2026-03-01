@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { 
   Play, 
   Pause, 
@@ -23,6 +23,7 @@ import {
   ResponsiveContainer,
   Cell
 } from "recharts";
+import { persistIterations, submitJob as submitJobApi } from "../../lib/api";
 
 interface Node {
   id: string;
@@ -66,6 +67,9 @@ interface AgentState {
 type Policy = 'round-robin' | 'least-loaded' | 'resource-aware' | 'random';
 
 export function Simulation() {
+  const runIdRef = useRef(`frontend-sim-${Date.now()}`);
+  const iterationRef = useRef(0);
+
   const [isRunning, setIsRunning] = useState(false);
   const [isAgentControlled, setIsAgentControlled] = useState(false);
   const [policy, setPolicy] = useState<Policy>('round-robin');
@@ -115,11 +119,82 @@ export function Simulation() {
     };
   }, []);
 
-  const submitJob = (overrides = {}) => {
+  const enqueueTask = (overrides = {}) => {
     const newTask = createRandomTask(overrides);
     newTask.remainingTime = newTask.duration;
     setGlobalQueue(prev => [...prev, newTask]);
   };
+
+  const dispatchTaskToBackend = useCallback(async (task: Task, fallbackTarget: Node) => {
+    const startedAt = performance.now();
+    let success = true;
+    let decision: Record<string, any> = {};
+    let responseBody: Record<string, any> = {};
+    let errorMessage: string | null = null;
+
+    try {
+      responseBody = await submitJobApi({
+        config: {
+          learner_kind: "sample_average",
+          goal_kind: "min_mean_latency",
+        },
+        job: {
+          job_id: task.id,
+          user_id: "frontend-sim-user",
+          service_time_ms: Math.max(1, task.duration * 100),
+          metadata: {
+            source: "frontend-simulation",
+            cpuReq: task.cpuReq,
+            memReq: task.memReq,
+            queuedAt: task.queuedAt,
+          },
+        },
+      });
+      decision = (responseBody?.decision ?? {}) as Record<string, any>;
+    } catch (err: unknown) {
+      success = false;
+      errorMessage = err instanceof Error ? err.message : "unknown error";
+    }
+
+    const elapsedMs = Math.max(1, Math.round(performance.now() - startedAt));
+    iterationRef.current += 1;
+
+    try {
+      await persistIterations({
+        userId: "frontend-sim-user",
+        runId: runIdRef.current,
+        records: [
+          {
+            iteration: iterationRef.current,
+            policyName: (decision.policy_name as string) ?? policy,
+            nodeName: (decision.node_name as string) ?? fallbackTarget.name,
+            targetHost: (decision.host as string) ?? "127.0.0.1",
+            targetPort: Number(decision.port ?? 0) || 0,
+            success,
+            latencyMs: elapsedMs,
+            learnerArm: (decision.policy_name as string) ?? policy,
+            metadata: {
+              taskId: task.id,
+              simTask: {
+                cpuReq: task.cpuReq,
+                memReq: task.memReq,
+                duration: task.duration,
+              },
+              fallbackTarget: {
+                name: fallbackTarget.name,
+                id: fallbackTarget.id,
+              },
+              backendDecision: decision,
+              backendResponse: responseBody,
+              error: errorMessage,
+            },
+          },
+        ],
+      });
+    } catch (persistErr) {
+      console.error("Failed to persist iteration", persistErr);
+    }
+  }, [policy]);
 
   const selectNode = useCallback((task: Task, currentNodes: Node[]) => {
     const activeNodes = currentNodes.filter(n => 
@@ -280,6 +355,7 @@ export function Simulation() {
                 memUsed: nextNodes[nodeIdx].memUsed + task.memReq,
               };
               assignedIds.push(task.id);
+              void dispatchTaskToBackend(task, target);
             }
           });
           return nextNodes;
@@ -289,7 +365,7 @@ export function Simulation() {
 
       // 3. Spawn random
       if (Math.random() < 0.25 * simulationSpeed) {
-        submitJob();
+        enqueueTask();
       }
 
     }, 1000 / simulationSpeed);
@@ -481,7 +557,7 @@ export function Simulation() {
                 <div className="flex justify-between text-xs text-neutral-500"><span>CPU Intensity</span><span>{manualTask.cpu}</span></div>
                 <input type="range" min="10" max="80" step="5" value={manualTask.cpu} onChange={e => setManualTask(prev => ({ ...prev, cpu: parseInt(e.target.value) }))} className="w-full h-1 bg-neutral-800 rounded-lg appearance-none accent-emerald-500" />
               </div>
-              <button onClick={() => submitJob({ cpuReq: manualTask.cpu, memReq: manualTask.mem, duration: 15 })} className="w-full py-2 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-500 border border-emerald-500/30 rounded-lg text-sm font-medium transition-colors">
+              <button onClick={() => enqueueTask({ cpuReq: manualTask.cpu, memReq: manualTask.mem, duration: 15 })} className="w-full py-2 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-500 border border-emerald-500/30 rounded-lg text-sm font-medium transition-colors">
                 Spike Load
               </button>
             </div>

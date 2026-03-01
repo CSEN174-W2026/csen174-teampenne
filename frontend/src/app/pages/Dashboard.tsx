@@ -17,7 +17,7 @@ import { MetricCard } from "../components/MetricCard";
 import { ResourceChart } from "../components/ResourceChart";
 import { motion } from "motion/react";
 
-import { getNodes, type NodeSnapshot } from "../../lib/api";
+import { getNodes, getStoredNodeSamples, type NodeSnapshot, type StoredNodeSample } from "../../lib/api";
 
 type SeriesPoint = { t: number; cpu: number; mem: number };
 
@@ -25,6 +25,7 @@ export function Dashboard() {
   const [nodes, setNodes] = useState<NodeSnapshot[]>([]);
   const [nodesTimeMs, setNodesTimeMs] = useState<number>(Date.now());
   const [series, setSeries] = useState<SeriesPoint[]>([]);
+  const [storedSamples, setStoredSamples] = useState<StoredNodeSample[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   // ---- Poll /nodes
@@ -68,6 +69,28 @@ export function Dashboard() {
     };
   }, []);
 
+  // ---- Poll persisted metrics rows from Postgres (via web API)
+  useEffect(() => {
+    let alive = true;
+
+    async function tickStored() {
+      try {
+        const data = await getStoredNodeSamples(20);
+        if (!alive) return;
+        setStoredSamples(data.rows ?? []);
+      } catch {
+        if (!alive) return;
+      }
+    }
+
+    tickStored();
+    const id = setInterval(tickStored, 5000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, []);
+
   // ---- Metric cards (real ones you can compute from /nodes)
   const totalNodes = nodes.length;
 
@@ -98,15 +121,21 @@ export function Dashboard() {
   }, [nodes]);
 
   const recentEvents = useMemo(() => {
-    // You don't have an /activity endpoint; keep this placeholder OR
-    // create a new endpoint later that returns recent job completions, errors, autoscaling, etc.
+    const sampleEvents = storedSamples.slice(0, 6).map((s) => ({
+      id: s.id,
+      title: `Metric snapshot saved for ${s.nodeName} (${Math.round(Number(s.cpuPct ?? 0))}% CPU)`,
+      time: new Date(Number(s.capturedAtMs)).toLocaleTimeString(),
+      status: "info",
+    }));
+
     return [
-      { id: 1, title: `Polled /nodes (${totalNodes} found)`, time: new Date(nodesTimeMs).toLocaleTimeString(), status: "info" },
-      ...(error
-        ? [{ id: 2, title: `API error: ${error}`, time: "just now", status: "warning" }]
+      ...sampleEvents,
+      ...(error ? [{ id: -1, title: `API error: ${error}`, time: "just now", status: "warning" }] : []),
+      ...(sampleEvents.length === 0
+        ? [{ id: -2, title: `Live poll active /nodes (${totalNodes} found)`, time: new Date(nodesTimeMs).toLocaleTimeString(), status: "info" }]
         : []),
     ];
-  }, [totalNodes, nodesTimeMs, error]);
+  }, [storedSamples, totalNodes, nodesTimeMs, error]);
 
   return (
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-700">
