@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from fastapi import Body
 
 from app.agent.manager_agent import ManagerAgent
 from app.state_types import JobRequest, NodeSnapshot
@@ -347,6 +348,50 @@ def agent_learner_stats(cfg: AgentConfig):
     )
     return agent.learner_stats()
 
+@app.post("/agents/latency_stats")
+def agent_latency_stats(cfg: AgentConfig):
+    agent = get_agent(
+        learner_kind=cfg.learner_kind,
+        goal_kind=cfg.goal_kind,
+        seed=cfg.seed,
+        learner_kwargs=cfg.learner_kwargs,
+        goal_kwargs=cfg.goal_kwargs,
+    )
+    return agent.latency_stats()
+
+
+@app.post("/agents/summary")
+def agent_summary(cfg: AgentConfig):
+    agent = get_agent(
+        learner_kind=cfg.learner_kind,
+        goal_kind=cfg.goal_kind,
+        seed=cfg.seed,
+        learner_kwargs=cfg.learner_kwargs,
+        goal_kwargs=cfg.goal_kwargs,
+    )
+    return agent.summary()
+
+
+@app.post("/agents/stats")
+def agent_stats(cfg: AgentConfig):
+    """
+    One call for frontend: learner stats + latency stats + summary + pending
+    """
+    agent = get_agent(
+        learner_kind=cfg.learner_kind,
+        goal_kind=cfg.goal_kind,
+        seed=cfg.seed,
+        learner_kwargs=cfg.learner_kwargs,
+        goal_kwargs=cfg.goal_kwargs,
+    )
+    return {
+        "learner": agent.learner_stats(),
+        "latency": agent.latency_stats(),
+        "summary": agent.summary(),
+        "pending_job_ids": agent.pending_job_ids(),
+        "time_ms": now_ms(),
+    }
+
 
 @app.post("/agents/pending")
 def agent_pending(cfg: AgentConfig):
@@ -382,22 +427,50 @@ def list_agents():
     }
 
 
-@app.post("/runs/start", response_model=RunStartResponse)
-def start_run(cfg: RunConfig):
-    run_id = str(uuid.uuid4())
-    state = RunState.new(run_id, cfg)
-    with RUNS_LOCK:
-        RUNS[run_id] = state
 
-    t = threading.Thread(target=RUN_ENGINE.execute_run, args=(run_id, cfg, RUNS), daemon=True)
-    t.start()
-    return RunStartResponse(run_id=run_id, status="running")
+@app.post("/reset")
+def reset_all():
+    global OBSERVE_DEUP
+    with AGENTS_LOCK:
+        AGENTS.clear()
+    with OBSERVE_LOCK:
+        OBSERVE_DEUP.clear()
+    return {"ok": True, "time_ms": now_ms()}
 
 
-@app.get("/runs/{run_id}", response_model=RunStatusResponse)
-def get_run_status(run_id: str):
-    with RUNS_LOCK:
-        st = RUNS.get(run_id)
-    if st is None:
-        raise HTTPException(status_code=404, detail="run not found")
-    return st.to_response()
+
+@app.post("/agents/explanations/recent")
+def agent_explanations_recent(cfg: AgentConfig, limit: int = 50):
+    agent = get_agent(
+        learner_kind=cfg.learner_kind,
+        goal_kind=cfg.goal_kind,
+        seed=cfg.seed,
+        learner_kwargs=cfg.learner_kwargs,
+        goal_kwargs=cfg.goal_kwargs,
+    )
+    # requires you added agent.explainer
+    return {"events": agent.explainer.recent_events(limit=limit), "time_ms": now_ms()}
+
+
+@app.post("/agents/explanations/summary")
+def agent_explanations_summary(cfg: AgentConfig):
+    agent = get_agent(
+        learner_kind=cfg.learner_kind,
+        goal_kind=cfg.goal_kind,
+        seed=cfg.seed,
+        learner_kwargs=cfg.learner_kwargs,
+        goal_kwargs=cfg.goal_kwargs,
+    )
+    return {"summary": agent.explainer.summary(), "time_ms": now_ms()}
+
+
+@app.post("/agents/explanations/timeseries")
+def agent_explanations_timeseries(cfg: AgentConfig):
+    agent = get_agent(
+        learner_kind=cfg.learner_kind,
+        goal_kind=cfg.goal_kind,
+        seed=cfg.seed,
+        learner_kwargs=cfg.learner_kwargs,
+        goal_kwargs=cfg.goal_kwargs,
+    )
+    return {"series": agent.explainer.timeseries(), "time_ms": now_ms()}

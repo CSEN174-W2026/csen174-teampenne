@@ -7,6 +7,7 @@ from app.agent.policies import RoutingPolicy, build_policies
 from app.state_types import JobRequest, NodeSnapshot
 from app.agent.learning_method import Learner, make_learner
 from app.agent.goals import Goal, Outcome, make_goal
+from app.agent.decision_explainer import DecisionExplainer
 
 # from app.agent.policies import RoutingPolicy, build_policies
 # from app.state_types import JobRequest, NodeSnapshot
@@ -108,8 +109,19 @@ class ManagerAgent:
     ):
         self.policies: Dict[str, RoutingPolicy] = policies or build_policies(seed) # If caller passes policies, use them, otherwise build default ones
         
+        policy_allowlist = None
+        if learner_kwargs and isinstance(learner_kwargs.get("policy_allowlist"), list):
+            policy_allowlist = set(str(x) for x in learner_kwargs["policy_allowlist"])
+
+        if policy_allowlist:
+            self.policies = {k: v for k, v in self.policies.items() if k in policy_allowlist}
+            if not self.policies:
+                raise ValueError("policy_allowlist removed all policies; check names")
+            
+        
         learner_kwargs = learner_kwargs or {}
         self.learner: Learner = make_learner(learner_kind, seed=seed, **learner_kwargs) # Initialize the learner
+        self.explainer = DecisionExplainer(history=max(500, history_size))  # For explaining decisions, keeps a history of outcomes
 
         goal_kwargs = goal_kwargs or {}
         self.goal: Goal = make_goal(goal_kind, **goal_kwargs)
@@ -149,6 +161,15 @@ class ManagerAgent:
             user_id=getattr(job, "user_id", None),
         )
         self._pending[job.job_id] = d # Remember the decision for this job so we can update the learner later when the outcome comes back
+        self.explainer.record_choice(
+            job_id=job.job_id,
+            chosen_policy=policy_name,
+            chosen_node=chosen.name,
+            context=context,
+            learner_stats=self.learner_stats(),
+            learner_name=getattr(self.learner, "name", "unknown"),
+        )
+
         return d
     
     # Observe the outcome of a completed job, update learner --> when job is finished
@@ -187,11 +208,34 @@ class ManagerAgent:
         reward = float(self.goal.reward(o)) # Compute reward based on the outcome
         self.learner.update(d.policy_name, reward, context=d.context)
 
+        self.explainer.record_observation(
+            job_id=job_id,
+            policy=d.policy_name,
+            reward=reward,
+            latency_ms=lat,
+            success=bool(success),
+            learner_stats_after=self.learner_stats(),
+            learner_name=getattr(self.learner, "name", "unknown"),
+        )
+
         self._outcomes.append(o)
         if len(self._outcomes) > self._history_size:
             self._outcomes.pop(0)
 
         return o, reward
+
+    def latency_stats(self) -> Dict[str, dict]:
+        acc = {}
+        for o in self._outcomes:
+            p = o.policy_name
+            a = acc.setdefault(p, {"n": 0, "total_latency_ms": 0.0, "avg_latency_ms": 0.0})
+            a["n"] += 1
+            a["total_latency_ms"] += float(o.latency_ms)
+
+        for p, a in acc.items():
+            if a["n"] > 0:
+                a["avg_latency_ms"] = a["total_latency_ms"] / a["n"]
+        return acc
 
     def learner_stats(self) -> Dict[str, dict]:
         return self.learner.stats()
