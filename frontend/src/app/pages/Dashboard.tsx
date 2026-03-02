@@ -161,7 +161,7 @@ export function Dashboard() {
           {error ? <p className="text-sm text-rose-400 mt-2">{error}</p> : null}
         </div>
 
-        <div className="flex items-center gap-2 bg-neutral-900 border border-neutral-800 p-1 rounded-lg">
+        {/* <div className="flex items-center gap-2 bg-neutral-900 border border-neutral-800 p-1 rounded-lg">
           <button className="px-3 py-1.5 text-sm font-medium rounded-md bg-neutral-800 text-white shadow-sm">
             24 Hours
           </button>
@@ -171,7 +171,7 @@ export function Dashboard() {
           <button className="px-3 py-1.5 text-sm font-medium rounded-md text-neutral-400 hover:text-white transition-colors">
             30 Days
           </button>
-        </div>
+        </div> */}
       </div>
 
       {/* Stats Grid */}
