@@ -474,3 +474,24 @@ def agent_explanations_timeseries(cfg: AgentConfig):
         goal_kwargs=cfg.goal_kwargs,
     )
     return {"series": agent.explainer.timeseries(), "time_ms": now_ms()}
+
+
+@app.post("/runs/start", response_model=RunStartResponse)
+def start_run(cfg: RunConfig):
+    run_id = str(uuid.uuid4())
+    state = RunState.new(run_id, cfg)
+    with RUNS_LOCK:
+        RUNS[run_id] = state
+
+    t = threading.Thread(target=RUN_ENGINE.execute_run, args=(run_id, cfg, RUNS), daemon=True)
+    t.start()
+    return RunStartResponse(run_id=run_id, status="running")
+
+
+@app.get("/runs/{run_id}", response_model=RunStatusResponse)
+def get_run_status(run_id: str):
+    with RUNS_LOCK:
+        st = RUNS.get(run_id)
+    if st is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return st.to_response()

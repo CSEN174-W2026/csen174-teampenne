@@ -22,6 +22,8 @@ import {
   getPending,
   getLatencyStats,
   getStats,
+  getRunStatus,
+  startRun,
   // (optional) resetManager if you added it
   resetManager,
   getRecentExplanations,
@@ -242,7 +244,11 @@ export function Simulation() {
 
   const [incomingJobs, setIncomingJobs] = useState(0);
   const [submittedJobs, setSubmittedJobs] = useState(0);
+  const [backendInFlightJobs, setBackendInFlightJobs] = useState(0);
   const simStartMsRef = useRef<number | null>(null);
+  const cumulativeRunProcessedRef = useRef(0);
+  const lastRunIdRef = useRef<string | null>(null);
+  const lastRunProcessedRef = useRef(0);
 
   const [policyStats, setPolicyStats] = useState<Record<Policy, PolicyStatUI>>({
     "round-robin": {
@@ -294,6 +300,9 @@ export function Simulation() {
   const [overallLatencyTrail, setOverallLatencyTrail] = useState<number[]>([]);
 
   const [manualTask, setManualTask] = useState({ cpu: 20, mem: 128, duration: 10 });
+  const [backendRunId, setBackendRunId] = useState<string | null>(null);
+  const [backendRunStatus, setBackendRunStatus] = useState<string>("idle");
+  const BACKEND_RUN_CHUNK_JOBS = 25;
 
   const POLICY_OPTIONS: { ui: Policy; backend: string; label: string }[] = useMemo(
     () => [
@@ -448,6 +457,74 @@ export function Simulation() {
     }
   }, [submitOneJob]);
 
+  const refreshBackendRunStatus = useCallback(async () => {
+    if (!backendRunId) return;
+    try {
+      const st = await getRunStatus(backendRunId);
+      setBackendRunStatus(st.status);
+      const processed = Number(st.processed_jobs ?? 0);
+      const total = Number(st.total_jobs ?? 0);
+      const inFlight = Math.max(0, total - processed);
+      setBackendInFlightJobs(inFlight);
+
+      // Track cumulative processed jobs across chained backend runs for throughput.
+      if (lastRunIdRef.current !== backendRunId) {
+        lastRunIdRef.current = backendRunId;
+        lastRunProcessedRef.current = 0;
+      }
+      const delta = Math.max(0, processed - lastRunProcessedRef.current);
+      if (delta > 0) {
+        cumulativeRunProcessedRef.current += delta;
+        setSubmittedJobs(cumulativeRunProcessedRef.current);
+      }
+      lastRunProcessedRef.current = processed;
+
+      // Build policy log directly from backend run events while simulation is run-driven.
+      const eventList = Array.isArray(st.events) ? st.events : [];
+      const latencyByPolicy: Record<string, { n: number; total_latency_ms: number; avg_latency_ms: number }> = {};
+      const rewardByPolicy: Record<string, { mean_reward: number }> = {};
+      const rewardAcc: Record<string, { sum: number; n: number }> = {};
+      let runLatencyTotal = 0;
+
+      for (const ev of eventList) {
+        const policy = typeof ev?.policy_name === "string" ? ev.policy_name : "";
+        const latency = Number(ev?.latency_ms ?? 0);
+        const reward = Number(ev?.reward ?? 0);
+        if (!policy || !Number.isFinite(latency)) continue;
+
+        const latRec = latencyByPolicy[policy] ?? { n: 0, total_latency_ms: 0, avg_latency_ms: 0 };
+        latRec.n += 1;
+        latRec.total_latency_ms += latency;
+        latRec.avg_latency_ms = latRec.total_latency_ms / Math.max(1, latRec.n);
+        latencyByPolicy[policy] = latRec;
+        runLatencyTotal += latency;
+
+        if (Number.isFinite(reward)) {
+          const r = rewardAcc[policy] ?? { sum: 0, n: 0 };
+          r.sum += reward;
+          r.n += 1;
+          rewardAcc[policy] = r;
+        }
+      }
+
+      for (const [policy, rec] of Object.entries(rewardAcc)) {
+        rewardByPolicy[policy] = { mean_reward: rec.sum / Math.max(1, rec.n) };
+      }
+
+      if (eventList.length > 0) {
+        setPolicyStats((prev) =>
+          buildPolicyStatsFromBackend(rewardByPolicy, latencyByPolicy, prev, selectedPolicies)
+        );
+        const runMeanLatency = runLatencyTotal / Math.max(1, eventList.length);
+        setOverallAvgLatencyMs(runMeanLatency);
+        setOverallLatencyTrail((prev) => [...prev, runMeanLatency].slice(-25));
+      }
+    } catch (_err: unknown) {
+      setBackendRunStatus("failed");
+      setBackendInFlightJobs(0);
+    }
+  }, [backendRunId, selectedPolicies]);
+
   // ---- explanation polling helpers ----
   const fetchLatestExplanation = useCallback(async () => {
     try {
@@ -556,13 +633,15 @@ export function Simulation() {
 
       setIncomingJobs(pendingIds.length);
 
-      setPolicyStats((prev) =>
-        buildPolicyStatsFromBackend(learnerStats, latencyStats, prev, selectedPolicies)
-      );
+      if (!backendRunId) {
+        setPolicyStats((prev) =>
+          buildPolicyStatsFromBackend(learnerStats, latencyStats, prev, selectedPolicies)
+        );
 
-      const backendOverall = typeof summary?.mean_latency_ms === "number" ? summary.mean_latency_ms : 0;
-      setOverallAvgLatencyMs(backendOverall);
-      if (backendOverall > 0) setOverallLatencyTrail((prev) => [...prev, backendOverall].slice(-25));
+        const backendOverall = typeof summary?.mean_latency_ms === "number" ? summary.mean_latency_ms : 0;
+        setOverallAvgLatencyMs(backendOverall);
+        if (backendOverall > 0) setOverallLatencyTrail((prev) => [...prev, backendOverall].slice(-25));
+      }
 
       setAgent((prev) => {
         const nextExploration = isAgentControlled
@@ -582,16 +661,13 @@ export function Simulation() {
     } catch {
       setIncomingJobs(0);
     }
-  }, [agentConfig, isAgentControlled, selectedPolicies, maybePauseForExplanation]);
+  }, [agentConfig, isAgentControlled, selectedPolicies, maybePauseForExplanation, backendRunId]);
 
-  const submitIntervalRef = useRef<number | null>(null);
   const pollIntervalRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (!isRunning) {
-      if (submitIntervalRef.current) window.clearInterval(submitIntervalRef.current);
       if (pollIntervalRef.current) window.clearInterval(pollIntervalRef.current);
-      submitIntervalRef.current = null;
       pollIntervalRef.current = null;
       return;
     }
@@ -601,28 +677,86 @@ export function Simulation() {
     pollManager();
     pollIntervalRef.current = window.setInterval(() => pollManager(), 1500);
 
-    const jobsPerSec = Math.max(0, Number(simulationSpeed) || 0);
-    if (jobsPerSec > 0) {
-      const intervalMs = Math.max(50, Math.floor(1000 / jobsPerSec));
-      submitIntervalRef.current = window.setInterval(() => submitOneJob(), intervalMs);
-    }
-
     return () => {
-      if (submitIntervalRef.current) window.clearInterval(submitIntervalRef.current);
       if (pollIntervalRef.current) window.clearInterval(pollIntervalRef.current);
-      submitIntervalRef.current = null;
       pollIntervalRef.current = null;
     };
-  }, [isRunning, pollManager, submitOneJob, simulationSpeed]);
+  }, [isRunning, pollManager]);
+
+  useEffect(() => {
+    if (!isRunning) return;
+    if (!backendRunId) return;
+    if (backendRunStatus !== "running") return;
+
+    void refreshBackendRunStatus();
+    const id = window.setInterval(() => {
+      void refreshBackendRunStatus();
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [isRunning, backendRunId, backendRunStatus, refreshBackendRunStatus]);
+
+  // Start simulation => start backend runs continuously in chunks.
+  useEffect(() => {
+    if (!isRunning) return;
+    if (backendRunStatus === "running") return;
+
+    let cancelled = false;
+    const launchNextRun = async () => {
+      try {
+        const res = await startRun({
+          goal_kind: goalKind,
+          learner_kind: learnerKind,
+          learner_kwargs: agentConfig.learner_kwargs ?? {},
+          goal_kwargs: agentConfig.goal_kwargs ?? {},
+          workload: {
+            kind: "tiny",
+            jobs: BACKEND_RUN_CHUNK_JOBS,
+            seed: seed ?? (Date.now() % 100000),
+            users: [userId],
+            sla_threshold_ms: slaMs,
+          },
+          poll_interval_ms: 50,
+          job_timeout_ms: 15000,
+        });
+        if (cancelled) return;
+        setBackendRunId(res.run_id);
+        setBackendRunStatus(res.status);
+        setBackendInFlightJobs(BACKEND_RUN_CHUNK_JOBS);
+      } catch (_err: unknown) {
+        if (cancelled) return;
+        setBackendRunStatus("failed");
+        setBackendInFlightJobs(0);
+      }
+    };
+
+    void launchNextRun();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    isRunning,
+    backendRunStatus,
+    goalKind,
+    learnerKind,
+    agentConfig.learner_kwargs,
+    agentConfig.goal_kwargs,
+    seed,
+    userId,
+    slaMs,
+  ]);
 
   const resetSimulation = () => {
     setIsRunning(false);
     setIsAgentControlled(false);
     setIncomingJobs(0);
     setSubmittedJobs(0);
+    setBackendInFlightJobs(0);
     setOverallAvgLatencyMs(0);
     setOverallLatencyTrail([]);
     simStartMsRef.current = null;
+    cumulativeRunProcessedRef.current = 0;
+    lastRunIdRef.current = null;
+    lastRunProcessedRef.current = 0;
 
     setPolicy("round-robin");
     setCurrentRouteStrategy("round-robin");
@@ -643,6 +777,8 @@ export function Simulation() {
       status: "exploring",
     });
     setNodes((prev) => prev.map((x) => ({ ...x, status: "offline", cpuUsed: 0, memUsed: 0, tasks: [] })));
+    setBackendRunId(null);
+    setBackendRunStatus("idle");
 
     resetManager()
       .then(() => pollManager())
@@ -675,6 +811,7 @@ export function Simulation() {
     if (elapsedS <= 0) return 0;
     return submittedJobs / elapsedS;
   }, [submittedJobs]);
+  const displayIncomingJobs = Math.max(incomingJobs, backendInFlightJobs);
 
   const bestByReward = useMemo(() => {
     const active = selectedPolicies.length ? selectedPolicies : (Object.keys(policyStats) as Policy[]);
@@ -808,7 +945,16 @@ export function Simulation() {
           <div className="h-6 w-px bg-neutral-800 mx-1" />
 
           <button
-            onClick={() => setIsRunning(!isRunning)}
+            onClick={() => {
+              const nextRunning = !isRunning;
+              setIsRunning(nextRunning);
+              if (!nextRunning) {
+                // Stop auto-chaining backend runs when simulation is paused.
+                setBackendRunId(null);
+                setBackendRunStatus("idle");
+                setBackendInFlightJobs(0);
+              }
+            }}
             className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-all ${
               isRunning
                 ? "bg-amber-500/10 text-amber-500 hover:bg-amber-500/20"
@@ -1096,7 +1242,7 @@ export function Simulation() {
               </div>
               <div>
                 <p className="text-[10px] font-bold text-neutral-500 uppercase">Incoming Jobs</p>
-                <p className="text-xl font-mono font-bold">{incomingJobs}</p>
+                <p className="text-xl font-mono font-bold">{displayIncomingJobs}</p>
               </div>
             </div>
 
@@ -1141,7 +1287,7 @@ export function Simulation() {
 
             <div className="absolute top-[160px] inset-x-0 h-[100px] pointer-events-none">
               <AnimatePresence>
-                {Array.from({ length: Math.min(12, incomingJobs) }).map((_, i) => (
+                {Array.from({ length: Math.min(12, displayIncomingJobs) }).map((_, i) => (
                   <Motion.div
                     key={`pending_${i}`}
                     initial={{ y: -80, opacity: 0, scale: 0 }}
