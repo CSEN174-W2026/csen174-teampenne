@@ -13,21 +13,29 @@ import {
   MoreHorizontal,
 } from "lucide-react";
 
+// import { useNavigate } from "react-router-dom";
 import { MetricCard } from "../components/MetricCard";
 import { ResourceChart } from "../components/ResourceChart";
 import { motion } from "motion/react";
 
-import { getNodes, type NodeSnapshot } from "../../lib/api";
+import { getClusterStats, getNodes, type ClusterStatsResponse, type NodeSnapshot } from "../../lib/api";
 
 type SeriesPoint = { t: number; cpu: number; mem: number };
+
+function fmtPct(x: number | null | undefined) {
+  if (x == null || !Number.isFinite(x)) return "—";
+  return `${Math.round(x)}%`;
+}
 
 export function Dashboard() {
   const [nodes, setNodes] = useState<NodeSnapshot[]>([]);
   const [nodesTimeMs, setNodesTimeMs] = useState<number>(Date.now());
   const [series, setSeries] = useState<SeriesPoint[]>([]);
+  const [cluster, setCluster] = useState<ClusterStatsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // const navigate = useNavigate();
 
-  // ---- Poll /nodes
+  // ---- Poll /nodes (for table + CPU/Mem chart)
   useEffect(() => {
     let alive = true;
 
@@ -40,7 +48,6 @@ export function Dashboard() {
         setNodesTimeMs(data.time_ms ?? Date.now());
         setError(null);
 
-        // Build aggregated CPU/Mem for chart (avg across nodes)
         const cpuAvg =
           (data.nodes ?? []).reduce((acc, n) => acc + (Number(n.cpu_pct) || 0), 0) /
           Math.max((data.nodes ?? []).length, 1);
@@ -51,7 +58,6 @@ export function Dashboard() {
 
         setSeries((prev) => {
           const next = [...prev, { t: data.time_ms ?? Date.now(), cpu: cpuAvg, mem: memAvg }];
-          // keep last 120 points (~4 minutes at 2s poll) – adjust for your UI
           return next.slice(-120);
         });
       } catch (e: any) {
@@ -68,45 +74,81 @@ export function Dashboard() {
     };
   }, []);
 
-  // ---- Metric cards (real ones you can compute from /nodes)
-  const totalNodes = nodes.length;
+  // ---- Poll /cluster/stats (for real Avg Latency / Throughput / Disk Usage)
+  useEffect(() => {
+    let alive = true;
 
-  const avgLatencyMs = useMemo(() => {
-    // You don't have global latency from /nodes right now.
-    // If your NodeSnapshot includes something like latency_ms, use it here.
-    const vals = nodes.map((n) => Number(n.latency_ms)).filter((x) => Number.isFinite(x));
-    if (!vals.length) return null;
-    return vals.reduce((a, b) => a + b, 0) / vals.length;
-  }, [nodes]);
+    async function tick() {
+      try {
+        const stats = await getClusterStats(60, 200); // 60s window
+        if (!alive) return;
+        setCluster(stats);
+      } catch (e: any) {
+        if (!alive) return;
+        // don't hard-fail the dashboard if this endpoint errors; just show warning
+        setCluster(null);
+      }
+    }
+
+    tick();
+    const id = setInterval(tick, 2000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, []);
+
+  const totalNodes = nodes.length;
 
   // Convert real nodes into your table format
   const nodeRows = useMemo(() => {
     return nodes.map((n) => {
       const cpu = Number(n.cpu_pct) || 0;
       const mem = Number(n.mem_pct) || 0;
-      const load = Math.round(Math.max(cpu, mem)); // simple “current load”
+      const load = Math.round(Math.max(cpu, mem));
       const status = load >= 85 ? "warning" : "healthy";
 
       return {
         name: n.name ?? `${n.host}:${n.port}`,
-        region: n.host ?? "—", // you don't have region in NodeSnapshot; show host or map it later
+        region: n.host ?? "—",
         load,
         status,
-        uptime: "—", // not provided by API currently
+        uptime: "—",
       };
     });
   }, [nodes]);
 
   const recentEvents = useMemo(() => {
-    // You don't have an /activity endpoint; keep this placeholder OR
-    // create a new endpoint later that returns recent job completions, errors, autoscaling, etc.
     return [
-      { id: 1, title: `Polled /nodes (${totalNodes} found)`, time: new Date(nodesTimeMs).toLocaleTimeString(), status: "info" },
-      ...(error
-        ? [{ id: 2, title: `API error: ${error}`, time: "just now", status: "warning" }]
+      {
+        id: 1,
+        title: `Polled /nodes (${totalNodes} found)`,
+        time: new Date(nodesTimeMs).toLocaleTimeString(),
+        status: "info",
+      },
+      ...(cluster
+        ? [
+            {
+              id: 2,
+              title: `Cluster stats: ${cluster.jobs_count} jobs in last ${Math.round(cluster.window_ms / 1000)}s`,
+              time: new Date(cluster.time_ms).toLocaleTimeString(),
+              status: "info",
+            },
+          ]
         : []),
+      ...(error ? [{ id: 3, title: `API error: ${error}`, time: "just now", status: "warning" }] : []),
     ];
-  }, [totalNodes, nodesTimeMs, error]);
+  }, [totalNodes, nodesTimeMs, cluster, error]);
+
+  const avgLatencyLabel =
+    cluster?.avg_latency_ms == null ? "—" : `${Math.round(cluster.avg_latency_ms)}ms`;
+
+  const thr = Number(cluster?.throughput_rps);
+  const throughputLabel =
+    cluster == null || !Number.isFinite(thr) ? "—" : `${thr.toFixed(2)} jobs/s`;
+
+  const diskUsageLabel =
+    cluster == null ? "—" : fmtPct(cluster.disk_usage_pct);
 
   return (
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-700">
@@ -135,16 +177,9 @@ export function Dashboard() {
       {/* Stats Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         <MetricCard label="Total Nodes" value={String(totalNodes)} trend={0} icon={Server} color="indigo" />
-        <MetricCard
-          label="Avg. Latency"
-          value={avgLatencyMs == null ? "—" : `${Math.round(avgLatencyMs)}ms`}
-          trend={0}
-          icon={Zap}
-          color="emerald"
-        />
-        {/* These two are NOT in your API yet: keep placeholders or add endpoints later */}
-        <MetricCard label="Throughput" value="—" trend={0} icon={Activity} color="indigo" />
-        <MetricCard label="Disk Usage" value="—" trend={0} icon={Database} color="amber" />
+        <MetricCard label="Avg. Latency" value={avgLatencyLabel} trend={0} icon={Zap} color="emerald" />
+        <MetricCard label="Throughput" value={throughputLabel} trend={0} icon={Activity} color="indigo" />
+        <MetricCard label="Disk Usage" value={diskUsageLabel} trend={0} icon={Database} color="amber" />
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
@@ -160,7 +195,6 @@ export function Dashboard() {
             </div>
           </div>
 
-          {/* Pass real time-series into chart */}
           <ResourceChart data={series} />
         </div>
 
@@ -220,9 +254,9 @@ export function Dashboard() {
             <h2 className="text-xl font-bold">Node Groups</h2>
             <p className="text-sm text-neutral-500">Live health and load status of primary clusters</p>
           </div>
-          <button className="bg-white text-black px-4 py-2 rounded-lg text-sm font-bold hover:bg-neutral-200 transition-colors">
+          <a href="/nodes" className="bg-white text-black px-4 py-2 rounded-lg text-sm font-bold hover:bg-neutral-200 transition-colors">
             Manage Nodes
-          </button>
+          </a>
         </div>
 
         <div className="overflow-x-auto">
@@ -276,7 +310,9 @@ export function Dashboard() {
                     >
                       <div
                         className={`w-1.5 h-1.5 rounded-full ${
-                          node.status === "healthy" ? "bg-emerald-400" : "bg-amber-400 animate-pulse"
+                          node.status === "healthy"
+                            ? "bg-emerald-400"
+                            : "bg-amber-400 animate-pulse"
                         }`}
                       />
                       {node.status.toUpperCase()}
