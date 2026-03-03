@@ -12,21 +12,27 @@ import {
   Cpu,
   Database,
   Globe,
-  Zap
+  Zap,
+  Users,
+  Network
 } from "lucide-react";
 import { useState } from "react";
 import { motion as Motion, AnimatePresence } from "motion/react";
+import { useAuth } from "../auth/AuthContext";
 
 export function Root() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const location = useLocation();
+  const { user, isAdmin, logout } = useAuth();
 
   const navItems = [
     { icon: LayoutDashboard, label: "Dashboard", path: "/" },
     { icon: Server, label: "Nodes", path: "/nodes" },
-    { icon: Activity, label: "Services", path: "/services" },
+    { icon: Network, label: "Mesh", path: "/mesh" },
+    // { icon: Activity, label: "Services", path: "/services" },
     { icon: Terminal, label: "System Logs", path: "/logs" },
     { icon: Zap, label: "Simulation", path: "/simulation" },
+    ...(isAdmin ? [{ icon: Users, label: "Manage Users", path: "/users" }] : []),
   ];
 
   return (
@@ -108,12 +114,18 @@ export function Root() {
             
             <div className="flex items-center gap-3 border-l border-neutral-800 pl-6">
               <div className="text-right">
-                <p className="text-sm font-medium">Admin User</p>
-                <p className="text-xs text-neutral-500">Enterprise Plan</p>
+                <p className="text-sm font-medium">{user?.full_name || user?.email || "User"}</p>
+                <p className="text-xs text-neutral-500">{isAdmin ? "Admin" : "Member"}</p>
               </div>
               <div className="w-9 h-9 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-500 flex items-center justify-center text-sm font-bold">
-                AD
+                {(user?.full_name || user?.email || "U").slice(0, 2).toUpperCase()}
               </div>
+              <button
+                onClick={() => void logout()}
+                className="text-xs px-2 py-1 rounded border border-neutral-700 hover:bg-neutral-800"
+              >
+                Logout
+              </button>
             </div>
           </div>
         </header>

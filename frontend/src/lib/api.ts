@@ -1,14 +1,13 @@
 // src/lib/api.ts
-const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
+const env = (import.meta as ImportMeta & { env?: Record<string, string> }).env ?? {};
+const API_BASE = env.VITE_API_BASE ?? "/manager-api";
+const WEB_API_BASE = env.VITE_WEB_API_BASE ?? "/web-api";
 
 async function http<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
-    cache: "no-store", // IMPORTANT: prevent stale GET caching
     ...init,
     headers: {
       "Content-Type": "application/json",
-      "Cache-Control": "no-cache",
-      Pragma: "no-cache",
       ...(init?.headers ?? {}),
     },
   });
@@ -17,13 +16,24 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
     const text = await res.text();
     throw new Error(`${res.status} ${res.statusText}: ${text}`);
   }
-
   return res.json() as Promise<T>;
 }
 
-// ----------------------------------------------------
-// TYPES
-// ----------------------------------------------------
+async function webHttp<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${WEB_API_BASE}${path}`, {
+    ...init,
+    headers: {
+      "Content-Type": "application/json",
+      ...(init?.headers ?? {}),
+    },
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`${res.status} ${res.statusText}: ${text}`);
+  }
+  return res.json() as Promise<T>;
+}
 
 export type NodeSnapshot = {
   name: string;
@@ -31,12 +41,10 @@ export type NodeSnapshot = {
   port: number;
   cpus?: number;
   memory_mb?: number;
-
-  cpu_pct?: number; // 0..100
-  mem_pct?: number; // 0..100
+  cpu_pct?: number;
+  mem_pct?: number;
   queue_len?: number;
   time_ms?: number;
-
   [k: string]: any;
 };
 
@@ -98,6 +106,42 @@ export type SystemLogsResponse = {
 // ----------------------------------------------------
 // BASIC API
 // ----------------------------------------------------
+export type RunStartResponse = {
+  run_id: string;
+  status: string;
+};
+
+export type RunStatusResponse = {
+  run_id: string;
+  status: string;
+  processed_jobs: number;
+  total_jobs: number;
+  summary: Record<string, unknown>;
+  events: Array<Record<string, unknown>>;
+};
+
+export type StoredNodeSample = {
+  id: number;
+  nodeName: string;
+  host: string;
+  port: number;
+  cpuPct?: number | null;
+  memPct?: number | null;
+  queueLen?: number | null;
+  capturedAtMs: string;
+  source: string;
+  createdAt: string;
+};
+
+export type AuthUser = {
+  id: string;
+  email: string;
+  full_name: string;
+  is_admin: boolean;
+  is_active: boolean;
+  created_at?: number | null;
+  updated_at?: number | null;
+};
 
 export async function getHealth() {
   return http<{ ok: boolean; time_ms: number }>("/health");
@@ -199,9 +243,89 @@ export async function postSystemLog(payload: {
     body: JSON.stringify(payload),
   });
 }
+//   return http<{ events: any[]; time_ms?: number }>(`/agents/explanations/recent?limit=${limit}`, {
+//     method: "POST",
+//     body: JSON.stringify(cfg),
+//   });
+// }
+
+// export async function getLatencyStats(cfg: AgentConfig) {
+//   return http<any>("/agents/latency_stats", { method: "POST", body: JSON.stringify(cfg) });
+// }
+
+// export async function getStats(cfg: AgentConfig) {
+//   return http<any>("/agents/stats", { method: "POST", body: JSON.stringify(cfg) });
+// }
+
+// export async function resetManager() {
+//   return http<{ ok: boolean; time_ms: number }>("/reset", { method: "POST" });
+// }
+
+export async function startRun(payload: Record<string, unknown>) {
+  return http<RunStartResponse>("/runs/start", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
 
 export async function clearSystemLogs() {
   return http<{ ok: boolean; time_ms: number }>("/system/logs/clear", {
     method: "POST",
+  });
+}
+export async function getRunStatus(runId: string) {
+  return http<RunStatusResponse>(`/runs/${runId}`);
+}
+
+export async function getStoredNodeSamples(limit = 20) {
+  return webHttp<{ rows: StoredNodeSample[] }>(`/api/metrics/node-samples?limit=${limit}`);
+}
+
+export async function me(token: string) {
+  return http<AuthUser>("/auth/me", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export async function logout(token: string) {
+  return http<{ ok: boolean; message: string }>("/auth/logout", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export async function listUsers(token: string) {
+  return http<{ rows: AuthUser[] }>("/users", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export async function createUser(
+  token: string,
+  payload: { email: string; password: string; full_name?: string; is_admin?: boolean; is_active?: boolean }
+) {
+  return http<AuthUser>("/users", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function updateUser(
+  token: string,
+  userId: string,
+  payload: { email?: string; password?: string; full_name?: string; is_admin?: boolean; is_active?: boolean }
+) {
+  return http<AuthUser>(`/users/${userId}`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function deleteUser(token: string, userId: string) {
+  return http<AuthUser>(`/users/${userId}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
   });
 }

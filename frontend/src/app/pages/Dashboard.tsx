@@ -19,6 +19,7 @@ import { ResourceChart } from "../components/ResourceChart";
 import { motion } from "motion/react";
 
 import { getClusterStats, getNodes, type ClusterStatsResponse, type NodeSnapshot } from "../../lib/api";
+import { getStoredNodeSamples, type StoredNodeSample } from "../../lib/api";
 
 type SeriesPoint = { t: number; cpu: number; mem: number };
 
@@ -32,6 +33,7 @@ export function Dashboard() {
   const [nodesTimeMs, setNodesTimeMs] = useState<number>(Date.now());
   const [series, setSeries] = useState<SeriesPoint[]>([]);
   const [cluster, setCluster] = useState<ClusterStatsResponse | null>(null);
+  const [storedSamples, setStoredSamples] = useState<StoredNodeSample[]>([]);
   const [error, setError] = useState<string | null>(null);
   // const navigate = useNavigate();
 

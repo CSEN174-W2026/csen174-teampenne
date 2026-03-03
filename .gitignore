@@ -9,7 +9,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-#lib/
+backend/lib/
+web/lib/
 lib64/
 parts/
 sdist/
@@ -76,3 +77,6 @@ __pycache__/
 .env
 .DS_Store
 .vscode/
+
+# Firebase
+backend/aimse_service.json
