@@ -76,3 +76,6 @@ __pycache__/
 .env
 .DS_Store
 .vscode/
+
+# Firebase
+backend/aimse_service.json

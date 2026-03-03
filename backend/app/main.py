@@ -9,9 +9,8 @@ from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
-from fastapi import Body
 
 from app.agent.manager_agent import ManagerAgent
 from app.state_types import JobRequest, NodeSnapshot
@@ -19,6 +18,27 @@ from app.node.node_client import NodeClient
 from app.node.virtualbox import discover_nodes
 from app.api_models import RunConfig, RunStartResponse, RunStatusResponse
 from app.run_engine import RunEngine, RunState
+from app.auth_models import (
+    ApiMessage,
+    CreateUserRequest,
+    LoginRequest,
+    LoginResponse,
+    UpdateUserRequest,
+    UserListResponse,
+    UserPublic,
+)
+from app.firebase_auth import (
+    AuthError,
+    UnauthorizedError,
+    create_user,
+    current_user_from_token,
+    deactivate_user,
+    ensure_bootstrap_admin,
+    init_firebase_app,
+    list_users,
+    login_with_email_password,
+    update_user,
+)
 
 
 app = FastAPI(title="CSEN 174 Manager API")
@@ -257,6 +277,13 @@ def poll_recent_jobs_and_observe():
 # Launches a background worker that keeps checking for completed jobs and runs forever in the background, allowing the manager to learn from job outcomes over time without blocking the main API thread.
 @app.on_event("startup")
 def startup():
+    try:
+        init_firebase_app()
+        boot = ensure_bootstrap_admin()
+        if boot is not None:
+            print(f"Auth bootstrap admin ready: {boot['email']}")
+    except Exception as exc:
+        print(f"[WARN] firebase auth bootstrap skipped: {exc}")
     print("Starting background observer thread...")
     t = threading.Thread(target=poll_recent_jobs_and_observe, daemon=True)
     t.start()
@@ -269,6 +296,103 @@ API ENDPOINTS
 @app.get("/health")
 def health():
     return {"ok": True, "time_ms": now_ms()}
+
+
+def _extract_bearer_token(authorization: Optional[str]) -> str:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    parts = authorization.split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Invalid Authorization header")
+    return parts[1].strip()
+
+
+def require_user(authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    try:
+        token = _extract_bearer_token(authorization)
+        return current_user_from_token(token)
+    except UnauthorizedError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except AuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def require_admin(user: Dict[str, Any] = Depends(require_user)) -> Dict[str, Any]:
+    if not bool(user.get("is_admin")):
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+    return user
+
+
+@app.post("/auth/login", response_model=LoginResponse)
+def auth_login(payload: LoginRequest):
+    try:
+        return LoginResponse(**login_with_email_password(payload.email, payload.password))
+    except UnauthorizedError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except AuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/auth/me", response_model=UserPublic)
+def auth_me(user: Dict[str, Any] = Depends(require_user)):
+    return UserPublic(**user)
+
+
+@app.post("/auth/logout", response_model=ApiMessage)
+def auth_logout(_: Dict[str, Any] = Depends(require_user)):
+    return ApiMessage(ok=True, message="Logged out")
+
+
+@app.get("/users", response_model=UserListResponse)
+def users_list(_: Dict[str, Any] = Depends(require_admin)):
+    return UserListResponse(rows=[UserPublic(**row) for row in list_users()])
+
+
+@app.post("/users", response_model=UserPublic)
+def users_create(payload: CreateUserRequest, _: Dict[str, Any] = Depends(require_admin)):
+    try:
+        return UserPublic(
+            **create_user(
+                email=payload.email,
+                password=payload.password,
+                full_name=payload.full_name,
+                is_admin=payload.is_admin,
+                is_active=payload.is_active,
+            )
+        )
+    except AuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.put("/users/{user_id}", response_model=UserPublic)
+def users_update(user_id: str, payload: UpdateUserRequest, admin: Dict[str, Any] = Depends(require_admin)):
+    if user_id == admin["id"] and payload.is_active is False:
+        raise HTTPException(status_code=400, detail="Admin cannot deactivate self")
+    if user_id == admin["id"] and payload.is_admin is False:
+        raise HTTPException(status_code=400, detail="Admin cannot remove own admin role")
+    try:
+        return UserPublic(
+            **update_user(
+                user_id=user_id,
+                email=payload.email,
+                password=payload.password,
+                full_name=payload.full_name,
+                is_admin=payload.is_admin,
+                is_active=payload.is_active,
+            )
+        )
+    except AuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/users/{user_id}", response_model=UserPublic)
+def users_delete(user_id: str, admin: Dict[str, Any] = Depends(require_admin)):
+    if user_id == admin["id"]:
+        raise HTTPException(status_code=400, detail="Admin cannot deactivate self")
+    try:
+        return UserPublic(**deactivate_user(user_id))
+    except AuthError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 # Finds all running VMs, Asks each VM for its metrics, and returns as JSON
 @app.get("/nodes")

@@ -80,6 +80,11 @@ function normalizePolicyKey(k: string): string {
   return (k || "").toLowerCase().replace(/\s+/g, "_");
 }
 
+const SIM_BG_RUNNING_KEY = "sim_bg_running";
+const SIM_BG_RUN_ID_KEY = "sim_bg_run_id";
+const SIM_BG_RUN_STATUS_KEY = "sim_bg_run_status";
+const SIM_BG_CONFIG_KEY = "sim_bg_config";
+
 function backendKeyToUiPolicy(k: string): Policy | null {
   const kk = normalizePolicyKey(k);
   if (kk.includes("round") && kk.includes("robin")) return "round-robin";
@@ -176,7 +181,10 @@ export function Simulation() {
   const runIdRef = useRef(`frontend-sim-${Date.now()}`);
   const iterationRef = useRef(0);
 
-  const [isRunning, setIsRunning] = useState(false);
+  const [isRunning, setIsRunning] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return localStorage.getItem(SIM_BG_RUNNING_KEY) === "1";
+  });
 
   // ---- NEW: Explanation modal state ----
   const [explainOpen, setExplainOpen] = useState(false);
@@ -300,9 +308,15 @@ export function Simulation() {
   const [overallLatencyTrail, setOverallLatencyTrail] = useState<number[]>([]);
 
   const [manualTask, setManualTask] = useState({ cpu: 20, mem: 128, duration: 10 });
-  const [backendRunId, setBackendRunId] = useState<string | null>(null);
-  const [backendRunStatus, setBackendRunStatus] = useState<string>("idle");
-  const BACKEND_RUN_CHUNK_JOBS = 25;
+  const [backendRunId, setBackendRunId] = useState<string | null>(() => {
+    if (typeof window === "undefined") return null;
+    return localStorage.getItem(SIM_BG_RUN_ID_KEY);
+  });
+  const [backendRunStatus, setBackendRunStatus] = useState<string>(() => {
+    if (typeof window === "undefined") return "idle";
+    return localStorage.getItem(SIM_BG_RUN_STATUS_KEY) ?? "idle";
+  });
+  const BACKEND_RUN_CHUNK_JOBS = 10000;
 
   const POLICY_OPTIONS: { ui: Policy; backend: string; label: string }[] = useMemo(
     () => [
@@ -743,6 +757,49 @@ export function Simulation() {
     seed,
     userId,
     slaMs,
+  ]);
+
+  // Persist simulation runner state so page switches do not stop background runs.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    localStorage.setItem(SIM_BG_RUNNING_KEY, isRunning ? "1" : "0");
+  }, [isRunning]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (backendRunId) localStorage.setItem(SIM_BG_RUN_ID_KEY, backendRunId);
+    else localStorage.removeItem(SIM_BG_RUN_ID_KEY);
+  }, [backendRunId]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    localStorage.setItem(SIM_BG_RUN_STATUS_KEY, backendRunStatus || "idle");
+  }, [backendRunStatus]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!isRunning) return;
+    const cfg = {
+      goal_kind: goalKind,
+      learner_kind: learnerKind,
+      learner_kwargs: agentConfig.learner_kwargs ?? {},
+      goal_kwargs: agentConfig.goal_kwargs ?? {},
+      seed,
+      user_id: userId,
+      sla_ms: slaMs,
+      jobs: BACKEND_RUN_CHUNK_JOBS,
+    };
+    localStorage.setItem(SIM_BG_CONFIG_KEY, JSON.stringify(cfg));
+  }, [
+    isRunning,
+    goalKind,
+    learnerKind,
+    agentConfig.learner_kwargs,
+    agentConfig.goal_kwargs,
+    seed,
+    userId,
+    slaMs,
+    BACKEND_RUN_CHUNK_JOBS,
   ]);
 
   const resetSimulation = () => {
