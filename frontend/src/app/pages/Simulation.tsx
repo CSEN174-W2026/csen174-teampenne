@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useAuth } from "../auth/AuthContext";
 import {
   Play,
   Pause,
@@ -360,7 +361,8 @@ export function Simulation() {
     };
   }, [POLICY_OPTIONS, selectedPolicies, learnerKind, goalKind, seed, slaMs, tailWeight]);
 
-  const userId = "u1";
+  const { user } = useAuth() as { user?: { id?: string; email?: string } };
+  const userId = user?.id ?? user?.email ?? "anon";
 
   const serviceTimeMsFromCpu = useCallback((cpu: number) => {
     return Math.max(50, Math.round(150 + cpu * 12));

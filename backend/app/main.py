@@ -75,6 +75,14 @@ METRICS_SINK_URL = os.getenv("METRICS_SINK_URL", "http://127.0.0.1:3000/api/metr
 METRICS_SINK_TIMEOUT_S = float(os.getenv("METRICS_SINK_TIMEOUT_S", "0.8"))
 OBSERVE_DEUP: Set[str] = set() # To track which nodes we've already observed during discovery
 OBSERVE_LOCK = threading.Lock() # To synchronize access to OBSERVE_DEUP -> protect against race conditions
+# Track last config used per user
+USER_LAST_CFG: Dict[str, Dict[str, Any]] = {}
+USER_LAST_CFG_LOCK = threading.Lock()
+
+# Track agent config history per user (most recent first)
+USER_AGENT_HISTORY: Dict[str, List[Dict[str, Any]]] = {}
+USER_AGENT_HISTORY_LOCK = threading.Lock()
+USER_AGENT_HISTORY_MAX = 30
 
 # Cache ManagerAgent instances so learning persists per (learner, goal, kwargs, etc...)
 """
@@ -239,6 +247,36 @@ def persist_node_samples(snaps: List[NodeSnapshot], captured_at_ms: int) -> None
     except Exception as e:
         # Keep /nodes fast and resilient even if metrics sink is unavailable.
         print(f"[WARN] metrics sink unreachable: {e}")
+
+
+
+def _cfg_key(cfg: AgentConfig) -> str:
+    return json.dumps(cfg.dict(), sort_keys=True)
+
+def record_user_agent_config(user_id: str, cfg: AgentConfig) -> None:
+    if not user_id:
+        return
+
+    item = {"time_ms": now_ms(), "config": cfg.dict()}
+    key = _cfg_key(cfg)
+
+    with USER_AGENT_HISTORY_LOCK:
+        hist = USER_AGENT_HISTORY.get(user_id, [])
+
+        # remove older identical configs (dedupe)
+        hist = [
+            h for h in hist
+            if json.dumps(h.get("config", {}), sort_keys=True) != key
+        ]
+
+        # newest first
+        hist.insert(0, item)
+
+        # cap length
+        if len(hist) > USER_AGENT_HISTORY_MAX:
+            hist = hist[:USER_AGENT_HISTORY_MAX]
+
+        USER_AGENT_HISTORY[user_id] = hist
 
 # Universal object -> dictionary converter
 # Standardizes everything into JSON-serializable dictionary
@@ -637,6 +675,16 @@ def submit_job(request: SubmitJobRequest):
     cfg = request.config
     job = request.job
 
+    # Store last agent config used by this user (best-effort)
+    if getattr(job, "user_id", None):
+        uid = job.user_id
+        with USER_LAST_CFG_LOCK:
+            USER_LAST_CFG[uid] = {
+                "time_ms": now_ms(),
+                "config": cfg.dict(),
+            }
+        record_user_agent_config(uid, cfg)
+    
     agent = get_agent(
         learner_kind=cfg.learner_kind,
         goal_kind=cfg.goal_kind,
@@ -902,3 +950,37 @@ def get_run_status(run_id: str):
     if st is None:
         raise HTTPException(status_code=404, detail="run not found")
     return st.to_response()
+
+
+@app.get("/users/me/last_agent_config")
+def users_me_last_agent_config(user: Dict[str, Any] = Depends(require_user)):
+    uid = user["id"]
+    with USER_LAST_CFG_LOCK:
+        last = USER_LAST_CFG.get(uid)
+    return last or {"time_ms": now_ms(), "config": None}
+
+
+@app.get("/users/me/activity")
+def users_me_activity(
+    limit: int = Query(200, ge=1, le=2000),
+    user: Dict[str, Any] = Depends(require_user),
+):
+    uid = user["id"]
+    # Filter logs for this user_id if present in ev.data
+    with LOGS_LOCK:
+        filtered = []
+        for ev in SYSTEM_LOGS:
+            d = ev.data or {}
+            if d.get("user_id") == uid:
+                filtered.append(asdict(ev))
+        filtered = filtered[-limit:]
+    return {"time_ms": now_ms(), "events": filtered}
+
+
+
+@app.get("/users/me/agent_history")
+def users_me_agent_history(user: Dict[str, Any] = Depends(require_user)):
+    uid = user["id"]
+    with USER_AGENT_HISTORY_LOCK:
+        hist = USER_AGENT_HISTORY.get(uid, [])
+    return {"time_ms": now_ms(), "history": hist}   

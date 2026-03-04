@@ -1,4 +1,4 @@
-import { Outlet, Link, useLocation } from "react-router";
+import { Outlet, Link, useLocation, useNavigate } from "react-router";
 import { 
   LayoutDashboard, 
   Server, 
@@ -24,6 +24,7 @@ export function Root() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const location = useLocation();
   const { user, isAdmin, logout } = useAuth();
+  const nav = useNavigate();
 
   const navItems = [
     { icon: LayoutDashboard, label: "Dashboard", path: "/" },
@@ -112,7 +113,10 @@ export function Root() {
               <span className="absolute top-2 right-2 w-2 h-2 bg-rose-500 rounded-full border-2 border-neutral-900" />
             </button>
             
-            <div className="flex items-center gap-3 border-l border-neutral-800 pl-6">
+            <div
+                onClick={() => nav("/profile")}
+                className="flex items-center gap-3 border-l border-neutral-800 pl-6 cursor-pointer hover:bg-neutral-800/40 px-3 py-1 rounded-lg transition"
+              >
               <div className="text-right">
                 <p className="text-sm font-medium">{user?.full_name || user?.email || "User"}</p>
                 <p className="text-xs text-neutral-500">{isAdmin ? "Admin" : "Member"}</p>
@@ -121,8 +125,11 @@ export function Root() {
                 {(user?.full_name || user?.email || "U").slice(0, 2).toUpperCase()}
               </div>
               <button
-                onClick={() => void logout()}
-                className="text-xs px-2 py-1 rounded border border-neutral-700 hover:bg-neutral-800"
+                onClick={(e) => {
+                    e.stopPropagation();
+                    void logout();
+                  }}
+                  className="text-xs px-2 py-1 rounded border border-neutral-700 hover:bg-neutral-800"
               >
                 Logout
               </button>

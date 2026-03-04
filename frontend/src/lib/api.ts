@@ -329,3 +329,22 @@ export async function deleteUser(token: string, userId: string) {
     headers: { Authorization: `Bearer ${token}` },
   });
 }
+
+export async function getMyLastAgentConfig(token: string) {
+  return http<{ time_ms: number; config: AgentConfig | null }>("/users/me/last_agent_config", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export async function getMyActivity(token: string, limit = 200) {
+  return http<{ time_ms: number; events: any[] }>(`/users/me/activity?limit=${limit}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export async function getMyAgentHistory(token: string) {
+  return http<{ time_ms: number; history: { time_ms: number; config: AgentConfig }[] }>(
+    "/users/me/agent_history",
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+}
