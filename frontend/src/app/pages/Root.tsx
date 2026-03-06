@@ -49,7 +49,7 @@ export function Root() {
             <Globe className="w-5 h-5 text-white" />
           </div>
           {isSidebarOpen && (
-            <span className="font-bold text-lg tracking-tight whitespace-nowrap">DistroMetric</span>
+            <span className="font-bold text-lg tracking-tight whitespace-nowrap"> ARMSE</span>
           )}
         </div>
 

@@ -1,7 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
-import { Server, Search, Filter, HardDrive, Cpu, Wifi } from "lucide-react";
+import { Server, Search, Filter, HardDrive, Cpu, Wifi, Plus, Square, Trash2 } from "lucide-react";
 import { motion } from "motion/react";
-import { getNodes, type NodeSnapshot } from "../../lib/api";
+import {
+  getNodes,
+  type NodeSnapshot,
+  createDockerNode,
+  stopDockerNode,
+  deleteDockerNode,
+} from "../../lib/api";
+import { useAuth } from "../auth/AuthContext";
 
 type StatusFilter = "all" | "online" | "offline";
 
@@ -11,12 +18,34 @@ function pct(x: any, fallback = 0) {
   return Math.max(0, Math.min(100, n));
 }
 
+function getTokenFromSomewhere(authCtx: any): string | null {
+  // Prefer whatever AuthContext provides
+  const t1 = authCtx?.token;
+  if (typeof t1 === "string" && t1.trim()) return t1.trim();
+
+  // Common localStorage keys (fallback)
+  const candidates = ["token", "access_token", "idToken", "id_token", "firebase_token"];
+  for (const k of candidates) {
+    const v = localStorage.getItem(k);
+    if (v && v.trim()) return v.trim();
+  }
+  return null;
+}
+
 export function Nodes() {
+  const auth = useAuth() as any;
+
   const [nodes, setNodes] = useState<NodeSnapshot[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+
+  // ---- NEW: create node UI state ----
+  const [createPort, setCreatePort] = useState<number>(8002);
+  const [busyName, setBusyName] = useState<string | null>(null);
+  const [busyCreate, setBusyCreate] = useState<boolean>(false);
+  const token = useMemo(() => getTokenFromSomewhere(auth), [auth]);
 
   // Poll /nodes
   useEffect(() => {
@@ -58,8 +87,7 @@ export function Nodes() {
       const storageRaw = (n as any).disk_pct ?? (n as any).storage_pct ?? null;
       const storage = storageRaw == null ? null : pct(storageRaw);
 
-      // Online/offline heuristic:
-      // If you later add { error: "..."} in backend, this will mark it offline.
+      // Online/offline heuristic
       const online = !(n as any).error && (n.cpu_pct != null || n.mem_pct != null);
 
       const region = (n as any).region ?? "—";
@@ -67,6 +95,7 @@ export function Nodes() {
       return {
         id: `${host}:${port}:${name}`,
         name,
+        dockerName: name, // docker endpoints use this as {name}
         ip: port ? `${host}:${port}` : host,
         status: online ? "online" : "offline",
         cpu,
@@ -98,6 +127,52 @@ export function Nodes() {
     });
   }, [uiNodes, query, statusFilter]);
 
+  // ---- NEW: docker actions ----
+  const requireTokenOrThrow = () => {
+    if (!token) throw new Error("Missing auth token. Please log in again.");
+    return token;
+  };
+
+  const onCreate = async () => {
+    try {
+      setBusyCreate(true);
+      const t = requireTokenOrThrow();
+      const p = Math.max(1, Math.floor(Number(createPort) || 0));
+      await createDockerNode(t, p); // POST /docker/nodes/create
+      setError(null);
+    } catch (e: any) {
+      setError(e?.message ?? "Failed to create docker node");
+    } finally {
+      setBusyCreate(false);
+    }
+  };
+
+  const onStop = async (dockerName: string) => {
+    try {
+      setBusyName(dockerName);
+      const t = requireTokenOrThrow();
+      await stopDockerNode(t, dockerName); // POST /docker/nodes/{name}/stop
+      setError(null);
+    } catch (e: any) {
+      setError(e?.message ?? "Failed to stop docker node");
+    } finally {
+      setBusyName(null);
+    }
+  };
+
+  const onDelete = async (dockerName: string) => {
+    try {
+      setBusyName(dockerName);
+      const t = requireTokenOrThrow();
+      await deleteDockerNode(t, dockerName); // DELETE /docker/nodes/{name}
+      setError(null);
+    } catch (e: any) {
+      setError(e?.message ?? "Failed to delete docker node");
+    } finally {
+      setBusyName(null);
+    }
+  };
+
   return (
     <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-700">
       {/* Header */}
@@ -105,7 +180,7 @@ export function Nodes() {
         <div>
           <h1 className="text-3xl font-bold tracking-tight text-white">Nodes</h1>
           <p className="text-neutral-400 mt-1">
-            Monitor and manage individual servers in your cluster.
+            Monitor and manage individual docker nodes in your cluster.
           </p>
           {error ? <p className="text-sm text-rose-400 mt-2">{error}</p> : null}
         </div>
@@ -122,6 +197,48 @@ export function Nodes() {
             Filter: {statusFilter}
           </button>
         </div>
+      </div>
+
+      {/* ---- NEW: Create Docker Node ---- */}
+      <div className="bg-neutral-900/40 border border-neutral-800 rounded-2xl p-4 md:p-5">
+        <div className="flex flex-col md:flex-row md:items-center gap-3 md:gap-4 justify-between">
+          <div>
+            <div className="flex items-center gap-2">
+              <Plus className="w-4 h-4 text-emerald-400" />
+              <h2 className="font-semibold text-neutral-200">Create Node</h2>
+            </div>
+            {/* <p className="text-xs text-neutral-500 mt-1">
+              Creates a container named <span className="font-mono">csen-node-&lt;port&gt;</span> mapping{" "}
+              <span className="font-mono">&lt;port&gt;:8001</span>.
+            </p> */}
+          </div>
+
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              min={1}
+              value={createPort}
+              onChange={(e) => setCreatePort(Math.max(1, Number(e.target.value) || 1))}
+              className="w-32 bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-200"
+              placeholder="8002"
+              title="Host port to expose (maps to container 8001)"
+            />
+            <button
+              disabled={busyCreate}
+              onClick={onCreate}
+              className="px-4 py-2 rounded-lg text-sm font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/20 disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+              title={token ? "Create docker node" : "Log in first to create nodes"}
+            >
+              {busyCreate ? "Creating..." : "Create"}
+            </button>
+          </div>
+        </div>
+
+        {!token ? (
+          <p className="text-xs text-amber-400 mt-3">
+            You’re not authenticated (no token found). Creating/stopping/deleting nodes requires login.
+          </p>
+        ) : null}
       </div>
 
       {/* Search */}
@@ -230,12 +347,31 @@ export function Nodes() {
               </div>
             </div>
 
-            {/* Footer */}
-            <div className="mt-6 pt-6 border-t border-neutral-800 flex justify-between items-center">
+            {/* Footer + Actions */}
+            <div className="mt-6 pt-6 border-t border-neutral-800 flex justify-between items-center gap-2">
               <span className="text-xs text-neutral-500 italic">Last seen: {node.lastSeen}</span>
-              <button className="text-xs font-bold text-indigo-400 hover:text-indigo-300">
-                SSH Terminal
-              </button>
+
+              <div className="flex items-center gap-2">
+                <button
+                  disabled={!token || busyName === node.dockerName}
+                  onClick={() => onStop(node.dockerName)}
+                  className="inline-flex items-center gap-1.5 text-xs font-bold text-amber-400 hover:text-amber-300 disabled:opacity-50 disabled:cursor-not-allowed"
+                  title={token ? "Stop this docker node" : "Log in first"}
+                >
+                  <Square className="w-3.5 h-3.5" />
+                  Stop
+                </button>
+
+                <button
+                  disabled={!token || busyName === node.dockerName}
+                  onClick={() => onDelete(node.dockerName)}
+                  className="inline-flex items-center gap-1.5 text-xs font-bold text-rose-400 hover:text-rose-300 disabled:opacity-50 disabled:cursor-not-allowed"
+                  title={token ? "Delete this docker node" : "Log in first"}
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  Delete
+                </button>
+              </div>
             </div>
           </motion.div>
         ))}

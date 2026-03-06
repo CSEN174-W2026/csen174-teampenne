@@ -2,6 +2,8 @@
 from __future__ import annotations
 from dotenv import load_dotenv
 load_dotenv()
+import subprocess # for disk usage
+import re
 
 import json
 import os
@@ -21,7 +23,7 @@ from pydantic import BaseModel, Field
 from app.agent.manager_agent import ManagerAgent
 from app.state_types import JobRequest, NodeSnapshot
 from app.node.node_client import NodeClient
-from app.node.virtualbox import discover_nodes
+# from app.node.virtualbox import discover_nodes
 from app.api_models import RunConfig, RunStartResponse, RunStatusResponse
 from app.run_engine import RunEngine, RunState
 from app.auth_models import (
@@ -45,6 +47,9 @@ from app.firebase_auth import (
     login_with_email_password,
     update_user,
 )
+
+from app.cloud.ec2_controller import create_vm, stop_vm, start_vm, delete_vm, get_instance_ip
+
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -108,6 +113,21 @@ RUNS_LOCK = threading.Lock()
 RUN_ENGINE = RunEngine()
 
 
+@dataclass
+class CloudNode:
+    id: str                 # cloud instance id
+    name: str
+    host: str               # public ip or DNS
+    port: int = 8001
+    created_ms: int = 0
+    status: str = "running" # running|stopped|terminated
+
+NODES: Dict[str, CloudNode] = {}
+NODES_LOCK = threading.Lock()
+
+
+
+ 
 # -------------------------
 # UTILITY FUNCTIONS
 # -------------------------
@@ -181,7 +201,11 @@ def live_snapshots() -> List[NodeSnapshot]:
     """
     VBox discover + pull /metrics from each node.
     """
-    base = discover_nodes()
+    #base = discover_nodes()
+
+    # Use discover docker nodes instead of VBox for better performance and reliability in cloud environment
+    base = discover_docker_nodes()
+
     snaps: List[NodeSnapshot] = []
     for n in base:
         try:
@@ -289,6 +313,10 @@ def to_dict(x: Any) -> Dict[str, Any]:
         return dict(x.__dict__)
     return dict(x)
 
+def docker(cmd: list[str]) -> str:
+    out = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+    return out.decode().strip()
+
 
 # -------------------------
 # SYSTEM LOGS
@@ -347,7 +375,8 @@ def watch_nodes_membership():
     while True:
         time.sleep(POLL_S)
         try:
-            nodes = discover_nodes()
+            # nodes = discover_nodes()
+            nodes = discover_docker_nodes()
             cur = set(_node_key(n) for n in nodes)
         except Exception as e:
             append_log("warn", "nodes", "discover_nodes failed", {"error": str(e)})
@@ -404,7 +433,8 @@ def poll_recent_jobs_and_observe():
             if not agents:
                 continue
 
-        nodes = discover_nodes()
+        #nodes = discover_nodes()
+        nodes = discover_docker_nodes()
         if not nodes:
             continue
 
@@ -602,7 +632,8 @@ def cluster_stats(window_s: int = Query(60, ge=5, le=3600), limit: int = Query(8
         "used_pct": round(disk_used_pct, 2) if disk_used_pct is not None else None,
     }
 
-    nodes = discover_nodes()
+    #nodes = discover_nodes()
+    nodes = discover_docker_nodes()
     all_lat: List[float] = []
     completed_in_window = 0
     per_node: List[Dict[str, Any]] = []
@@ -984,3 +1015,77 @@ def users_me_agent_history(user: Dict[str, Any] = Depends(require_user)):
     with USER_AGENT_HISTORY_LOCK:
         hist = USER_AGENT_HISTORY.get(uid, [])
     return {"time_ms": now_ms(), "history": hist}   
+
+
+
+"""Dockerize The Nodes"""
+
+# Instead of using virtualbox.py to find running VMs -> replace with Docker discovery
+def discover_docker_nodes():
+    out = docker([
+        "docker",
+        "ps",
+        "--filter", "label=csen174.node=true",
+        "--format", "{{.Names}}\t{{.Ports}}"
+    ])
+
+    nodes: list[NodeSnapshot] = []
+    seen: set[tuple[str, int]] = set()
+
+    # Example Ports field might contain BOTH:
+    # "0.0.0.0:8002->8001/tcp, :::8002->8001/tcp"
+    port_re = re.compile(r"(?:0\.0\.0\.0|::):(\d+)->8001/tcp")
+
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+
+        parts = line.split("\t", 1)
+        name = parts[0].strip()
+        ports = parts[1].strip() if len(parts) > 1 else ""
+
+        for m in port_re.finditer(ports):
+            host_port = int(m.group(1))
+            key = (name, host_port)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            nodes.append(
+                NodeSnapshot(
+                    name=name,
+                    host="127.0.0.1",
+                    port=host_port,
+                    cpus=0,
+                    memory_mb=0,
+                )
+            )
+
+    return nodes
+
+# Create Docker Nodes
+@app.post("/docker/nodes/create")
+def docker_create_node(port: int = Body(..., embed=True)):
+    name = f"csen-node-{port}"
+
+    docker([
+        "docker",
+        "run",
+        "-d",
+        "--name", name,
+        "--label", "csen174.node=true",
+        "-p", f"{port}:8001",
+        "csen-node"
+    ])
+
+    return {"ok": True, "port": port}
+
+@app.post("/docker/nodes/{name}/stop")
+def docker_stop_node(name: str):
+    docker(["docker", "stop", name])
+    return {"ok": True}
+
+@app.delete("/docker/nodes/{name}")
+def docker_delete_node(name: str):
+    docker(["docker", "rm", "-f", name])
+    return {"ok": True}

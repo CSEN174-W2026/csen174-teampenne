@@ -14,7 +14,7 @@ import {
   Activity,
 } from "lucide-react";
 import { motion as Motion, AnimatePresence } from "motion/react";
-import { BarChart, Bar, XAxis, YAxis, ResponsiveContainer, Cell } from "recharts";
+import { BarChart, Bar, XAxis, YAxis, ResponsiveContainer, Cell, LineChart, Tooltip, Legend, Line } from "recharts";
 
 import {
   getNodes,
@@ -60,6 +60,13 @@ interface AgentState {
   lastDecisionTime: number;
   status: "exploring" | "optimizing" | "monitoring";
 }
+
+const POLICY_COLORS: Record<Policy, string> = {
+  "round-robin": "#6366f1",     // indigo
+  "least-loaded": "#10b981",    // emerald
+  "resource-aware": "#a855f7",  // purple
+  random: "#f59e0b",            // amber
+};
 
 function nowMs() {
   return Date.now();
@@ -183,6 +190,13 @@ export function Simulation() {
 
   const [isAgentControlled, setIsAgentControlled] = useState(false);
   const [policy, setPolicy] = useState<Policy>("round-robin");
+
+  type RewardPoint = {
+  t: number;
+  [policy: string]: number;
+  };
+  const [rewardHistory, setRewardHistory] = useState<RewardPoint[]>([]);
+  const [seenPolicies, setSeenPolicies] = useState<Set<Policy>>(new Set());
 
   // DISPLAY as the current routing strategy
   // - In manual mode: follows `policy`
@@ -555,9 +569,34 @@ export function Simulation() {
 
       setIncomingJobs(pendingIds.length);
 
-      setPolicyStats((prev) =>
-        buildPolicyStatsFromBackend(learnerStats, latencyStats, prev, selectedPolicies)
-      );
+      setPolicyStats((prev) => {
+        const next = buildPolicyStatsFromBackend(learnerStats, latencyStats, prev, selectedPolicies);
+
+        // policies that have actually been used at least once
+        const usedNow = (selectedPolicies as Policy[]).filter((p) => (next[p]?.completedTasks ?? 0) > 0);
+
+        // update seen policies
+        setSeenPolicies((old) => {
+          const s = new Set(old);
+          usedNow.forEach((p) => s.add(p));
+          return s;
+        });
+
+        // append reward history point (only for used policies)
+        setRewardHistory((h) => {
+          // use "usedNow" if any exists; otherwise keep previous seen policies
+          const keys = usedNow.length > 0 ? usedNow : Array.from(seenPolicies);
+
+          const point: RewardPoint = { t: h.length };
+          keys.forEach((p) => {
+            point[p] = next[p]?.reward ?? 0;
+          });
+
+          return [...h, point].slice(-200);
+        });
+
+        return next;
+      });
 
       const backendOverall = typeof summary?.mean_latency_ms === "number" ? summary.mean_latency_ms : 0;
       setOverallAvgLatencyMs(backendOverall);
@@ -613,7 +652,7 @@ export function Simulation() {
       pollIntervalRef.current = null;
     };
   }, [isRunning, pollManager, submitOneJob, simulationSpeed]);
-
+  
   const resetSimulation = () => {
     setIsRunning(false);
     setIsAgentControlled(false);
@@ -622,7 +661,8 @@ export function Simulation() {
     setOverallAvgLatencyMs(0);
     setOverallLatencyTrail([]);
     simStartMsRef.current = null;
-
+    setRewardHistory([]);
+    setSeenPolicies(new Set());
     setPolicy("round-robin");
     setCurrentRouteStrategy("round-robin");
 
@@ -1232,6 +1272,36 @@ export function Simulation() {
                   RL Enabled
                 </div>
               </div>
+              <div className="bg-neutral-900 border border-neutral-800 rounded-2xl p-6">
+                <div className="flex items-center gap-2 mb-4">
+                  <Activity className="w-5 h-5 text-purple-400" />
+                  <h3 className="font-semibold">Policy Reward Over Time</h3>
+                </div>
+
+                <div className="h-[260px]">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={rewardHistory}>
+                      <XAxis dataKey="t" />
+                      <YAxis />
+                      <Tooltip />
+                      <Legend />
+                      {Array.from(seenPolicies).map((p) => (
+                        <Line
+                          key={p}
+                          type="monotone"
+                          dataKey={p}
+                          name={p.replace("-", " ")}
+                          stroke={POLICY_COLORS[p]}
+                          dot={false}
+                          strokeWidth={2}
+                          isAnimationActive={false}
+                        />
+                      ))}
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+
 
               <div className="overflow-x-auto">
                 <table className="w-full text-left">

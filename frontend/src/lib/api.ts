@@ -348,3 +348,27 @@ export async function getMyAgentHistory(token: string) {
     { headers: { Authorization: `Bearer ${token}` } }
   );
 }
+
+
+// Dockerize Functions
+export async function createDockerNode(token: string, port: number) {
+  return http("/docker/nodes/create", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ port }),
+  });
+}
+
+export async function stopDockerNode(token: string, name: string) {
+  return http(`/docker/nodes/${name}/stop`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export async function deleteDockerNode(token: string, name: string) {
+  return http(`/docker/nodes/${name}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}

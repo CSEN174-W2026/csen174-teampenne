@@ -7,19 +7,16 @@ import {
   Cpu,
   Zap,
   ShieldCheck,
-  Globe,
   Clock,
   ChevronRight,
   MoreHorizontal,
 } from "lucide-react";
 
-// import { useNavigate } from "react-router-dom";
 import { MetricCard } from "../components/MetricCard";
 import { ResourceChart } from "../components/ResourceChart";
 import { motion } from "motion/react";
 
 import { getClusterStats, getNodes, type ClusterStatsResponse, type NodeSnapshot } from "../../lib/api";
-import { getStoredNodeSamples, type StoredNodeSample } from "../../lib/api";
 
 type SeriesPoint = { t: number; cpu: number; mem: number };
 
@@ -33,9 +30,7 @@ export function Dashboard() {
   const [nodesTimeMs, setNodesTimeMs] = useState<number>(Date.now());
   const [series, setSeries] = useState<SeriesPoint[]>([]);
   const [cluster, setCluster] = useState<ClusterStatsResponse | null>(null);
-  const [storedSamples, setStoredSamples] = useState<StoredNodeSample[]>([]);
   const [error, setError] = useState<string | null>(null);
-  // const navigate = useNavigate();
 
   // ---- Poll /nodes (for table + CPU/Mem chart)
   useEffect(() => {
@@ -76,7 +71,7 @@ export function Dashboard() {
     };
   }, []);
 
-  // ---- Poll /cluster/stats (for real Avg Latency / Throughput / Disk Usage)
+  // ---- Poll /cluster/stats (Avg Latency / Throughput / Disk Usage)
   useEffect(() => {
     let alive = true;
 
@@ -85,7 +80,7 @@ export function Dashboard() {
         const stats = await getClusterStats(60, 200); // 60s window
         if (!alive) return;
         setCluster(stats);
-      } catch (e: any) {
+      } catch {
         if (!alive) return;
         // don't hard-fail the dashboard if this endpoint errors; just show warning
         setCluster(null);
@@ -132,7 +127,9 @@ export function Dashboard() {
         ? [
             {
               id: 2,
-              title: `Cluster stats: ${cluster.jobs_count} jobs in last ${Math.round(cluster.window_ms / 1000)}s`,
+              title: `Cluster stats: ${cluster.jobs_count} jobs in last ${Math.round(
+                cluster.window_ms / 1000
+              )}s`,
               time: new Date(cluster.time_ms).toLocaleTimeString(),
               status: "info",
             },
@@ -146,42 +143,54 @@ export function Dashboard() {
     cluster?.avg_latency_ms == null ? "—" : `${Math.round(cluster.avg_latency_ms)}ms`;
 
   const thr = Number(cluster?.throughput_rps);
-  const throughputLabel =
-    cluster == null || !Number.isFinite(thr) ? "—" : `${thr.toFixed(2)} jobs/s`;
+  const throughputLabel = cluster == null || !Number.isFinite(thr) ? "—" : `${thr.toFixed(2)} jobs/s`;
 
-  const diskUsageLabel =
-    cluster == null ? "—" : fmtPct(cluster.disk_usage_pct);
+  const diskUsageLabel = cluster == null ? "—" : fmtPct(cluster.disk_usage_pct);
 
   return (
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-700">
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold tracking-tight">System Overview</h1>
-          <p className="text-neutral-400 mt-1">
-            Real-time performance metrics across your distributed infrastructure.
-          </p>
+          <p className="text-neutral-400 mt-1">Real-time performance metrics across your distributed infrastructure.</p>
           {error ? <p className="text-sm text-rose-400 mt-2">{error}</p> : null}
         </div>
-
-        {/* <div className="flex items-center gap-2 bg-neutral-900 border border-neutral-800 p-1 rounded-lg">
-          <button className="px-3 py-1.5 text-sm font-medium rounded-md bg-neutral-800 text-white shadow-sm">
-            24 Hours
-          </button>
-          <button className="px-3 py-1.5 text-sm font-medium rounded-md text-neutral-400 hover:text-white transition-colors">
-            7 Days
-          </button>
-          <button className="px-3 py-1.5 text-sm font-medium rounded-md text-neutral-400 hover:text-white transition-colors">
-            30 Days
-          </button>
-        </div> */}
       </div>
 
       {/* Stats Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-        <MetricCard label="Total Nodes" value={String(totalNodes)} trend={0} icon={Server} color="indigo" />
-        <MetricCard label="Avg. Latency" value={avgLatencyLabel} trend={0} icon={Zap} color="emerald" />
-        <MetricCard label="Throughput" value={throughputLabel} trend={0} icon={Activity} color="indigo" />
-        <MetricCard label="Disk Usage" value={diskUsageLabel} trend={0} icon={Database} color="amber" />
+        <MetricCard
+          label="Total Nodes"
+          value={String(totalNodes)}
+          trend={0}
+          icon={Server}
+          color="indigo"
+          definition="Number of worker nodes currently registered and returned by the /nodes API."
+        />
+        <MetricCard
+          label="Avg. Latency"
+          value={avgLatencyLabel}
+          trend={0}
+          icon={Zap}
+          color="emerald"
+          definition="Average end-to-end job latency over the last window (from /cluster/stats, in milliseconds)."
+        />
+        <MetricCard
+          label="Throughput"
+          value={throughputLabel}
+          trend={0}
+          icon={Activity}
+          color="indigo"
+          definition="Job completion rate over the last window (from /cluster/stats), measured as jobs per second."
+        />
+        <MetricCard
+          label="Disk Usage"
+          value={diskUsageLabel}
+          trend={0}
+          icon={Database}
+          color="amber"
+          definition="Percent of disk space used (from /cluster/stats)."
+        />
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
@@ -230,22 +239,17 @@ export function Dashboard() {
             ))}
           </div>
 
-          <div className="mt-6 pt-6 border-t border-neutral-800 space-y-4">
+          {/* <div className="mt-6 pt-6 border-t border-neutral-800 space-y-4">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2 text-sm text-neutral-400">
                 <ShieldCheck className="w-4 h-4 text-emerald-400" />
                 Security Status
               </div>
-              <span className="text-xs font-bold text-emerald-400 bg-emerald-400/10 px-2 py-1 rounded">SECURE</span>
+              <span className="text-xs font-bold text-emerald-400 bg-emerald-400/10 px-2 py-1 rounded">
+                SECURE
+              </span>
             </div>
-            <div className="flex items-center justify-between">
-              {/* <div className="flex items-center gap-2 text-sm text-neutral-400">
-                <Globe className="w-4 h-4 text-indigo-400" />
-                Edge Availability
-              </div> */}
-              {/* <span className="text-xs font-bold text-indigo-400 bg-indigo-400/10 px-2 py-1 rounded">99.99%</span> */}
-            </div>
-          </div>
+          </div> */}
         </div>
       </div>
 
@@ -256,7 +260,10 @@ export function Dashboard() {
             <h2 className="text-xl font-bold">Node Groups</h2>
             <p className="text-sm text-neutral-500">Live health and load status of primary clusters</p>
           </div>
-          <a href="/nodes" className="bg-white text-black px-4 py-2 rounded-lg text-sm font-bold hover:bg-neutral-200 transition-colors">
+          <a
+            href="/nodes"
+            className="bg-white text-black px-4 py-2 rounded-lg text-sm font-bold hover:bg-neutral-200 transition-colors"
+          >
             Manage Nodes
           </a>
         </div>
@@ -312,9 +319,7 @@ export function Dashboard() {
                     >
                       <div
                         className={`w-1.5 h-1.5 rounded-full ${
-                          node.status === "healthy"
-                            ? "bg-emerald-400"
-                            : "bg-amber-400 animate-pulse"
+                          node.status === "healthy" ? "bg-emerald-400" : "bg-amber-400 animate-pulse"
                         }`}
                       />
                       {node.status.toUpperCase()}
