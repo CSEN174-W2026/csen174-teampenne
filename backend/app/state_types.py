@@ -30,6 +30,8 @@ class NodeSnapshot:
     name: str
     host: str          # IP or hostname reachable from controller
     port: int
+    instance_id: Optional[str] = None
+    region: Optional[str] = None
 
     # capacity (static-ish)
     cpus: Optional[int] = None

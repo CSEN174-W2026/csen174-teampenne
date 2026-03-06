@@ -1,0 +1,62 @@
+#!/bin/bash
+set -euxo pipefail
+
+# Bootstrap script for Ubuntu/Amazon Linux based AMIs.
+# This installs Python, clones a GitHub repo, creates venv, installs deps,
+# and runs node worker on port 5001 via systemd.
+
+if command -v apt-get >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y python3 python3-venv python3-pip git
+elif command -v dnf >/dev/null 2>&1; then
+  dnf makecache
+  dnf install -y python3 python3-pip git
+elif command -v yum >/dev/null 2>&1; then
+  yum makecache fast
+  yum install -y python3 python3-pip git
+else
+  echo "No supported package manager found." >&2
+  exit 1
+fi
+
+mkdir -p /opt/csen174
+cd /opt
+
+git clone --branch Josh-Manager-Agent --depth 1 https://github.com/CSEN174-W2026/csen174-teampenne.git /opt/csen174
+
+cd /opt/csen174/backend
+if ! python3 -m venv venv; then
+  python3 -m pip install virtualenv
+  python3 -m virtualenv venv
+fi
+source venv/bin/activate
+python -m pip install --upgrade pip
+
+# Install project requirements if present.
+if [ -f /opt/csen174/backend/requirements.txt ]; then
+  pip install -r /opt/csen174/backend/requirements.txt
+fi
+
+# Fallback runtime deps.
+pip install fastapi "uvicorn[standard]" pydantic psutil requests
+
+cat >/etc/systemd/system/csen174-node.service <<'EOF'
+[Unit]
+Description=CSEN174 Node Worker
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/csen174/backend
+ExecStart=/bin/bash -lc 'source venv/bin/activate && python -m uvicorn app.node.node_worker:app --host 0.0.0.0 --port 5001'
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable csen174-node
+systemctl restart csen174-node

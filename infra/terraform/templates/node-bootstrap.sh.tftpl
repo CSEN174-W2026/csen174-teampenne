@@ -1,0 +1,66 @@
+#!/bin/bash
+set -euxo pipefail
+
+if command -v apt-get >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y python3 python3-venv python3-pip git
+elif command -v dnf >/dev/null 2>&1; then
+  dnf makecache
+  dnf install -y python3 python3-pip git
+elif command -v yum >/dev/null 2>&1; then
+  yum makecache fast
+  yum install -y python3 python3-pip git
+else
+  echo "No supported package manager found." >&2
+  exit 1
+fi
+
+mkdir -p /opt
+
+if [ ! -d "${repo_clone_dir}/.git" ]; then
+  rm -rf "${repo_clone_dir}"
+  git clone --branch "${github_branch}" --depth 1 "${github_repo_url}" "${repo_clone_dir}"
+else
+  cd "${repo_clone_dir}"
+  git fetch --all
+  git checkout "${github_branch}"
+  git pull --ff-only origin "${github_branch}"
+fi
+
+cd "${repo_clone_dir}/${node_working_dir}"
+
+if ! python3 -m venv venv; then
+  python3 -m pip install virtualenv
+  python3 -m virtualenv venv
+fi
+source venv/bin/activate
+python -m pip install --upgrade pip
+
+if [ -f "${repo_clone_dir}/${requirements_file}" ]; then
+  pip install -r "${repo_clone_dir}/${requirements_file}"
+fi
+
+%{ for pkg in extra_pip_packages ~}
+pip install "${pkg}"
+%{ endfor ~}
+
+cat >/etc/systemd/system/${node_service_name}.service <<EOF
+[Unit]
+Description=Node worker (${node_service_name})
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=${repo_clone_dir}/${node_working_dir}
+ExecStart=/bin/bash -lc '${node_start_command}'
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable ${node_service_name}
+systemctl restart ${node_service_name}

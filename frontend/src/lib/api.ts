@@ -143,6 +143,45 @@ export type AuthUser = {
   updated_at?: number | null;
 };
 
+export type SavedNodeRef = {
+  id?: number;
+  nodeKey: string;
+  nodeName: string;
+  host: string;
+  port: number;
+};
+
+export type NodeGroup = {
+  id: number;
+  userId: string;
+  userEmail?: string | null;
+  name: string;
+  color: string;
+  createdAt?: string;
+  updatedAt?: string;
+  nodes: SavedNodeRef[];
+};
+
+export type NodeGroupSelection = {
+  id: number;
+  userId: string;
+  userEmail?: string | null;
+  groupIds: number[];
+  updatedAt?: string;
+};
+
+export type Ec2Node = {
+  instance_id: string;
+  name: string;
+  state: string; // pending | running | stopping | stopped | ...
+  private_ip?: string | null;
+  public_ip?: string | null;
+  public_dns?: string | null;
+  az?: string | null;
+  region?: string | null;
+  instance_type?: string | null;
+};
+
 export async function getHealth() {
   return http<{ ok: boolean; time_ms: number }>("/health");
 }
@@ -281,6 +320,56 @@ export async function getStoredNodeSamples(limit = 20) {
   return webHttp<{ rows: StoredNodeSample[] }>(`/api/metrics/node-samples?limit=${limit}`);
 }
 
+export async function listNodeGroups(userId: string) {
+  return webHttp<{ rows: NodeGroup[] }>(`/api/node-groups?userId=${encodeURIComponent(userId)}`);
+}
+
+export async function createNodeGroup(payload: {
+  userId: string;
+  userEmail?: string;
+  name: string;
+  color?: string;
+  nodes: SavedNodeRef[];
+}) {
+  return webHttp<{ row: NodeGroup }>("/api/node-groups", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function updateNodeGroup(
+  groupId: number,
+  payload: { name?: string; color?: string; nodes?: SavedNodeRef[] }
+) {
+  return webHttp<{ row: NodeGroup }>(`/api/node-groups/${groupId}`, {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function deleteNodeGroup(groupId: number) {
+  return webHttp<{ ok: boolean; deleted: number }>(`/api/node-groups/${groupId}`, {
+    method: "DELETE",
+  });
+}
+
+export async function getNodeGroupSelection(userId: string) {
+  return webHttp<{ row: NodeGroupSelection | null }>(
+    `/api/node-groups/selections?userId=${encodeURIComponent(userId)}`
+  );
+}
+
+export async function saveNodeGroupSelection(payload: {
+  userId: string;
+  userEmail?: string;
+  groupIds: number[];
+}) {
+  return webHttp<{ row: NodeGroupSelection }>("/api/node-groups/selections", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
 export async function me(token: string) {
   return http<AuthUser>("/auth/me", {
     headers: { Authorization: `Bearer ${token}` },
@@ -347,6 +436,51 @@ export async function getMyAgentHistory(token: string) {
     "/users/me/agent_history",
     { headers: { Authorization: `Bearer ${token}` } }
   );
+}
+
+export type CreateEc2NodePayload = {
+  image_id?: string;
+  instance_type: string;
+  subnet_id?: string;
+  security_group_id?: string;
+  key_name?: string;
+  iam_instance_profile?: string;
+  user_data?: string;
+};
+
+export async function createEc2Node(token: string, payload: CreateEc2NodePayload) {
+  return http("/ec2/nodes/create", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function startEc2Node(token: string, instanceId: string) {
+  return http(`/ec2/nodes/${instanceId}/start`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export async function stopEc2Node(token: string, instanceId: string) {
+  return http(`/ec2/nodes/${instanceId}/stop`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export async function deleteEc2Node(token: string, instanceId: string) {
+  return http(`/ec2/nodes/${instanceId}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export async function listEc2Nodes(token: string) {
+  return http<{ nodes: Ec2Node[]; count: number; time_ms: number }>("/ec2/nodes", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
 }
 
 

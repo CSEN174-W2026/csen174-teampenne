@@ -26,6 +26,8 @@ class NodeClient:
             name=node.name,
             host=node.host,
             port=node.port,
+            instance_id=node.instance_id,
+            region=node.region,
             cpus=node.cpus,
             memory_mb=node.memory_mb,
             cpu_pct=m.get("cpu_pct"),

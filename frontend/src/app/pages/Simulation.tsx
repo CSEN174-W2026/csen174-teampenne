@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useAuth } from "../auth/AuthContext";
 import {
   Play,
@@ -18,6 +18,7 @@ import { BarChart, Bar, XAxis, YAxis, ResponsiveContainer, Cell, LineChart, Tool
 
 import {
   getNodes,
+  listNodeGroups,
   submitJob,
   getLearnerStats,
   getPending,
@@ -27,6 +28,7 @@ import {
   resetManager,
   getRecentExplanations,
   type AgentConfig,
+  type NodeGroup,
 } from "../../lib/api";
 
 type Json = Record<string, any>;
@@ -80,6 +82,10 @@ function safePct(x: any) {
 
 function mkJobId() {
   return `job_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+}
+
+function normalizeNodeKey(x: unknown): string {
+  return String(x ?? "").trim().toLowerCase();
 }
 
 function normalizePolicyKey(k: string): string {
@@ -209,48 +215,7 @@ export function Simulation() {
 
   const [simulationSpeed, setSimulationSpeed] = useState(1);
 
-  const [nodes, setNodes] = useState<NodeUI[]>([
-    {
-      id: "node-1",
-      name: "us-east-1a",
-      cpuCapacity: 100,
-      memCapacity: 1024,
-      cpuUsed: 0,
-      memUsed: 0,
-      tasks: [],
-      status: "offline",
-    },
-    {
-      id: "node-2",
-      name: "us-east-1b",
-      cpuCapacity: 100,
-      memCapacity: 1024,
-      cpuUsed: 0,
-      memUsed: 0,
-      tasks: [],
-      status: "offline",
-    },
-    {
-      id: "node-3",
-      name: "us-west-2a",
-      cpuCapacity: 150,
-      memCapacity: 2048,
-      cpuUsed: 0,
-      memUsed: 0,
-      tasks: [],
-      status: "offline",
-    },
-    {
-      id: "node-4",
-      name: "eu-central-1",
-      cpuCapacity: 80,
-      memCapacity: 512,
-      cpuUsed: 0,
-      memUsed: 0,
-      tasks: [],
-      status: "offline",
-    },
-  ]);
+  const [nodes, setNodes] = useState<NodeUI[]>([]);
 
   const [incomingJobs, setIncomingJobs] = useState(0);
   const [submittedJobs, setSubmittedJobs] = useState(0);
@@ -377,6 +342,168 @@ export function Simulation() {
 
   const { user } = useAuth() as { user?: { id?: string; email?: string } };
   const userId = user?.id ?? user?.email ?? "anon";
+  const [connectedNodeKeys, setConnectedNodeKeys] = useState<string[]>([]);
+  const [nodeGroups, setNodeGroups] = useState<NodeGroup[]>([]);
+  const [selectedSimulationGroupId, setSelectedSimulationGroupId] = useState<number | null>(null);
+  const [scopeError, setScopeError] = useState<string | null>(null);
+  const connectedStorageKey = useMemo(
+    () => `nodes.connected.${user?.id ?? "anonymous"}`,
+    [user?.id]
+  );
+
+  useEffect(() => {
+    const loadConnected = () => {
+      try {
+        const raw = localStorage.getItem(connectedStorageKey);
+        if (!raw) {
+          setConnectedNodeKeys([]);
+          return;
+        }
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          setConnectedNodeKeys(parsed.filter((x) => typeof x === "string"));
+        } else {
+          setConnectedNodeKeys([]);
+        }
+      } catch {
+        setConnectedNodeKeys([]);
+      }
+    };
+
+    loadConnected();
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === connectedStorageKey) loadConnected();
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [connectedStorageKey]);
+
+  useEffect(() => {
+    if (!user?.id) {
+      setNodeGroups([]);
+      setSelectedSimulationGroupId(null);
+      return;
+    }
+    let active = true;
+    const loadGroups = async () => {
+      try {
+        const groupsResp = await listNodeGroups(user.id!);
+        if (!active) return;
+        const rows = groupsResp.rows ?? [];
+        setNodeGroups(rows);
+        setSelectedSimulationGroupId((prev) => {
+          if (prev != null && rows.some((g) => g.id === prev)) return prev;
+          return null;
+        });
+      } catch {
+        if (!active) return;
+        setNodeGroups([]);
+        setSelectedSimulationGroupId(null);
+      }
+    };
+    void loadGroups();
+    return () => {
+      active = false;
+    };
+  }, [user?.id]);
+
+  const selectedSimulationGroup = useMemo(
+    () => nodeGroups.find((g) => g.id === selectedSimulationGroupId) ?? null,
+    [nodeGroups, selectedSimulationGroupId]
+  );
+
+  const selectedSimulationGroupNodeKeys = useMemo(() => {
+    if (!selectedSimulationGroup) return new Set<string>();
+    return new Set<string>(selectedSimulationGroup.nodes.map((n) => normalizeNodeKey(n.nodeKey)));
+  }, [selectedSimulationGroup]);
+
+  const connectedNodeKeySet = useMemo(
+    () => new Set<string>(connectedNodeKeys.map((k) => normalizeNodeKey(k))),
+    [connectedNodeKeys]
+  );
+
+  const selectedGroupConnectedNodeKeys = useMemo(() => {
+    if (!selectedSimulationGroup) return new Set<string>();
+    const result = new Set<string>();
+    selectedSimulationGroupNodeKeys.forEach((k) => {
+      if (connectedNodeKeySet.has(k)) result.add(k);
+    });
+    return result;
+  }, [selectedSimulationGroup, selectedSimulationGroupNodeKeys, connectedNodeKeySet]);
+
+  const allowedNodeKeys = useMemo(() => {
+    if (selectedSimulationGroup) return selectedGroupConnectedNodeKeys;
+    if (nodeGroups.length > 0) return new Set<string>();
+    return connectedNodeKeySet;
+  }, [connectedNodeKeySet, nodeGroups.length, selectedSimulationGroup, selectedGroupConnectedNodeKeys]);
+
+  const renderNodes = useMemo<NodeUI[]>(() => {
+    if (nodes.length > 0) return nodes;
+    if (!selectedSimulationGroup) return [];
+    return selectedSimulationGroup.nodes
+      .filter((n) => connectedNodeKeySet.has(normalizeNodeKey(n.nodeKey)))
+      .map((n) => ({
+        id: `${n.host}:${n.port}`,
+        name: n.nodeName || `${n.host}:${n.port}`,
+        cpuCapacity: 100,
+        memCapacity: 100,
+        cpuUsed: 0,
+        memUsed: 0,
+        tasks: [],
+        status: "offline",
+      }));
+  }, [nodes, selectedSimulationGroup, connectedNodeKeySet]);
+
+  const pollNodes = useCallback(async () => {
+    try {
+      const nodesResp = await getNodes();
+      const rawNodes = nodesResp.nodes || [];
+      const connectedSet = new Set<string>(connectedNodeKeys.map((k) => normalizeNodeKey(k)));
+      const filteredRaw = rawNodes.filter((n: any) => {
+        const hostPort = normalizeNodeKey(`${n?.host}:${n?.port}`);
+        const name = normalizeNodeKey(n?.name);
+        const instanceId = normalizeNodeKey(n?.instance_id);
+        const hostPortName = normalizeNodeKey(`${n?.host}:${n?.port}:${n?.name ?? ""}`);
+        if (allowedNodeKeys.size === 0) return false;
+        return (
+          allowedNodeKeys.has(hostPort) ||
+          allowedNodeKeys.has(name) ||
+          allowedNodeKeys.has(instanceId) ||
+          allowedNodeKeys.has(hostPortName)
+        );
+      });
+
+      const mapped: NodeUI[] = filteredRaw.map((n: any) => {
+        const cpuPct = safePct(n.cpu_pct);
+        const memPct = safePct(n.mem_pct);
+        const cpuCap = 100;
+        const memCap = 100;
+        const online = !(n as any).error && (n.cpu_pct != null || n.mem_pct != null);
+        const hostPort = normalizeNodeKey(`${n?.host}:${n?.port}`);
+        const name = normalizeNodeKey(n?.name);
+        const instanceId = normalizeNodeKey(n?.instance_id);
+        const hostPortName = normalizeNodeKey(`${n?.host}:${n?.port}:${n?.name ?? ""}`);
+        const isUserConnected =
+          connectedSet.has(hostPort) ||
+          connectedSet.has(name) ||
+          connectedSet.has(instanceId) ||
+          connectedSet.has(hostPortName);
+        return {
+          id: `${n.host}:${n.port}`,
+          name: (n.name ?? `${n.host}:${n.port}`).toLowerCase(),
+          cpuCapacity: cpuCap,
+          memCapacity: memCap,
+          cpuUsed: (cpuPct / 100) * cpuCap,
+          memUsed: (memPct / 100) * memCap,
+          tasks: [],
+          status: online && isUserConnected ? "active" : "offline",
+        };
+      });
+      setNodes(mapped);
+    } catch {
+      setNodes([]);
+    }
+  }, [allowedNodeKeys, connectedNodeKeys]);
 
   const serviceTimeMsFromCpu = useCallback((cpu: number) => {
     return Math.max(50, Math.round(150 + cpu * 12));
@@ -384,6 +511,16 @@ export function Simulation() {
 
   const submitOneJob = useCallback(
     async (metadata: Json = {}) => {
+      if (nodeGroups.length > 0) {
+        if (!selectedSimulationGroup) {
+          setScopeError("Select a node group before submitting jobs.");
+          return;
+        }
+        if (allowedNodeKeys.size === 0) {
+          setScopeError("No connected nodes in this group. Connect group nodes first.");
+          return;
+        }
+      }
       const manualPolicyBackend =
         POLICY_OPTIONS.find((p) => p.ui === policy)?.backend ?? "round_robin";
 
@@ -395,6 +532,9 @@ export function Simulation() {
           cpu_intensity: manualTask.cpu,
           mem_hint: manualTask.mem,
           duration_hint: manualTask.duration,
+          selected_group_id: selectedSimulationGroup?.id ?? null,
+          selected_group_name: selectedSimulationGroup?.name ?? null,
+          allowed_node_keys: Array.from(allowedNodeKeys),
 
           // backend expects underscore keys
           manual_policy: isAgentControlled ? null : manualPolicyBackend,
@@ -450,6 +590,12 @@ export function Simulation() {
       isAgentControlled,
       policy,
       POLICY_OPTIONS,
+      nodeGroups.length,
+      selectedSimulationGroup,
+      selectedSimulationGroup?.id,
+      selectedSimulationGroup?.name,
+      allowedNodeKeys,
+      setScopeError,
       serviceTimeMsFromCpu,
     ]
   );
@@ -514,39 +660,7 @@ export function Simulation() {
   }, []);
 
   const pollManager = useCallback(async () => {
-    // 1) Nodes
-    try {
-      const nodesResp = await getNodes();
-      const mapped: NodeUI[] = (nodesResp.nodes || []).map((n: any) => {
-        const cpuPct = safePct(n.cpu_pct);
-        const memPct = safePct(n.mem_pct);
-        const cpuCap = 100;
-        const memCap = 100;
-
-        return {
-          id: `${n.host}:${n.port}`,
-          name: (n.name ?? `${n.host}:${n.port}`).toLowerCase(),
-          cpuCapacity: cpuCap,
-          memCapacity: memCap,
-          cpuUsed: (cpuPct / 100) * cpuCap,
-          memUsed: (memPct / 100) * memCap,
-          tasks: [],
-          status: n.error ? "offline" : "active",
-        };
-      });
-
-      if (mapped.length > 0) setNodes(mapped);
-      else
-        setNodes((prev) =>
-          prev.map((x) => ({ ...x, status: "offline", cpuUsed: 0, memUsed: 0, tasks: [] }))
-        );
-    } catch {
-      setNodes((prev) =>
-        prev.map((x) => ({ ...x, status: "offline", cpuUsed: 0, memUsed: 0, tasks: [] }))
-      );
-    }
-
-    // 2) Stats
+    // Stats
     try {
       let pendingIds: string[] = [];
       let learnerStats: Record<string, any> = {};
@@ -622,6 +736,12 @@ export function Simulation() {
     }
   }, [agentConfig, isAgentControlled, selectedPolicies, maybePauseForExplanation]);
 
+  useEffect(() => {
+    void pollNodes();
+    const id = window.setInterval(() => void pollNodes(), 2000);
+    return () => window.clearInterval(id);
+  }, [pollNodes]);
+
   const submitIntervalRef = useRef<number | null>(null);
   const pollIntervalRef = useRef<number | null>(null);
 
@@ -681,7 +801,7 @@ export function Simulation() {
       lastDecisionTime: Date.now(),
       status: "exploring",
     });
-    setNodes((prev) => prev.map((x) => ({ ...x, status: "offline", cpuUsed: 0, memUsed: 0, tasks: [] })));
+    setNodes([]);
 
     resetManager()
       .then(() => pollManager())
@@ -819,6 +939,12 @@ export function Simulation() {
           <p className="text-neutral-400 mt-1">
             A manager agent that learns the optimal routing policy to minimize latency.
           </p>
+          <p className="text-neutral-500 mt-1 text-xs">
+            {selectedSimulationGroup
+              ? `Group: ${selectedSimulationGroup.name} • connected+visible nodes: ${nodes.length}`
+              : `Connected nodes visible to this user: ${nodes.length}`}
+          </p>
+          {scopeError ? <p className="text-rose-400 mt-1 text-xs">{scopeError}</p> : null}
         </div>
 
         <div className="flex items-center gap-3 bg-neutral-900 border border-neutral-800 p-2 rounded-xl">
@@ -847,7 +973,26 @@ export function Simulation() {
           <div className="h-6 w-px bg-neutral-800 mx-1" />
 
           <button
-            onClick={() => setIsRunning(!isRunning)}
+            onClick={() => {
+              if (!isRunning) {
+                if (nodeGroups.length > 0 && !selectedSimulationGroup) {
+                  setScopeError("Select a node group before starting the simulation.");
+                  return;
+                }
+                if (selectedSimulationGroup && selectedSimulationGroupNodeKeys.size === 0) {
+                  setScopeError("Selected group has no nodes.");
+                  return;
+                }
+                if (selectedSimulationGroup && selectedGroupConnectedNodeKeys.size === 0) {
+                  setScopeError("No connected nodes in this group. Connect group nodes first.");
+                  return;
+                }
+                setScopeError(null);
+                setIsRunning(true);
+                return;
+              }
+              setIsRunning(false);
+            }}
             className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-all ${
               isRunning
                 ? "bg-amber-500/10 text-amber-500 hover:bg-amber-500/20"
@@ -959,6 +1104,33 @@ export function Simulation() {
             </div>
 
             <div className="space-y-5">
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-neutral-400">Simulation Group</label>
+                <select
+                  value={selectedSimulationGroupId ?? ""}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    setSelectedSimulationGroupId(v === "" ? null : Number(v));
+                    setScopeError(null);
+                  }}
+                  className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-200"
+                >
+                  <option value="">
+                    {nodeGroups.length > 0
+                      ? "Select a saved group"
+                      : "No saved groups (fallback: connected nodes)"}
+                  </option>
+                  {nodeGroups.map((g) => (
+                    <option key={g.id} value={g.id}>
+                      {g.name} ({g.nodes.length})
+                    </option>
+                  ))}
+                </select>
+                <p className="text-[11px] text-neutral-500 leading-snug">
+                  Simulation uses only nodes in the selected group that you are currently connected to.
+                </p>
+              </div>
+
               <div className="space-y-2">
                 <label className="text-sm font-medium text-neutral-400">Learner</label>
                 <select
@@ -1138,6 +1310,18 @@ export function Simulation() {
                 <p className="text-xl font-mono font-bold">{incomingJobs}</p>
               </div>
             </div>
+            {nodeGroups.length > 0 && selectedSimulationGroup ? (
+              <button
+                onClick={() => {
+                  setSelectedSimulationGroupId(null);
+                  setScopeError(null);
+                  setIsRunning(false);
+                }}
+                className="absolute top-6 right-6 z-20 rounded-lg border border-neutral-700 bg-neutral-900/80 px-3 py-1.5 text-xs text-neutral-300 hover:bg-neutral-800"
+              >
+                Back to Groups
+              </button>
+            ) : null}
 
             <div className="z-10 flex flex-col items-center gap-4 mb-16">
               <Motion.div
@@ -1203,8 +1387,36 @@ export function Simulation() {
               </AnimatePresence>
             </div>
 
+            {nodeGroups.length > 0 && !selectedSimulationGroup ? (
+              <div className="w-full z-10 mt-auto">
+                <div className="mb-3 text-xs text-neutral-400">Pick a group to view its nodes</div>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {nodeGroups.map((g) => (
+                    <button
+                      key={g.id}
+                      onClick={() => {
+                        setSelectedSimulationGroupId(g.id);
+                        setScopeError(null);
+                      }}
+                      className="text-left rounded-xl border border-neutral-800 bg-neutral-900/80 p-4 hover:border-indigo-500/40 hover:bg-neutral-900 transition-colors"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="text-sm font-semibold text-neutral-100">{g.name}</div>
+                        <span className="w-3 h-3 rounded-full" style={{ backgroundColor: g.color }} />
+                      </div>
+                      <div className="mt-1 text-xs text-neutral-400">
+                        {g.nodes.length} node(s) •{" "}
+                        {
+                          g.nodes.filter((n) => connectedNodeKeySet.has(normalizeNodeKey(n.nodeKey))).length
+                        } connected
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : (
             <div className="grid grid-cols-2 md:grid-cols-4 gap-6 w-full z-10 mt-auto">
-              {nodes.map((node) => (
+              {renderNodes.map((node) => (
                 <div
                   key={node.id}
                   className={`bg-neutral-900/80 backdrop-blur-sm border rounded-xl p-4 transition-all ${
@@ -1257,7 +1469,13 @@ export function Simulation() {
                   </div>
                 </div>
               ))}
+              {renderNodes.length === 0 && (
+                <div className="col-span-2 md:col-span-4 rounded-xl border border-neutral-800 bg-neutral-900/80 p-4 text-sm text-neutral-400">
+                  No connected nodes are selected for this user. Connect nodes in the Nodes page, then return here.
+                </div>
+              )}
             </div>
+            )}
           </div>
 
           {/* Leaderboard + Diagnostics */}
