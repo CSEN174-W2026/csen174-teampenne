@@ -240,6 +240,16 @@ export async function getRecentExplanations(cfg: AgentConfig, limit = 10) {
   );
 }
 
+export async function explainSimulation(payload: { config: AgentConfig; context: Record<string, any> }) {
+  return http<{ explanation: string; provider: string; reason?: string; time_ms: number }>(
+    "/agents/simulation/explain",
+    {
+    method: "POST",
+    body: JSON.stringify(payload),
+    }
+  );
+}
+
 export async function getLatencyStats(cfg: AgentConfig) {
   return http<any>("/agents/latency_stats", {
     method: "POST",

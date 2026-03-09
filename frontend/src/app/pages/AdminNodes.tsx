@@ -214,7 +214,9 @@ export function AdminNodes() {
           {nodes.map((n, i) => {
             const instanceId = String(n.instance_id ?? n.name ?? `node-${i + 1}`);
             const addr = n.public_ip ?? n.private_ip ?? n.public_dns ?? "n/a";
-            const isRunning = (n.state ?? "").toLowerCase() === "running";
+            const state = (n.state ?? "").toLowerCase();
+            const isRunning = state === "running";
+            const isStopped = state === "stopped";
             return (
               <div
                 key={`${instanceId}-${i}`}
@@ -239,7 +241,7 @@ export function AdminNodes() {
                 <div className="flex items-center gap-2">
                   <button
                     onClick={() => void onAction(instanceId, startEc2Node, "start")}
-                    disabled={busyId === instanceId || isRunning}
+                    disabled={busyId === instanceId || !isStopped}
                     className="inline-flex items-center gap-1.5 text-xs font-bold text-sky-400 hover:text-sky-300 disabled:opacity-50"
                   >
                     <Play className="w-3.5 h-3.5" />

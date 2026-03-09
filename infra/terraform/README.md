@@ -22,7 +22,7 @@ Notes:
 - `ami_id = null` uses latest Ubuntu 22.04 LTS automatically.
 - Default node service port is `5001`.
 - The generated cloud-init script installs Python, clones your repo, creates venv, installs deps, and starts systemd service.
-- For this project, set `github_branch=Josh-Manager-Agent` so `backend/app/node/node_worker.py` exists.
+- For this project, set `github_branch=vm-info` so `backend/app/node/node_worker.py` matches the manager's expected API.
 
 ## 3) Plan and apply
 

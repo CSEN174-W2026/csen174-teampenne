@@ -63,7 +63,7 @@ class MinLatencyWithSLA(Goal):
         r = -lat
         if lat > self.sla_ms:
             r -= self.sla_penalty
-        if not o.ok:
+        if not o.success:
             r -= self.fail_penalty
         return r
 
@@ -82,13 +82,17 @@ class MinLatencyPlusTail(Goal):
     def reward(self, o: Outcome) -> float:
         lat = float(o.latency_ms)
         p95 = None
-        if o.extra and o.extra.get("p95_ms") is not None:
-            p95 = float(o.extra["p95_ms"])
+        extra = o.extra_info or {}
+        if isinstance(extra, dict):
+            if extra.get("p95_ms") is not None:
+                p95 = float(extra["p95_ms"])
+            elif extra.get("p95_latency_ms") is not None:
+                p95 = float(extra["p95_latency_ms"])
 
         r = -lat
         if p95 is not None:
             r -= self.tail_weight * p95
-        if not o.ok:
+        if not o.success:
             r -= self.fail_penalty
         return r
 

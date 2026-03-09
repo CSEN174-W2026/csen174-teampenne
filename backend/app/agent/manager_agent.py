@@ -132,23 +132,21 @@ class ManagerAgent:
         self._pending: Dict[str, Decision] = {}  # job_id -> Decision
         self._outcomes: List[Outcome] = []  # most recent outcomes, for diagnostics
         self._history_size = int(history_size) # how many past outcomes to remember for diagnostics
+        self._reward_sum_by_policy: Dict[str, float] = {}
+        self._reward_count_by_policy: Dict[str, int] = {}
 
     # Return list of policy names (arms)
     def policy_names(self) -> List[str]:
         return list(self.policies.keys())
     
-
-    # Decide which policy to use, and which node to route to, for this job request
-    def route(self, job: JobRequest, nodes: List[NodeSnapshot]) -> Decision:
+    def _route_with_policy_name(self, policy_name: str, job: JobRequest, nodes: List[NodeSnapshot]) -> Decision:
         if not nodes:
             raise ValueError("No nodes available")
+        if policy_name not in self.policies:
+            raise ValueError(f"Unknown policy '{policy_name}'")
 
         context = self.context_builder(nodes, job)
-        arms = self.policy_names()
-
-        policy_name = self.learner.choose_arm(arms, context=context) # Learner chooses which policy to use based on the arms and context
         policy = self.policies[policy_name]
-
         chosen = policy.choose_node(nodes, job)
         d = Decision(
             job_id=job.job_id,
@@ -160,7 +158,7 @@ class ManagerAgent:
             context=context,
             user_id=getattr(job, "user_id", None),
         )
-        self._pending[job.job_id] = d # Remember the decision for this job so we can update the learner later when the outcome comes back
+        self._pending[job.job_id] = d
         self.explainer.record_choice(
             job_id=job.job_id,
             chosen_policy=policy_name,
@@ -169,8 +167,26 @@ class ManagerAgent:
             learner_stats=self.learner_stats(),
             learner_name=getattr(self.learner, "name", "unknown"),
         )
-
         return d
+
+    def route_with_policy(self, policy_name: str, job: JobRequest, nodes: List[NodeSnapshot]) -> Decision:
+        """
+        Route using a fixed policy name (manual override path).
+        """
+        key = (policy_name or "").strip().lower().replace("-", "_")
+        return self._route_with_policy_name(key, job, nodes)
+
+
+    # Decide which policy to use, and which node to route to, for this job request
+    def route(self, job: JobRequest, nodes: List[NodeSnapshot]) -> Decision:
+        if not nodes:
+            raise ValueError("No nodes available")
+
+        context = self.context_builder(nodes, job)
+        arms = self.policy_names()
+
+        policy_name = self.learner.choose_arm(arms, context=context) # Learner chooses which policy to use based on the arms and context
+        return self._route_with_policy_name(policy_name, job, nodes)
     
     # Observe the outcome of a completed job, update learner --> when job is finished
     def observe(
@@ -195,6 +211,17 @@ class ManagerAgent:
             lat = self.latency_clip_ms
         lat = min(lat, self.latency_clip_ms)
 
+        # Provide rolling p95 if caller didn't pass one so tail-sensitive goals
+        # have a meaningful signal beyond single-job latency.
+        extra_info: Dict[str, Any] = dict(extra or {})
+        if extra_info.get("p95_ms") is None and extra_info.get("p95_latency_ms") is None:
+            latencies = [float(o.latency_ms) for o in self._outcomes]
+            latencies.append(float(lat))
+            if latencies:
+                latencies.sort()
+                idx = int(0.95 * (len(latencies) - 1))
+                extra_info["p95_latency_ms"] = float(latencies[idx])
+
         o = Outcome(
             job_id=job_id,
             success=bool(success),
@@ -202,11 +229,13 @@ class ManagerAgent:
             policy_name=d.policy_name,
             node_name=d.node_name,
             user_id=d.user_id,
-            extra_info=extra or {},
+            extra_info=extra_info,
         )
 
         reward = float(self.goal.reward(o)) # Compute reward based on the outcome
         self.learner.update(d.policy_name, reward, context=d.context)
+        self._reward_sum_by_policy[d.policy_name] = self._reward_sum_by_policy.get(d.policy_name, 0.0) + reward
+        self._reward_count_by_policy[d.policy_name] = self._reward_count_by_policy.get(d.policy_name, 0) + 1
 
         self.explainer.record_observation(
             job_id=job_id,
@@ -239,6 +268,17 @@ class ManagerAgent:
 
     def learner_stats(self) -> Dict[str, dict]:
         return self.learner.stats()
+
+    def reward_stats(self) -> Dict[str, dict]:
+        acc: Dict[str, dict] = {}
+        for policy, total in self._reward_sum_by_policy.items():
+            n = int(self._reward_count_by_policy.get(policy, 0))
+            acc[policy] = {
+                "n": n,
+                "total_reward": float(total),
+                "avg_reward": float(total / n) if n > 0 else 0.0,
+            }
+        return acc
 
     def recent_outcomes(self) -> List[Outcome]:
         return list(self._outcomes)
@@ -278,5 +318,6 @@ class ManagerAgent:
             "top_policy": top_policy,
             "top_policy_count": counts[top_policy],
             "learner_stats": self.learner_stats(),
+            "reward_stats": self.reward_stats(),
             "pending": len(self._pending),
         }

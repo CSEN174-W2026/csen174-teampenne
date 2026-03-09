@@ -14,6 +14,7 @@ import time
 import shutil
 import uuid
 import statistics
+from pathlib import Path
 from dataclasses import asdict, is_dataclass, dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -195,7 +196,30 @@ def _load_default_ec2_user_data() -> Optional[str]:
             "Failed to read EC2_DEFAULT_USER_DATA_FILE",
             {"path": file_path, "error": str(exc)},
         )
-        return None
+
+    # Fallback: resolve from repository root so this works across machines.
+    # backend/app/main.py -> repo root is 2 levels up from backend/.
+    try:
+        repo_root = Path(__file__).resolve().parents[2]
+        fallback_path = repo_root / "infra" / "terraform" / "user-data-node.sh.example"
+        if fallback_path.exists():
+            with open(fallback_path, "r", encoding="utf-8") as f:
+                append_log(
+                    "info",
+                    "nodes",
+                    "Using fallback EC2 user_data file",
+                    {"path": str(fallback_path)},
+                )
+                return f.read()
+    except Exception as exc:
+        append_log(
+            "warn",
+            "nodes",
+            "Failed to resolve fallback EC2 user_data file",
+            {"error": str(exc)},
+        )
+
+    return None
 
 
 def get_agent(
@@ -506,6 +530,106 @@ class SubmitJobResult(BaseModel):
     agent_key: Dict[str, Any]
 
 
+class SimulationExplainRequest(BaseModel):
+    config: AgentConfig
+    context: Dict[str, Any] = Field(default_factory=dict)
+
+
+def _fallback_sim_explanation(payload: Dict[str, Any], reason: str = "") -> str:
+    ctx = payload.get("context") or {}
+    cfg = payload.get("config") or {}
+    learner = cfg.get("learner_kind", "unknown")
+    goal = cfg.get("goal_kind", "unknown")
+    best_policy = ctx.get("best_policy_by_reward") or "unknown"
+    selected = ctx.get("selected_policies") or []
+    current_policy = ctx.get("current_manual_policy") or "none"
+    spike_events = ctx.get("spike_events", 0)
+    policies = ctx.get("policies") or []
+    winner = next((p for p in policies if str(p.get("policy")) == str(best_policy)), None)
+    winner_reward = winner.get("reward") if isinstance(winner, dict) else None
+    winner_lat = winner.get("avg_latency_ms") if isinstance(winner, dict) else None
+    suffix = (
+        f" Gemini fallback reason: {reason}."
+        if reason
+        else " Gemini fallback reason: unknown."
+    )
+    return (
+        f"Preferred policy is {best_policy}. "
+        f"It is favored because it currently has the strongest observed goal reward"
+        f"{f' ({winner_reward})' if winner_reward is not None else ''}"
+        f"{f' with avg latency {winner_lat} ms' if winner_lat is not None else ''} "
+        f"under learner={learner}, goal={goal}. "
+        f"Compared policies in scope: {', '.join(selected) if selected else 'none'}; "
+        f"manual override is {current_policy}, spike events={spike_events}. "
+        f"Use this as a baseline preference explanation.{suffix}"
+    )
+
+
+def _gemini_sim_explanation(payload: Dict[str, Any]) -> Tuple[str, str, str]:
+    api_key = (os.getenv("GEMINI_API_KEY", "") or "").strip()
+    configured_model = (os.getenv("GEMINI_MODEL", "gemini-2.0-flash") or "gemini-2.0-flash").strip()
+    if not api_key:
+        reason = "missing GEMINI_API_KEY"
+        return _fallback_sim_explanation(payload, reason), "fallback", reason
+
+    prompt = (
+        "You are explaining only ONE thing: why the currently preferred routing policy is favored over alternatives.\n"
+        "Write exactly 2-3 short sentences (max 70 words total).\n"
+        "Must include: preferred policy name, direct comparison against at least one alternative, and evidence from reward/latency/tasks.\n"
+        "Mention learner+goal and whether manual override limits interpretation.\n"
+        "Do NOT include generic system advice, trend commentary, or action recommendations.\n\n"
+        "Simulation snapshot JSON:\n"
+        f"{json.dumps(payload, ensure_ascii=True)}"
+    )
+    body = {
+        "contents": [
+            {
+                "parts": [{"text": prompt}],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.15,
+            "maxOutputTokens": 180,
+        },
+    }
+    # Try model + API version fallbacks because some keys/projects only expose
+    # a subset of models/endpoints.
+    model_candidates = [configured_model, "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+    dedup_models = []
+    for m in model_candidates:
+        mm = (m or "").strip()
+        if mm and mm not in dedup_models:
+            dedup_models.append(mm)
+    api_versions = ["v1beta", "v1"]
+    errors: List[str] = []
+
+    for model in dedup_models:
+        for api_ver in api_versions:
+            url = f"https://generativelanguage.googleapis.com/{api_ver}/models/{model}:generateContent?key={api_key}"
+            try:
+                resp = requests.post(url, json=body, timeout=20)
+                resp.raise_for_status()
+                data = resp.json()
+                candidates = data.get("candidates") or []
+                if not candidates:
+                    errors.append(f"{api_ver}/{model}: empty candidates")
+                    continue
+                parts = ((candidates[0].get("content") or {}).get("parts")) or []
+                text = "\n".join(str(p.get("text", "")).strip() for p in parts if isinstance(p, dict)).strip()
+                if not text:
+                    errors.append(f"{api_ver}/{model}: empty text")
+                    continue
+                return text, f"gemini:{model}@{api_ver}", ""
+            except Exception as exc:
+                msg = str(exc)
+                errors.append(f"{api_ver}/{model}: {msg}")
+                continue
+
+    reason = "Gemini request failed across fallbacks: " + " | ".join(errors[:6])
+    append_log("warn", "agents", "Gemini explanation failed", {"error": reason})
+    return _fallback_sim_explanation(payload, reason), "fallback", reason
+
+
 def _normalize_node_key(x: Any) -> str:
     return str(x or "").strip().lower()
 
@@ -535,6 +659,17 @@ def _snapshot_matches_allowed_keys(snap: NodeSnapshot, allowed: Set[str]) -> boo
         _normalize_node_key(f"{snap.host}:{snap.port}:{getattr(snap, 'name', '')}"),
     }
     return any(k in allowed for k in keys if k)
+
+
+def _extract_manual_policy(job: JobRequest) -> Optional[str]:
+    meta = getattr(job, "metadata", None)
+    if not isinstance(meta, dict):
+        return None
+    raw = meta.get("manual_policy")
+    if not isinstance(raw, str):
+        return None
+    key = raw.strip().lower().replace("-", "_")
+    return key or None
 
 
 class CreateEc2NodeRequest(BaseModel):
@@ -873,7 +1008,14 @@ def submit_job(request: SubmitJobRequest):
             )
         raise HTTPException(status_code=503, detail="No nodes available")
 
-    decision = agent.route(job, snaps)
+    manual_policy = _extract_manual_policy(job)
+    if manual_policy:
+        try:
+            decision = agent.route_with_policy(manual_policy, job, snaps)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        decision = agent.route(job, snaps)
 
     append_log("info", "jobs", "Job routed", {
     "job_id": job.job_id,
@@ -891,6 +1033,7 @@ def submit_job(request: SubmitJobRequest):
             "user_id": job.user_id,
             "node": getattr(decision, "node_name", None),
             "decision": to_dict(decision),
+            "manual_policy": manual_policy,
         },
     )
 
@@ -989,6 +1132,7 @@ def agent_stats(cfg: AgentConfig):
     return {
         "learner": agent.learner_stats(),
         "latency": agent.latency_stats(),
+        "reward": agent.reward_stats(),
         "summary": agent.summary(),
         "pending_job_ids": agent.pending_job_ids(),
         "time_ms": now_ms(),
@@ -1054,6 +1198,22 @@ def agent_explanations_recent(cfg: AgentConfig, limit: int = 50):
         goal_kwargs=cfg.goal_kwargs,
     )
     return {"events": agent.explainer.recent_events(limit=limit), "time_ms": now_ms()}
+
+
+@app.post("/agents/simulation/explain")
+def agent_simulation_explain(req: SimulationExplainRequest):
+    payload = {
+        "config": req.config.dict(),
+        "context": req.context or {},
+        "time_ms": now_ms(),
+    }
+    explanation, provider, reason = _gemini_sim_explanation(payload)
+    return {
+        "explanation": explanation,
+        "provider": provider,
+        "reason": reason,
+        "time_ms": now_ms(),
+    }
 
 
 @app.post("/agents/explanations/summary")
@@ -1185,6 +1345,14 @@ def ec2_create_node(payload: CreateEc2NodeRequest, _: Dict[str, Any] = Depends(r
             payload.iam_instance_profile or os.getenv("EC2_DEFAULT_IAM_INSTANCE_PROFILE", "")
         ).strip() or None
         user_data = payload.user_data or _load_default_ec2_user_data()
+        if not user_data:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "No EC2 startup script resolved. Set EC2_DEFAULT_USER_DATA, "
+                    "or EC2_DEFAULT_USER_DATA_FILE, or keep infra/terraform/user-data-node.sh.example in repo."
+                ),
+            )
         if not image_id or not subnet_id or not security_group_id:
             raise HTTPException(
                 status_code=400,
@@ -1213,7 +1381,15 @@ def ec2_start_node(instance_id: str, _: Dict[str, Any] = Depends(require_node_ad
     try:
         result = start_vm(instance_id)
         return {"ok": True, "result": result, "time_ms": now_ms()}
+    except HTTPException:
+        raise
     except Exception as exc:
+        msg = str(exc)
+        if "IncorrectInstanceState" in msg:
+            raise HTTPException(
+                status_code=409,
+                detail="Instance is not in a startable state yet (likely still stopping). Wait until it is 'stopped' and try again.",
+            ) from exc
         raise HTTPException(status_code=500, detail=f"Failed to start EC2 node: {exc}") from exc
 
 

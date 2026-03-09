@@ -17,6 +17,7 @@ import { motion as Motion, AnimatePresence } from "motion/react";
 import { BarChart, Bar, XAxis, YAxis, ResponsiveContainer, Cell, LineChart, Tooltip, Legend, Line } from "recharts";
 
 import {
+  explainSimulation,
   getNodes,
   listNodeGroups,
   submitJob,
@@ -34,6 +35,7 @@ import {
 type Json = Record<string, any>;
 
 type Policy = "round-robin" | "least-loaded" | "resource-aware" | "random";
+type ManualOverridePolicy = Policy | "none";
 
 interface NodeUI {
   id: string;
@@ -42,6 +44,14 @@ interface NodeUI {
   memCapacity: number;
   cpuUsed: number;
   memUsed: number;
+  cpuPct: number;
+  memPct: number;
+  queueLen: number | null;
+  inFlight: number | null;
+  completedLast60s: number | null;
+  nodeSpeed: number | null;
+  ewmaLatencyMs: number | null;
+  p95LatencyMs: number | null;
   tasks: any[];
   status: "active" | "draining" | "offline";
 }
@@ -61,6 +71,93 @@ interface AgentState {
   explorationRate: number;
   lastDecisionTime: number;
   status: "exploring" | "optimizing" | "monitoring";
+}
+
+type ExplainOption = {
+  value: string;
+  label: string;
+  description: string;
+};
+
+function HoverExplainSelect({
+  label,
+  value,
+  onChange,
+  options,
+}: {
+  label: string;
+  value: string;
+  onChange: (next: string) => void;
+  options: ExplainOption[];
+}) {
+  const [open, setOpen] = useState(false);
+  const [hovered, setHovered] = useState<ExplainOption | null>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const onDocMouseDown = (ev: MouseEvent) => {
+      if (!rootRef.current) return;
+      if (!rootRef.current.contains(ev.target as Node)) {
+        setOpen(false);
+        setHovered(null);
+      }
+    };
+    document.addEventListener("mousedown", onDocMouseDown);
+    return () => document.removeEventListener("mousedown", onDocMouseDown);
+  }, []);
+
+  const selected = options.find((o) => o.value === value) ?? options[0];
+  const shown = hovered ?? selected;
+
+  return (
+    <div className="space-y-2" ref={rootRef}>
+      <label className="text-sm font-medium text-neutral-400">{label}</label>
+      <div className="relative">
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-200 flex items-center justify-between hover:border-neutral-700 transition-colors"
+        >
+          <span>{selected?.label ?? value}</span>
+          <span className="text-neutral-500">{open ? "▴" : "▾"}</span>
+        </button>
+
+        {open ? (
+          <div className="absolute left-0 right-0 top-full mt-1 z-[85] rounded-xl border border-neutral-700 bg-neutral-950 shadow-2xl overflow-hidden">
+            {options.map((o) => (
+              <button
+                key={o.value}
+                type="button"
+                onMouseEnter={() => setHovered(o)}
+                onClick={() => {
+                  onChange(o.value);
+                  setOpen(false);
+                  setHovered(null);
+                }}
+                className={`w-full text-left px-3 py-2 text-sm transition-colors ${
+                  value === o.value
+                    ? "bg-indigo-500/20 text-indigo-300"
+                    : "text-neutral-200 hover:bg-neutral-800"
+                }`}
+              >
+                {o.label}
+              </button>
+            ))}
+          </div>
+        ) : null}
+
+        {open ? (
+          <div className="pointer-events-none absolute left-full top-0 ml-3 z-[90] w-96 rounded-xl border border-neutral-700 bg-neutral-900/95 backdrop-blur p-4 shadow-2xl">
+            <div className="text-[11px] uppercase tracking-wider text-indigo-300 font-semibold">
+              {label} Details
+            </div>
+            <div className="mt-1 text-sm text-neutral-100 font-semibold">{shown?.label}</div>
+            <div className="mt-2 text-sm leading-relaxed text-neutral-300">{shown?.description}</div>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
 }
 
 const POLICY_COLORS: Record<Policy, string> = {
@@ -120,6 +217,7 @@ function extractReward(stat: any): number {
 function buildPolicyStatsFromBackend(
   learnerStats: Record<string, any>,
   latencyStats: Record<string, any>,
+  rewardStats: Record<string, any>,
   prev: Record<Policy, PolicyStatUI>,
   selectedPolicies: Policy[]
 ): Record<Policy, PolicyStatUI> {
@@ -163,6 +261,18 @@ function buildPolicyStatsFromBackend(
     };
   }
 
+  // 2b) apply realized goal rewards (preferred over learner estimates)
+  for (const [k, v] of Object.entries(rewardStats || {})) {
+    const ui = backendKeyToUiPolicy(k);
+    if (!ui) continue;
+    const avgReward = typeof (v as any)?.avg_reward === "number" ? (v as any).avg_reward : undefined;
+    if (typeof avgReward !== "number" || !Number.isFinite(avgReward)) continue;
+    next[ui] = {
+      ...next[ui],
+      reward: avgReward,
+    };
+  }
+
   // 3) selection frequency (%)
   const active = selectedPolicies.length ? selectedPolicies : (Object.keys(next) as Policy[]);
   const totalCompleted = active.reduce((acc, p) => acc + (next[p]?.completedTasks || 0), 0);
@@ -191,11 +301,13 @@ export function Simulation() {
   const [explainOpen, setExplainOpen] = useState(false);
   const [currentExplanation, setCurrentExplanation] = useState<any | null>(null);
   const [latestExplanation, setLatestExplanation] = useState<any | null>(null);
+  const [aiExplainLoading, setAiExplainLoading] = useState(false);
+  const [spikeEvents, setSpikeEvents] = useState(0);
   const lastExplainTmsRef = useRef<number>(0);
   const resumeRunningRef = useRef<boolean>(false);
 
   const [isAgentControlled, setIsAgentControlled] = useState(false);
-  const [policy, setPolicy] = useState<Policy>("round-robin");
+  const [policy, setPolicy] = useState<ManualOverridePolicy>("none");
 
   type RewardPoint = {
   t: number;
@@ -284,21 +396,57 @@ export function Simulation() {
 
   const LEARNER_OPTIONS = useMemo(
     () => [
-      { value: "ucb1", label: "UCB1" },
-      { value: "sample_average", label: "Sample Average" },
-      { value: "ema", label: "EMA" },
-      { value: "thompson_gaussian", label: "Thompson (Gaussian)" },
-      { value: "sliding_window", label: "Sliding Window" },
-      { value: "contextual_linear", label: "Contextual Linear" },
+      {
+        value: "ucb1",
+        label: "UCB1",
+        description: "Balances exploration and exploitation with confidence bounds; favors policies with high reward and uncertainty.",
+      },
+      {
+        value: "sample_average",
+        label: "Sample Average",
+        description: "Uses the simple average reward of each policy over all history; stable but slower to adapt.",
+      },
+      {
+        value: "ema",
+        label: "EMA",
+        description: "Weights recent rewards more than older ones; adapts faster to changing node behavior.",
+      },
+      {
+        value: "thompson_gaussian",
+        label: "Thompson (Gaussian)",
+        description: "Samples from a reward distribution per policy to trade off exploration and exploitation probabilistically.",
+      },
+      {
+        value: "sliding_window",
+        label: "Sliding Window",
+        description: "Learns from only the most recent rewards in a fixed window; useful when conditions shift often.",
+      },
+      {
+        value: "contextual_linear",
+        label: "Contextual Linear",
+        description: "Uses workload/system features to predict policy reward for the current context rather than global averages.",
+      },
     ],
     []
   );
 
   const GOAL_OPTIONS = useMemo(
     () => [
-      { value: "min_mean_latency", label: "Min Mean Latency" },
-      { value: "min_latency_with_sla", label: "Min Latency w/ SLA" },
-      { value: "min_latency_plus_tail", label: "Min Latency + Tail" },
+      {
+        value: "min_mean_latency",
+        label: "Min Mean Latency",
+        description: "Optimizes average response time by rewarding lower latency directly.",
+      },
+      {
+        value: "min_latency_with_sla",
+        label: "Min Latency w/ SLA",
+        description: "Optimizes latency but adds extra penalty when requests exceed the SLA threshold.",
+      },
+      {
+        value: "min_latency_plus_tail",
+        label: "Min Latency + Tail",
+        description: "Optimizes latency while also penalizing p95 tail latency, weighted by tail weight.",
+      },
     ],
     []
   );
@@ -326,6 +474,17 @@ export function Simulation() {
     const learner_kwargs: Json = {
       policy_allowlist: backendPolicies,
     };
+    if (learnerKind === "contextual_linear") {
+      learner_kwargs.feature_keys = [
+        "node_count",
+        "avg_load",
+        "max_load",
+        "load_imbalance",
+        "avg_cpu",
+        "max_cpu",
+        "job_size_ms",
+      ];
+    }
 
     const goal_kwargs: Json = {};
     if (goalKind === "min_latency_with_sla") goal_kwargs.sla_ms = slaMs;
@@ -449,6 +608,14 @@ export function Simulation() {
         memCapacity: 100,
         cpuUsed: 0,
         memUsed: 0,
+        cpuPct: 0,
+        memPct: 0,
+        queueLen: null,
+        inFlight: null,
+        completedLast60s: null,
+        nodeSpeed: null,
+        ewmaLatencyMs: null,
+        p95LatencyMs: null,
         tasks: [],
         status: "offline",
       }));
@@ -495,6 +662,16 @@ export function Simulation() {
           memCapacity: memCap,
           cpuUsed: (cpuPct / 100) * cpuCap,
           memUsed: (memPct / 100) * memCap,
+          cpuPct,
+          memPct,
+          queueLen: Number.isFinite(Number(n?.queue_len)) ? Number(n.queue_len) : null,
+          inFlight: Number.isFinite(Number(n?.in_flight)) ? Number(n.in_flight) : null,
+          completedLast60s: Number.isFinite(Number(n?.completed_last_60s))
+            ? Number(n.completed_last_60s)
+            : null,
+          nodeSpeed: Number.isFinite(Number(n?.node_speed)) ? Number(n.node_speed) : null,
+          ewmaLatencyMs: Number.isFinite(Number(n?.ewma_latency_ms)) ? Number(n.ewma_latency_ms) : null,
+          p95LatencyMs: Number.isFinite(Number(n?.p95_latency_ms)) ? Number(n.p95_latency_ms) : null,
           tasks: [],
           status: online && isUserConnected ? "active" : "offline",
         };
@@ -522,7 +699,7 @@ export function Simulation() {
         }
       }
       const manualPolicyBackend =
-        POLICY_OPTIONS.find((p) => p.ui === policy)?.backend ?? "round_robin";
+        policy === "none" ? null : POLICY_OPTIONS.find((p) => p.ui === policy)?.backend ?? null;
 
       const job = {
         job_id: mkJobId(),
@@ -566,7 +743,7 @@ export function Simulation() {
         }
 
         // Update the displayed route strategy
-        if (isAgentControlled) {
+        if (isAgentControlled || policy === "none") {
           const chosen =
             resp?.decision?.policy ??
             resp?.decision?.policy_name ??
@@ -576,7 +753,7 @@ export function Simulation() {
           const ui = typeof chosen === "string" ? backendKeyToUiPolicy(chosen) : null;
           if (ui) setCurrentRouteStrategy(ui);
         } else {
-          setCurrentRouteStrategy(policy);
+          setCurrentRouteStrategy(policy as Policy);
         }
       } catch (e) {
         console.error("submitJob failed:", e);
@@ -601,6 +778,7 @@ export function Simulation() {
   );
 
   const spikeLoad = useCallback(async () => {
+    setSpikeEvents((v) => v + 1);
     for (let i = 0; i < 10; i++) {
       // eslint-disable-next-line no-await-in-loop
       await submitOneJob({ spike: true, idx: i });
@@ -665,6 +843,7 @@ export function Simulation() {
       let pendingIds: string[] = [];
       let learnerStats: Record<string, any> = {};
       let latencyStats: Record<string, any> = {};
+      let rewardStats: Record<string, any> = {};
       let summary: any = {};
 
       try {
@@ -672,6 +851,7 @@ export function Simulation() {
         pendingIds = stats?.pending_job_ids ?? [];
         learnerStats = stats?.learner ?? {};
         latencyStats = stats?.latency ?? {};
+        rewardStats = stats?.reward ?? stats?.summary?.reward_stats ?? {};
         summary = stats?.summary ?? {};
       } catch {
         const p = await getPending(agentConfig);
@@ -684,7 +864,13 @@ export function Simulation() {
       setIncomingJobs(pendingIds.length);
 
       setPolicyStats((prev) => {
-        const next = buildPolicyStatsFromBackend(learnerStats, latencyStats, prev, selectedPolicies);
+        const next = buildPolicyStatsFromBackend(
+          learnerStats,
+          latencyStats,
+          rewardStats,
+          prev,
+          selectedPolicies
+        );
 
         // policies that have actually been used at least once
         const usedNow = (selectedPolicies as Policy[]).filter((p) => (next[p]?.completedTasks ?? 0) > 0);
@@ -783,7 +969,7 @@ export function Simulation() {
     simStartMsRef.current = null;
     setRewardHistory([]);
     setSeenPolicies(new Set());
-    setPolicy("round-robin");
+    setPolicy("none");
     setCurrentRouteStrategy("round-robin");
 
     setLastChosenNodeId(null);
@@ -842,6 +1028,103 @@ export function Simulation() {
       active[0] || "round-robin"
     );
   }, [policyStats, selectedPolicies]);
+
+  const requestAiExplanation = useCallback(async () => {
+    try {
+      setAiExplainLoading(true);
+      const res = await explainSimulation({
+        config: agentConfig,
+        context: {
+          is_running: isRunning,
+          is_agent_controlled: isAgentControlled,
+          current_manual_policy: policy,
+          current_route_strategy: currentRouteStrategy,
+          learner_kind: learnerKind,
+          goal_kind: goalKind,
+          goal_kwargs: agentConfig.goal_kwargs ?? {},
+          selected_policies: selectedPolicies,
+          best_policy_by_reward: bestByReward,
+          throughput_jps: Number(throughput.toFixed(2)),
+          avg_latency_ms: Number(overallAvgLatencyMs.toFixed(2)),
+          optimization_trend:
+            overallLatencyTrail.length >= 2
+              ? overallLatencyTrail[overallLatencyTrail.length - 1] <
+                overallLatencyTrail[overallLatencyTrail.length - 2]
+                ? "improving"
+                : "worsening"
+              : "unknown",
+          spike_events: spikeEvents,
+          node_scope: {
+            selected_group_id: selectedSimulationGroup?.id ?? null,
+            selected_group_name: selectedSimulationGroup?.name ?? null,
+            allowed_node_keys_count: allowedNodeKeys.size,
+            connected_visible_nodes: nodes.length,
+          },
+          policies: Object.values(policyStats).map((s) => ({
+            policy: s.policy,
+            completed_tasks: s.completedTasks,
+            avg_latency_ms: Number(s.avgLatency.toFixed(3)),
+            reward: Number(s.reward.toFixed(6)),
+            selection_pct: Number(s.selectionPct.toFixed(2)),
+            recent_latency_ms: s.recentLatency.slice(-6),
+          })),
+          diagnostics: {
+            incoming_jobs: incomingJobs,
+            submitted_jobs: submittedJobs,
+            overall_latency_trail: overallLatencyTrail.slice(-10),
+            last_chosen_node: lastChosenNodeLabel,
+          },
+        },
+      });
+      setLatestExplanation({
+        kind: "ai",
+        policy: currentRouteStrategy,
+        text: res.explanation || "No explanation returned.",
+        t_ms: res.time_ms ?? Date.now(),
+        meta: {
+          source: res.provider || "unknown",
+          reason: res.reason || "",
+          switched: false,
+        },
+      });
+    } catch (e: any) {
+      setLatestExplanation({
+        kind: "ai",
+        policy: currentRouteStrategy,
+        text: `Failed to generate Gemini explanation: ${e?.message ?? "unknown error"}`,
+        t_ms: Date.now(),
+        meta: {
+          source: "error",
+          reason: e?.message ?? "unknown error",
+          switched: false,
+        },
+      });
+    } finally {
+      setAiExplainLoading(false);
+    }
+  }, [
+    agentConfig,
+    allowedNodeKeys.size,
+    bestByReward,
+    currentRouteStrategy,
+    incomingJobs,
+    isAgentControlled,
+    isRunning,
+    lastChosenNodeLabel,
+    learnerKind,
+    nodes.length,
+    overallAvgLatencyMs,
+    overallLatencyTrail,
+    policy,
+    policyStats,
+    selectedPolicies,
+    selectedSimulationGroup?.id,
+    selectedSimulationGroup?.name,
+    spikeEvents,
+    submittedJobs,
+    throughput,
+    goalKind,
+  ]);
 
   return (
     <div className="space-y-8 pb-12">
@@ -957,7 +1240,9 @@ export function Simulation() {
                 // turning ON agent: backend will update route strategy on submit
               } else {
                 // turning OFF agent: display manual policy
-                setCurrentRouteStrategy(policy);
+                if (policy !== "none") {
+                  setCurrentRouteStrategy(policy);
+                }
               }
             }}
             className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-all ${
@@ -1018,7 +1303,7 @@ export function Simulation() {
 
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
         {/* Sidebar */}
-        <div className="lg:col-span-1 space-y-6">
+        <div className="lg:col-span-1 space-y-6 relative z-[70]">
           <AnimatePresence>
             {isAgentControlled && (
               <Motion.div
@@ -1131,35 +1416,19 @@ export function Simulation() {
                 </p>
               </div>
 
-              <div className="space-y-2">
-                <label className="text-sm font-medium text-neutral-400">Learner</label>
-                <select
-                  value={learnerKind}
-                  onChange={(e) => setLearnerKind(e.target.value)}
-                  className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-200"
-                >
-                  {LEARNER_OPTIONS.map((o) => (
-                    <option key={o.value} value={o.value}>
-                      {o.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
+              <HoverExplainSelect
+                label="Learner"
+                value={learnerKind}
+                onChange={setLearnerKind}
+                options={LEARNER_OPTIONS}
+              />
 
-              <div className="space-y-2">
-                <label className="text-sm font-medium text-neutral-400">Goal</label>
-                <select
-                  value={goalKind}
-                  onChange={(e) => setGoalKind(e.target.value)}
-                  className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-200"
-                >
-                  {GOAL_OPTIONS.map((o) => (
-                    <option key={o.value} value={o.value}>
-                      {o.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
+              <HoverExplainSelect
+                label="Goal"
+                value={goalKind}
+                onChange={setGoalKind}
+                options={GOAL_OPTIONS}
+              />
 
               {goalKind === "min_latency_with_sla" && (
                 <div className="space-y-2">
@@ -1242,6 +1511,20 @@ export function Simulation() {
             <div className="space-y-3">
               <label className="text-sm font-medium text-neutral-400">Fixed Policy</label>
               <div className="grid grid-cols-1 gap-2">
+                <button
+                  key="none"
+                  disabled={isAgentControlled}
+                  onClick={() => {
+                    setPolicy("none");
+                  }}
+                  className={`text-left px-3 py-2 rounded-lg text-sm capitalize transition-all border ${
+                    policy === "none" && !isAgentControlled
+                      ? "bg-indigo-500/10 text-indigo-400 border-indigo-500/30"
+                      : "border-transparent text-neutral-500 hover:bg-neutral-800"
+                  } disabled:opacity-50 disabled:cursor-not-allowed`}
+                >
+                  none (do not override)
+                </button>
                 {(selectedPolicies as Policy[]).map((p) => (
                   <button
                     key={p}
@@ -1297,7 +1580,7 @@ export function Simulation() {
         </div>
 
         {/* Main */}
-        <div className="lg:col-span-3 space-y-6">
+        <div className="lg:col-span-3 space-y-6 relative z-10">
           <div className="relative bg-neutral-900 border border-neutral-800 rounded-2xl p-8 min-h-[420px] flex flex-col items-center overflow-hidden">
             <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.02)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.02)_1px,transparent_1px)] bg-[size:32px_32px] [mask-image:radial-gradient(ellipse_at_center,black,transparent)] pointer-events-none" />
 
@@ -1466,6 +1749,62 @@ export function Simulation() {
                         className="h-full"
                       />
                     </div>
+                    <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[10px] pt-1">
+                      <div className="flex justify-between">
+                        <span className="text-neutral-500">CPU</span>
+                        <span className="font-mono text-neutral-300">
+                          {node.status === "offline" ? "--" : `${node.cpuPct.toFixed(0)}%`}
+                        </span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-neutral-500">MEM</span>
+                        <span className="font-mono text-neutral-300">
+                          {node.status === "offline" ? "--" : `${node.memPct.toFixed(0)}%`}
+                        </span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-neutral-500">Queue</span>
+                        <span className="font-mono text-neutral-300">
+                          {node.status === "offline" ? "--" : (node.queueLen ?? 0)}
+                        </span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-neutral-500">In-flight</span>
+                        <span className="font-mono text-neutral-300">
+                          {node.status === "offline" ? "--" : (node.inFlight ?? 0)}
+                        </span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-neutral-500">Jobs/60s</span>
+                        <span className="font-mono text-neutral-300">
+                          {node.status === "offline" ? "--" : (node.completedLast60s ?? 0)}
+                        </span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-neutral-500">Speed</span>
+                        <span className="font-mono text-neutral-300">
+                          {node.status === "offline" || node.nodeSpeed == null
+                            ? "--"
+                            : `${node.nodeSpeed.toFixed(1)}`}
+                        </span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-neutral-500">EWMA</span>
+                        <span className="font-mono text-neutral-300">
+                          {node.status === "offline" || node.ewmaLatencyMs == null
+                            ? "--"
+                            : `${Math.round(node.ewmaLatencyMs)}ms`}
+                        </span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-neutral-500">P95</span>
+                        <span className="font-mono text-neutral-300">
+                          {node.status === "offline" || node.p95LatencyMs == null
+                            ? "--"
+                            : `${Math.round(node.p95LatencyMs)}ms`}
+                        </span>
+                      </div>
+                    </div>
                   </div>
                 </div>
               ))}
@@ -1629,13 +1968,22 @@ export function Simulation() {
 
                 {/* Explanation Box (Latest switch) */}
                 <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-2">
                       <History className="h-4 w-4 text-neutral-300" />
                       <div className="text-sm font-semibold">Latest Explanation</div>
                     </div>
-                    <div className="text-xs text-neutral-400">
-                      {latestExplanation?.policy ? String(latestExplanation.policy) : "—"}
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => void requestAiExplanation()}
+                        disabled={aiExplainLoading}
+                        className="rounded-lg border border-indigo-500/30 bg-indigo-500/10 px-2.5 py-1 text-xs text-indigo-300 hover:bg-indigo-500/20 disabled:opacity-50"
+                      >
+                        {aiExplainLoading ? "Analyzing..." : "Explain with Gemini"}
+                      </button>
+                      <div className="text-xs text-neutral-400">
+                        {latestExplanation?.policy ? String(latestExplanation.policy) : "—"}
+                      </div>
                     </div>
                   </div>
 
@@ -1650,6 +1998,21 @@ export function Simulation() {
                       Switch: {String(latestExplanation.meta.from_policy)} → {String(latestExplanation.meta.to_policy)}
                     </div>
                   ) : null}
+                  {latestExplanation?.meta?.source ? (
+                    <div className="mt-2 text-[11px] text-neutral-500">
+                      Source: {String(latestExplanation.meta.source)}
+                      {latestExplanation?.meta?.reason
+                        ? ` (${String(latestExplanation.meta.reason)})`
+                        : ""}
+                    </div>
+                  ) : null}
+                  {latestExplanation?.kind === "ai" ? (
+                    <div className="mt-2 text-[11px] text-indigo-300">AI-generated simulation explanation</div>
+                  ) : (
+                    <div className="mt-2 text-[11px] text-neutral-500">
+                      Switch explanation generated by routing events
+                    </div>
+                  )}
                 </div>
 
                 <div className="space-y-3 mt-auto">
