@@ -1,4 +1,5 @@
 import { Outlet, Link, useLocation, useNavigate } from "react-router";
+import React from "react";
 import { 
   LayoutDashboard, 
   Server, 
@@ -14,7 +15,8 @@ import {
   Globe,
   Zap,
   Users,
-  Network
+  Network,
+  Shield
 } from "lucide-react";
 import { useState } from "react";
 import { motion as Motion, AnimatePresence } from "motion/react";
@@ -25,6 +27,7 @@ export function Root() {
   const location = useLocation();
   const { user, isAdmin, logout } = useAuth();
   const nav = useNavigate();
+  const canManageEc2 = (user?.email ?? "").trim().toLowerCase() === "jackdoquan1234@gmail.com";
 
   const navItems = [
     { icon: LayoutDashboard, label: "Dashboard", path: "/" },
@@ -33,6 +36,7 @@ export function Root() {
     // { icon: Activity, label: "Services", path: "/services" },
     { icon: Terminal, label: "System Logs", path: "/logs" },
     { icon: Zap, label: "Simulation", path: "/simulation" },
+    ...(canManageEc2 ? [{ icon: Shield, label: "Admin Nodes", path: "/admin-nodes" }] : []),
     ...(isAdmin ? [{ icon: Users, label: "Manage Users", path: "/users" }] : []),
   ];
 

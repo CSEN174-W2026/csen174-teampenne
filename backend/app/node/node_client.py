@@ -26,6 +26,8 @@ class NodeClient:
             name=node.name,
             host=node.host,
             port=node.port,
+            instance_id=node.instance_id,
+            region=node.region,
             cpus=node.cpus,
             memory_mb=node.memory_mb,
             cpu_pct=m.get("cpu_pct"),
@@ -40,15 +42,20 @@ class NodeClient:
 
     # Sends a job to a node, returns whatever JSON the node sent back
     def submit_job(self, node: NodeSnapshot, job: JobRequest) -> Dict[str, Any]:
-        url = f"http://{node.host}:{node.port}/submit" # Build submit endpoint URL
+        url = f"http://{node.host}:{node.port}/submit"
 
-        # Create JSON payload expected by the node's /submit endpoint
         payload = {
             "job_id": job.job_id,
             "user_id": job.user_id,
-            "service_time_ms": job.service_time_ms,
+            "service_time_ms": getattr(job, "service_time_ms", None),
+            "job_type": getattr(job, "job_type", "simulated"),
+            "script_name": getattr(job, "script_name", None),
+            "script_content": getattr(job, "script_content", None),
+            "args": getattr(job, "args", []) or [],
+            "timeout_s": getattr(job, "timeout_s", 60),
             "metadata": job.metadata or {},
         }
-        r = requests.post(url, json=payload, timeout=self.timeout_s) # Sends HTTP POST with job payload
+
+        r = requests.post(url, json=payload, timeout=max(self.timeout_s, 10))
         r.raise_for_status()
         return r.json()

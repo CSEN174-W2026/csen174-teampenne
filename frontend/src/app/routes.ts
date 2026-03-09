@@ -11,6 +11,7 @@ import { ManageUsers } from "./pages/ManageUsers";
 import { Mesh } from "./pages/Mesh";
 import { RequireAdmin, RequireAuth } from "./auth/RouteGuards";
 import { Profile } from "./pages/Profile";
+import { AdminNodes } from "./pages/AdminNodes";
 
 export const router = createBrowserRouter([
   { path: "/login", Component: Login },
@@ -27,6 +28,7 @@ export const router = createBrowserRouter([
           { path: "logs", Component: Logs },
           { path: "simulation", Component: Simulation },
           { path: "mesh", Component: Mesh },
+          { path: "admin-nodes", Component: AdminNodes },
           { path: "profile", Component: Profile },
           {
             Component: RequireAdmin,

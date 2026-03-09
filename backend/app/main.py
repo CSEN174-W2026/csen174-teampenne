@@ -1,10 +1,12 @@
 # Combine everything together in main.py
 from __future__ import annotations
-from dotenv import load_dotenv
-load_dotenv()
-import subprocess # for disk usage
-import re
+try:
+    from dotenv import load_dotenv
+except Exception:
+    def load_dotenv(*_args, **_kwargs):
+        return False
 
+load_dotenv()
 import json
 import os
 import threading
@@ -48,7 +50,8 @@ from app.firebase_auth import (
     update_user,
 )
 
-from app.cloud.ec2_controller import create_vm, stop_vm, start_vm, delete_vm, get_instance_ip
+from app.cloud.ec2_controller import create_vm, stop_vm, start_vm, delete_vm, get_instance_ip, get_latest_ubuntu_ami
+from app.cloud.ec2_controller import list_nodes as list_ec2_nodes
 
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -88,6 +91,7 @@ USER_LAST_CFG_LOCK = threading.Lock()
 USER_AGENT_HISTORY: Dict[str, List[Dict[str, Any]]] = {}
 USER_AGENT_HISTORY_LOCK = threading.Lock()
 USER_AGENT_HISTORY_MAX = 30
+EC2_ADMIN_EMAIL = (os.getenv("EC2_ADMIN_EMAIL", "shypine8@gmail.com") or "").strip().lower()
 
 # Cache ManagerAgent instances so learning persists per (learner, goal, kwargs, etc...)
 """
@@ -118,7 +122,7 @@ class CloudNode:
     id: str                 # cloud instance id
     name: str
     host: str               # public ip or DNS
-    port: int = 8001
+    port: int = 5001
     created_ms: int = 0
     status: str = "running" # running|stopped|terminated
 
@@ -167,6 +171,33 @@ def _safe_int(v: Any) -> Optional[int]:
         return None
 
 
+def _load_default_ec2_user_data() -> Optional[str]:
+    """
+    Resolve default EC2 user_data from either:
+      1) EC2_DEFAULT_USER_DATA (inline string), or
+      2) EC2_DEFAULT_USER_DATA_FILE (absolute path to script file)
+    """
+    inline = (os.getenv("EC2_DEFAULT_USER_DATA", "") or "").strip()
+    if inline:
+        return inline
+
+    file_path = (os.getenv("EC2_DEFAULT_USER_DATA_FILE", "") or "").strip()
+    if not file_path:
+        return None
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as exc:
+        append_log(
+            "warn",
+            "nodes",
+            "Failed to read EC2_DEFAULT_USER_DATA_FILE",
+            {"path": file_path, "error": str(exc)},
+        )
+        return None
+
+
 def get_agent(
     *,
     learner_kind: str,
@@ -203,8 +234,8 @@ def live_snapshots() -> List[NodeSnapshot]:
     """
     #base = discover_nodes()
 
-    # Use discover docker nodes instead of VBox for better performance and reliability in cloud environment
-    base = discover_docker_nodes()
+    # Use EC2/static discovery for cloud-friendly node management.
+    base = discover_cluster_nodes()
 
     snaps: List[NodeSnapshot] = []
     for n in base:
@@ -313,9 +344,63 @@ def to_dict(x: Any) -> Dict[str, Any]:
         return dict(x.__dict__)
     return dict(x)
 
-def docker(cmd: list[str]) -> str:
-    out = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
-    return out.decode().strip()
+def _parse_static_nodes(raw: str) -> List[NodeSnapshot]:
+    """
+    Parse STATIC_NODE_LIST env var:
+      "name:host:port,name2:host:port"
+    """
+    out: List[NodeSnapshot] = []
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        parts = item.split(":")
+        if len(parts) != 3:
+            continue
+        name, host, port_s = parts
+        try:
+            out.append(
+                NodeSnapshot(
+                    name=name.strip(),
+                    host=host.strip(),
+                    port=int(port_s),
+                )
+            )
+        except Exception:
+            continue
+    return out
+
+
+def discover_cluster_nodes() -> List[NodeSnapshot]:
+    """
+    Discover nodes from EC2 (tagged instances) and optional STATIC_NODE_LIST fallback.
+    """
+    nodes: List[NodeSnapshot] = []
+    default_port = int(os.getenv("NODE_SERVICE_PORT", "5001"))
+
+    # Optional static nodes fallback for local testing.
+    nodes.extend(_parse_static_nodes(os.getenv("STATIC_NODE_LIST", "")))
+
+    try:
+        for item in list_ec2_nodes():
+            if item.get("state") != "running":
+                continue
+            host = item.get("public_ip") or item.get("private_ip")
+            if not host:
+                continue
+            nodes.append(
+                NodeSnapshot(
+                    name=item.get("name") or item["instance_id"],
+                    host=host,
+                    port=default_port,
+                    instance_id=item["instance_id"],
+                    region=item.get("region"),
+                )
+            )
+    except Exception as exc:
+        append_log("warn", "nodes", "EC2 discovery failed", {"error": str(exc)})
+
+    return nodes
 
 
 # -------------------------
@@ -376,7 +461,7 @@ def watch_nodes_membership():
         time.sleep(POLL_S)
         try:
             # nodes = discover_nodes()
-            nodes = discover_docker_nodes()
+            nodes = discover_cluster_nodes()
             cur = set(_node_key(n) for n in nodes)
         except Exception as e:
             append_log("warn", "nodes", "discover_nodes failed", {"error": str(e)})
@@ -421,6 +506,47 @@ class SubmitJobResult(BaseModel):
     agent_key: Dict[str, Any]
 
 
+def _normalize_node_key(x: Any) -> str:
+    return str(x or "").strip().lower()
+
+
+def _extract_allowed_node_keys(job: JobRequest) -> Set[str]:
+    meta = getattr(job, "metadata", None)
+    if not isinstance(meta, dict):
+        return set()
+    raw = meta.get("allowed_node_keys")
+    if not isinstance(raw, list):
+        return set()
+    out: Set[str] = set()
+    for item in raw:
+        k = _normalize_node_key(item)
+        if k:
+            out.add(k)
+    return out
+
+
+def _snapshot_matches_allowed_keys(snap: NodeSnapshot, allowed: Set[str]) -> bool:
+    if not allowed:
+        return True
+    keys = {
+        _normalize_node_key(f"{snap.host}:{snap.port}"),
+        _normalize_node_key(getattr(snap, "name", "")),
+        _normalize_node_key(getattr(snap, "instance_id", "")),
+        _normalize_node_key(f"{snap.host}:{snap.port}:{getattr(snap, 'name', '')}"),
+    }
+    return any(k in allowed for k in keys if k)
+
+
+class CreateEc2NodeRequest(BaseModel):
+    image_id: Optional[str] = None
+    instance_type: str = "t3.micro"
+    subnet_id: Optional[str] = None
+    security_group_id: Optional[str] = None
+    key_name: Optional[str] = None
+    iam_instance_profile: Optional[str] = None
+    user_data: Optional[str] = None
+
+
 # -------------------------
 # BACKGROUND OBSERVER
 # -------------------------
@@ -434,7 +560,7 @@ def poll_recent_jobs_and_observe():
                 continue
 
         #nodes = discover_nodes()
-        nodes = discover_docker_nodes()
+        nodes = discover_cluster_nodes()
         if not nodes:
             continue
 
@@ -525,6 +651,15 @@ def require_admin(user: Dict[str, Any] = Depends(require_user)) -> Dict[str, Any
     if not bool(user.get("is_admin")):
         raise HTTPException(status_code=403, detail="Admin privileges required")
     return user
+
+
+def require_node_admin(user: Dict[str, Any] = Depends(require_user)) -> Dict[str, Any]:
+    if bool(user.get("is_admin")):
+        return user
+    email = str(user.get("email") or "").strip().lower()
+    if EC2_ADMIN_EMAIL and email == EC2_ADMIN_EMAIL:
+        return user
+    raise HTTPException(status_code=403, detail="Admin node privileges required")
 
 
 @app.post("/auth/login", response_model=LoginResponse)
@@ -633,7 +768,7 @@ def cluster_stats(window_s: int = Query(60, ge=5, le=3600), limit: int = Query(8
     }
 
     #nodes = discover_nodes()
-    nodes = discover_docker_nodes()
+    nodes = discover_cluster_nodes()
     all_lat: List[float] = []
     completed_in_window = 0
     per_node: List[Dict[str, Any]] = []
@@ -706,6 +841,24 @@ def submit_job(request: SubmitJobRequest):
     cfg = request.config
     job = request.job
 
+    # Validate real jobs
+    job_type = getattr(job, "job_type", "simulated")
+    if job_type != "simulated":
+        script_content = getattr(job, "script_content", None)
+        script_name = getattr(job, "script_name", None)
+
+        if not script_content:
+            raise HTTPException(
+                status_code=400,
+                detail="script_content is required for real jobs",
+            )
+
+        if not script_name:
+            raise HTTPException(
+                status_code=400,
+                detail="script_name is required for real jobs",
+            )
+
     # Store last agent config used by this user (best-effort)
     if getattr(job, "user_id", None):
         uid = job.user_id
@@ -715,7 +868,7 @@ def submit_job(request: SubmitJobRequest):
                 "config": cfg.dict(),
             }
         record_user_agent_config(uid, cfg)
-    
+
     agent = get_agent(
         learner_kind=cfg.learner_kind,
         goal_kind=cfg.goal_kind,
@@ -725,19 +878,21 @@ def submit_job(request: SubmitJobRequest):
     )
 
     snaps = live_snapshots()
+    allowed_node_keys = _extract_allowed_node_keys(job)
+    if allowed_node_keys:
+        snaps = [s for s in snaps if _snapshot_matches_allowed_keys(s, allowed_node_keys)]
+
     if not snaps:
         append_log("error", "jobs", "No nodes available", {"job_id": job.job_id})
+        if allowed_node_keys:
+            raise HTTPException(
+                status_code=503,
+                detail="No allowed connected nodes available for this simulation scope",
+            )
         raise HTTPException(status_code=503, detail="No nodes available")
 
     decision = agent.route(job, snaps)
 
-    append_log("info", "jobs", "Job routed", {
-    "job_id": job.job_id,
-    "user_id": job.user_id,
-    "node": getattr(decision, "node_name", None),
-    })
-
-    # LOG: job routed
     append_log(
         "info",
         "jobs",
@@ -745,6 +900,7 @@ def submit_job(request: SubmitJobRequest):
         {
             "job_id": job.job_id,
             "user_id": job.user_id,
+            "job_type": getattr(job, "job_type", "simulated"),
             "node": getattr(decision, "node_name", None),
             "decision": to_dict(decision),
         },
@@ -758,21 +914,36 @@ def submit_job(request: SubmitJobRequest):
             cpus=0,
             memory_mb=0,
         )
-        node_resp = client.submit_job(node_stub, job)
-        append_log("info", "jobs", "Job dispatched", {
-            "job_id": job.job_id,
-            "node": getattr(decision, "node_name", None),
-        })
 
-        # LOG: dispatched
+        node_resp = client.submit_job(node_stub, job)
+
+        if isinstance(node_resp, dict):
+            node_resp["node_name"] = decision.node_name
+            node_resp["node_host"] = decision.host
+            node_resp["node_port"] = decision.port
+
         append_log(
             "info",
             "jobs",
             "Job dispatched",
-            {"job_id": job.job_id, "node": getattr(decision, "node_name", None)},
+            {
+                "job_id": job.job_id,
+                "job_type": getattr(job, "job_type", "simulated"),
+                "node": getattr(decision, "node_name", None),
+            },
         )
+
     except Exception as e:
-        append_log("error", "jobs", "Dispatch failed", {"job_id": job.job_id, "error": str(e)})
+        append_log(
+            "error",
+            "jobs",
+            "Dispatch failed",
+            {
+                "job_id": job.job_id,
+                "job_type": getattr(job, "job_type", "simulated"),
+                "error": str(e),
+            },
+        )
         try:
             agent.observe(
                 job.job_id,
@@ -1018,74 +1189,83 @@ def users_me_agent_history(user: Dict[str, Any] = Depends(require_user)):
 
 
 
-"""Dockerize The Nodes"""
+@app.get("/ec2/nodes")
+def ec2_nodes(_: Dict[str, Any] = Depends(require_node_admin)):
+    nodes = list_ec2_nodes()
+    return {"nodes": nodes, "count": len(nodes), "time_ms": now_ms()}
 
-# Instead of using virtualbox.py to find running VMs -> replace with Docker discovery
-def discover_docker_nodes():
-    out = docker([
-        "docker",
-        "ps",
-        "--filter", "label=csen174.node=true",
-        "--format", "{{.Names}}\t{{.Ports}}"
-    ])
 
-    nodes: list[NodeSnapshot] = []
-    seen: set[tuple[str, int]] = set()
-
-    # Example Ports field might contain BOTH:
-    # "0.0.0.0:8002->8001/tcp, :::8002->8001/tcp"
-    port_re = re.compile(r"(?:0\.0\.0\.0|::):(\d+)->8001/tcp")
-
-    for line in out.splitlines():
-        if not line.strip():
-            continue
-
-        parts = line.split("\t", 1)
-        name = parts[0].strip()
-        ports = parts[1].strip() if len(parts) > 1 else ""
-
-        for m in port_re.finditer(ports):
-            host_port = int(m.group(1))
-            key = (name, host_port)
-            if key in seen:
-                continue
-            seen.add(key)
-
-            nodes.append(
-                NodeSnapshot(
-                    name=name,
-                    host="127.0.0.1",
-                    port=host_port,
-                    cpus=0,
-                    memory_mb=0,
-                )
+@app.post("/ec2/nodes/create")
+def ec2_create_node(payload: CreateEc2NodeRequest, _: Dict[str, Any] = Depends(require_node_admin)):
+    try:
+        desired_os = (os.getenv("EC2_ADMIN_DEFAULT_OS", "ubuntu") or "ubuntu").strip().lower()
+        image_id = (payload.image_id or "").strip()
+        if not image_id:
+            if desired_os == "ubuntu":
+                image_id = get_latest_ubuntu_ami()
+            else:
+                image_id = (os.getenv("EC2_DEFAULT_IMAGE_ID", "")).strip()
+        subnet_id = (payload.subnet_id or os.getenv("EC2_DEFAULT_SUBNET_ID", "")).strip()
+        security_group_id = (payload.security_group_id or os.getenv("EC2_DEFAULT_SECURITY_GROUP_ID", "")).strip()
+        key_name = (payload.key_name or os.getenv("EC2_DEFAULT_KEY_NAME", "")).strip() or None
+        iam_instance_profile = (
+            payload.iam_instance_profile or os.getenv("EC2_DEFAULT_IAM_INSTANCE_PROFILE", "")
+        ).strip() or None
+        user_data = payload.user_data or _load_default_ec2_user_data()
+        if not image_id or not subnet_id or not security_group_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Missing EC2 create inputs. Provide image_id/subnet_id/security_group_id in request "
+                    "or set EC2_DEFAULT_IMAGE_ID, EC2_DEFAULT_SUBNET_ID, EC2_DEFAULT_SECURITY_GROUP_ID in backend env."
+                ),
             )
 
-    return nodes
+        created = create_vm(
+            image_id=image_id,
+            instance_type=payload.instance_type,
+            subnet_id=subnet_id,
+            security_group_id=security_group_id,
+            key_name=key_name,
+            iam_instance_profile=iam_instance_profile,
+            user_data=user_data,
+        )
+        return {"ok": True, "instance": created, "time_ms": now_ms()}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to create EC2 node: {exc}") from exc
 
-# Create Docker Nodes
-@app.post("/docker/nodes/create")
-def docker_create_node(port: int = Body(..., embed=True)):
-    name = f"csen-node-{port}"
 
-    docker([
-        "docker",
-        "run",
-        "-d",
-        "--name", name,
-        "--label", "csen174.node=true",
-        "-p", f"{port}:8001",
-        "csen-node"
-    ])
+@app.post("/ec2/nodes/{instance_id}/start")
+def ec2_start_node(instance_id: str, _: Dict[str, Any] = Depends(require_node_admin)):
+    try:
+        result = start_vm(instance_id)
+        return {"ok": True, "result": result, "time_ms": now_ms()}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to start EC2 node: {exc}") from exc
 
-    return {"ok": True, "port": port}
 
-@app.post("/docker/nodes/{name}/stop")
-def docker_stop_node(name: str):
-    docker(["docker", "stop", name])
-    return {"ok": True}
+@app.post("/ec2/nodes/{instance_id}/stop")
+def ec2_stop_node(instance_id: str, _: Dict[str, Any] = Depends(require_node_admin)):
+    try:
+        result = stop_vm(instance_id)
+        return {"ok": True, "result": result, "time_ms": now_ms()}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to stop EC2 node: {exc}") from exc
 
-@app.delete("/docker/nodes/{name}")
-def docker_delete_node(name: str):
-    docker(["docker", "rm", "-f", name])
-    return {"ok": True}
+
+@app.delete("/ec2/nodes/{instance_id}")
+def ec2_delete_node(instance_id: str, _: Dict[str, Any] = Depends(require_node_admin)):
+    try:
+        result = delete_vm(instance_id)
+        return {"ok": True, "result": result, "time_ms": now_ms()}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to terminate EC2 node: {exc}") from exc
+
+
+@app.get("/ec2/nodes/{instance_id}/ip")
+def ec2_node_ip(instance_id: str, _: Dict[str, Any] = Depends(require_node_admin)):
+    try:
+        ip = get_instance_ip(instance_id)
+        return {"instance_id": instance_id, "ip": ip, "time_ms": now_ms()}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to resolve EC2 IP: {exc}") from exc

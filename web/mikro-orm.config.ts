@@ -5,6 +5,9 @@ import { ReflectMetadataProvider } from "@mikro-orm/core";
 import { VmInfo } from "./app/db/entities/VmInfo";
 import { DistributedManagerIteration } from "./app/db/entities/DistributedManagerIteration";
 import { NodeMetricSample } from "./app/db/entities/NodeMetricSample";
+import { UserNodeGroup } from "./app/db/entities/UserNodeGroup";
+import { UserNodeGroupNode } from "./app/db/entities/UserNodeGroupNode";
+import { UserNodeGroupSelection } from "./app/db/entities/UserNodeGroupSelection";
 
 export default defineConfig({
   host: process.env.DB_HOST ?? "localhost",
@@ -14,8 +17,22 @@ export default defineConfig({
   dbName: process.env.DB_NAME ?? "systems-manager",
   metadataProvider: ReflectMetadataProvider,
   // Explicit class registration is reliable in Next runtime.
-  entities: [VmInfo, DistributedManagerIteration, NodeMetricSample],
-  entitiesTs: [VmInfo, DistributedManagerIteration, NodeMetricSample],
+  entities: [
+    VmInfo,
+    DistributedManagerIteration,
+    NodeMetricSample,
+    UserNodeGroup,
+    UserNodeGroupNode,
+    UserNodeGroupSelection,
+  ],
+  entitiesTs: [
+    VmInfo,
+    DistributedManagerIteration,
+    NodeMetricSample,
+    UserNodeGroup,
+    UserNodeGroupNode,
+    UserNodeGroupSelection,
+  ],
   migrations: {
     path: path.join(__dirname, "migrations"),
     glob: "!(*.d).{js,ts}",
