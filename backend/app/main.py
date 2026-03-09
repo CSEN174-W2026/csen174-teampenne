@@ -122,7 +122,7 @@ class CloudNode:
     id: str                 # cloud instance id
     name: str
     host: str               # public ip or DNS
-    port: int = 8001
+    port: int = 5001
     created_ms: int = 0
     status: str = "running" # running|stopped|terminated
 
@@ -841,6 +841,24 @@ def submit_job(request: SubmitJobRequest):
     cfg = request.config
     job = request.job
 
+    # Validate real jobs
+    job_type = getattr(job, "job_type", "simulated")
+    if job_type != "simulated":
+        script_content = getattr(job, "script_content", None)
+        script_name = getattr(job, "script_name", None)
+
+        if not script_content:
+            raise HTTPException(
+                status_code=400,
+                detail="script_content is required for real jobs",
+            )
+
+        if not script_name:
+            raise HTTPException(
+                status_code=400,
+                detail="script_name is required for real jobs",
+            )
+
     # Store last agent config used by this user (best-effort)
     if getattr(job, "user_id", None):
         uid = job.user_id
@@ -850,7 +868,7 @@ def submit_job(request: SubmitJobRequest):
                 "config": cfg.dict(),
             }
         record_user_agent_config(uid, cfg)
-    
+
     agent = get_agent(
         learner_kind=cfg.learner_kind,
         goal_kind=cfg.goal_kind,
@@ -875,13 +893,6 @@ def submit_job(request: SubmitJobRequest):
 
     decision = agent.route(job, snaps)
 
-    append_log("info", "jobs", "Job routed", {
-    "job_id": job.job_id,
-    "user_id": job.user_id,
-    "node": getattr(decision, "node_name", None),
-    })
-
-    # LOG: job routed
     append_log(
         "info",
         "jobs",
@@ -889,6 +900,7 @@ def submit_job(request: SubmitJobRequest):
         {
             "job_id": job.job_id,
             "user_id": job.user_id,
+            "job_type": getattr(job, "job_type", "simulated"),
             "node": getattr(decision, "node_name", None),
             "decision": to_dict(decision),
         },
@@ -902,21 +914,36 @@ def submit_job(request: SubmitJobRequest):
             cpus=0,
             memory_mb=0,
         )
-        node_resp = client.submit_job(node_stub, job)
-        append_log("info", "jobs", "Job dispatched", {
-            "job_id": job.job_id,
-            "node": getattr(decision, "node_name", None),
-        })
 
-        # LOG: dispatched
+        node_resp = client.submit_job(node_stub, job)
+
+        if isinstance(node_resp, dict):
+            node_resp["node_name"] = decision.node_name
+            node_resp["node_host"] = decision.host
+            node_resp["node_port"] = decision.port
+
         append_log(
             "info",
             "jobs",
             "Job dispatched",
-            {"job_id": job.job_id, "node": getattr(decision, "node_name", None)},
+            {
+                "job_id": job.job_id,
+                "job_type": getattr(job, "job_type", "simulated"),
+                "node": getattr(decision, "node_name", None),
+            },
         )
+
     except Exception as e:
-        append_log("error", "jobs", "Dispatch failed", {"job_id": job.job_id, "error": str(e)})
+        append_log(
+            "error",
+            "jobs",
+            "Dispatch failed",
+            {
+                "job_id": job.job_id,
+                "job_type": getattr(job, "job_type", "simulated"),
+                "error": str(e),
+            },
+        )
         try:
             agent.observe(
                 job.job_id,

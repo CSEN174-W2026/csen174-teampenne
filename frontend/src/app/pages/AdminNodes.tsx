@@ -10,7 +10,7 @@ import {
 } from "../../lib/api";
 import { useAuth } from "../auth/AuthContext";
 
-const ADMIN_NODE_EMAIL = "shypine8@gmail.com";
+const ADMIN_NODE_EMAIL = "jackdoquan1234@gmail.com";
 
 function isAllowedAdminEmail(email?: string | null): boolean {
   return (email ?? "").trim().toLowerCase() === ADMIN_NODE_EMAIL;

@@ -26,7 +26,7 @@ WorkloadKind = Literal["tiny", "medium", "large", "heavy_tail", "sla_mix", "prio
 class NodeConfig(BaseModel):
     name: str
     host: str
-    port: int = 8001
+    port: int = 5001
     cpus: Optional[int] = None
     memory_mb: Optional[int] = None
 

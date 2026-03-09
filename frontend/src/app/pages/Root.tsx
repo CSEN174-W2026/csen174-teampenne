@@ -27,7 +27,7 @@ export function Root() {
   const location = useLocation();
   const { user, isAdmin, logout } = useAuth();
   const nav = useNavigate();
-  const canManageEc2 = (user?.email ?? "").trim().toLowerCase() === "shypine8@gmail.com";
+  const canManageEc2 = (user?.email ?? "").trim().toLowerCase() === "jackdoquan1234@gmail.com";
 
   const navItems = [
     { icon: LayoutDashboard, label: "Dashboard", path: "/" },
