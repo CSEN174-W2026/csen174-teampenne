@@ -379,6 +379,10 @@ def get_metrics():
 async def submit_job(req: SubmitJobRequest):
     queued_at = _now_ms()
 
+    print("NODE RECEIVED JOB TYPE:", req.job_type)
+    print("NODE RECEIVED SCRIPT NAME:", req.script_name)
+    print("NODE RECEIVED HAS CONTENT:", bool(req.script_content))
+
     job = _InternalJob(
         job_id=req.job_id,
         user_id=req.user_id,
