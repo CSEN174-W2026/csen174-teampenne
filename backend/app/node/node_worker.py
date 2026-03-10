@@ -188,7 +188,7 @@ async def _run_python_job(job: _InternalJob, started_at: int) -> JobRecord:
     try:
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
-            str(script_path),
+            safe_name,
             *(job.args or []),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
