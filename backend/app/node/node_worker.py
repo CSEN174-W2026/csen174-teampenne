@@ -14,7 +14,7 @@ from typing import Deque, Dict, List, Optional
 import psutil
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-
+from fastapi.middleware.cors import CORSMiddleware
 
 # -----------------------------
 # Models (API payloads)
@@ -343,7 +343,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="CSEN174 Node Agent", lifespan=lifespan)
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or your frontend origin
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/metrics", response_model=MetricsResponse)
 def get_metrics():
