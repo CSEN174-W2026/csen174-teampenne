@@ -14,21 +14,11 @@ from typing import Deque, Dict, List, Optional
 import psutil
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-
-import os
-import sys
-import contextlib
-from pathlib import Path
+from fastapi.middleware.cors import CORSMiddleware
 
 # -----------------------------
 # Models (API payloads)
 # -----------------------------
-# class SubmitJobRequest(BaseModel):
-#     job_id: str
-#     user_id: str
-#     service_time_ms: int = Field(ge=1, description="Simulated job duration")
-#     metadata: dict = {}
-
 class SubmitJobRequest(BaseModel):
     job_id: str
     user_id: str
@@ -41,14 +31,11 @@ class SubmitJobRequest(BaseModel):
     metadata: dict = Field(default_factory=dict)
 
 
-# class SubmitJobResponse(BaseModel):
-#     accepted: bool
-#     queued_at_ms: int
-
 class SubmitJobResponse(BaseModel):
     accepted: bool
     queued_at_ms: int
     status: str
+
 
 class MetricsResponse(BaseModel):
     node_time_ms: int
@@ -61,15 +48,6 @@ class MetricsResponse(BaseModel):
     completed_last_60s: int
     node_speed: Optional[float] = None
 
-
-# class JobRecord(BaseModel):
-#     job_id: str
-#     user_id: str
-#     queued_at_ms: int
-#     started_at_ms: int
-#     finished_at_ms: int
-#     observed_latency_ms: int
-#     service_time_ms: int
 
 class JobRecord(BaseModel):
     job_id: str
@@ -91,14 +69,6 @@ class JobRecord(BaseModel):
 # -----------------------------
 # Internal state
 # -----------------------------
-# @dataclass
-# class _InternalJob:
-#     job_id: str
-#     user_id: str
-#     service_time_ms: int
-#     metadata: dict
-#     queued_at_ms: int
-
 @dataclass
 class _InternalJob:
     job_id: str
@@ -490,7 +460,7 @@ async def _worker_loop() -> None:
         try:
             if job.job_type == "simulated":
                 record = await _run_simulated_job(job, started_at)
-            elif job.job_type == "python":
+            elif job.job_type in {"python", "python_script", "ml_script"}:
                 record = await _run_python_job(job, started_at)
             else:
                 finished_at = _now_ms()
@@ -556,7 +526,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="CSEN174 Node Agent", lifespan=lifespan)
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or your frontend origin
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/metrics", response_model=MetricsResponse)
 def get_metrics():
@@ -588,22 +564,13 @@ def get_metrics():
     )
 
 
-# @app.post("/submit", response_model=SubmitJobResponse)
-# async def submit_job(req: SubmitJobRequest):
-#     job = _InternalJob(
-#         job_id=req.job_id,
-#         user_id=req.user_id,
-#         service_time_ms=req.service_time_ms,
-#         metadata=req.metadata,
-#         queued_at_ms=_now_ms(),
-#     )
-#     await _job_queue.put(job)
-#     return SubmitJobResponse(accepted=True, queued_at_ms=job.queued_at_ms)
-
-
 @app.post("/submit", response_model=SubmitJobResponse)
 async def submit_job(req: SubmitJobRequest):
     queued_at = _now_ms()
+
+    print("NODE RECEIVED JOB TYPE:", req.job_type)
+    print("NODE RECEIVED SCRIPT NAME:", req.script_name)
+    print("NODE RECEIVED HAS CONTENT:", bool(req.script_content))
 
     job = _InternalJob(
         job_id=req.job_id,
@@ -636,6 +603,7 @@ async def submit_job(req: SubmitJobRequest):
     )
 
     await _job_queue.put(job)
+
     return SubmitJobResponse(
         accepted=True,
         queued_at_ms=queued_at,
