@@ -93,6 +93,8 @@ _job_status: Dict[str, JobRecord] = {}
 _ewma_latency_ms: Optional[float] = None
 _EWMA_ALPHA = 0.2
 
+PAUSED = False
+PAUSE_LOCK = asyncio.Lock()
 JOB_RUNS_DIR = Path("./job_runs")
 JOB_RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -274,7 +276,17 @@ async def _worker_loop() -> None:
     global _in_flight, _ewma_latency_ms
 
     while True:
+        if PAUSED:
+            await asyncio.sleep(0.1)
+            continue
+
         job = await _job_queue.get()
+
+        if PAUSED:
+            await _job_queue.put(job)
+            await asyncio.sleep(0.1)
+            continue
+
         _in_flight += 1
         started_at = _now_ms()
 
@@ -446,3 +458,41 @@ def get_job(job_id: str):
     if record is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return record
+
+
+
+@app.post("/pause")
+async def pause_node():
+    global PAUSED
+    PAUSED = True
+    return {"ok": True, "paused": True, "time_ms": _now_ms()}
+
+@app.post("/resume")
+async def resume_node():
+    global PAUSED
+    PAUSED = False
+    return {"ok": True, "paused": False, "time_ms": _now_ms()}
+
+@app.post("/clear_queue")
+async def clear_queue():
+    cleared = 0
+
+    # remove only queued jobs, not currently running one
+    while not _job_queue.empty():
+        try:
+            job = _job_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+
+        _set_job_status(
+            job.job_id,
+            status="cancelled",
+            finished_at_ms=_now_ms(),
+            observed_latency_ms=_now_ms() - job.queued_at_ms,
+            stderr="Cancelled because simulation was paused.",
+        )
+        _recent_jobs.append(_job_status[job.job_id])
+        _job_queue.task_done()
+        cleared += 1
+
+    return {"ok": True, "cleared": cleared, "time_ms": _now_ms()}

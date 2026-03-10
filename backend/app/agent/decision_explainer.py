@@ -3,10 +3,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+import json
 import os
 import time
 import math
 from collections import defaultdict, deque
+
+try:
+    from google import genai
+except Exception:
+    genai = None
 
 
 @dataclass(frozen=True)
@@ -30,14 +36,14 @@ class DecisionExplainer:
     Switch-only explainer:
       - track chosen policies
       - emit an explanation event ONLY when policy changes
-      - optionally call OpenAI to produce human explanation
+      - optionally call Gemini to produce human explanation
     """
 
     def __init__(
         self,
         history: int = 500,
         *,
-        openai_model: str = "gpt-5",
+        gemini_model: str = "gemini-3.1-flash-lite-preview",
         enable_observe_events: bool = False,  # keep False unless you want observe spam
         max_context_keys: int = 8,
     ):
@@ -51,7 +57,7 @@ class DecisionExplainer:
         self._last_policy: Optional[str] = None
         self._switch_count = 0
 
-        self.openai_model = openai_model
+        self.gemini_model = gemini_model
         self.enable_observe_events = bool(enable_observe_events)
         self.max_context_keys = int(max_context_keys)
 
@@ -78,12 +84,10 @@ class DecisionExplainer:
         self._last_policy = chosen_policy
 
         if not switched:
-            # No event, no explanation.
             return None
 
         self._switch_count += 1
 
-        # Build explanation text
         text, meta = self._explain_switch(
             from_policy=prev,
             to_policy=chosen_policy,
@@ -187,7 +191,6 @@ class DecisionExplainer:
         }
 
     def timeseries(self) -> Dict[str, Any]:
-        # minimal: switches over time
         xs = [e.t_ms for e in self._events]
         ys = [1 if e.kind == "switch" else 0 for e in self._events]
         return {"t_ms": xs, "switch_event": ys}
@@ -203,8 +206,7 @@ class DecisionExplainer:
         learner_stats: Dict[str, Any],
         learner_name: str,
     ) -> Tuple[str, Dict[str, Any]]:
-        # Try OpenAI first (if configured)
-        text = self._openai_switch_explanation(
+        text = self._gemini_switch_explanation(
             from_policy=from_policy,
             to_policy=to_policy,
             context=context,
@@ -212,9 +214,9 @@ class DecisionExplainer:
             learner_name=learner_name,
         )
         if text:
-            return text, {}
+            return text, {"provider": "gemini", "model": self.gemini_model}
 
-        # Fallback deterministic explanation (no API key / no openai installed / error)
+        # Fallback deterministic explanation
         ctx = _compact_context(context, self.max_context_keys)
         arm_prev = learner_stats.get(from_policy) if from_policy else None
         arm_next = learner_stats.get(to_policy)
@@ -239,7 +241,7 @@ class DecisionExplainer:
         else:
             reasons.append("the learner is exploring (not enough stats to justify purely by estimates).")
 
-        if ctx:
+        if ctx and ctx != "(none)":
             reasons.append(f"Context snapshot: {ctx}")
 
         prev_s = from_policy or "(none yet)"
@@ -247,9 +249,9 @@ class DecisionExplainer:
             f"**Policy switch:** {prev_s} → **{to_policy}**.\n"
             f"Why: " + " ".join(reasons)
         )
-        return text, {}
+        return text, {"provider": "fallback"}
 
-    def _openai_switch_explanation(
+    def _gemini_switch_explanation(
         self,
         *,
         from_policy: Optional[str],
@@ -258,48 +260,42 @@ class DecisionExplainer:
         learner_stats: Dict[str, Any],
         learner_name: str,
     ) -> Optional[str]:
-        key = os.getenv("OPENAI_API_KEY")
-        if not key:
-            return None
-
-        try:
-            # Lazy import so your project still runs without the dependency.
-            from openai import OpenAI  # type: ignore
-        except Exception:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key or genai is None:
             return None
 
         prev = from_policy or "(none yet)"
-        ctx = _compact_context(context, self.max_context_keys)
-
-        # Pull only the relevant arm stats to keep prompt small
         arm_prev = learner_stats.get(from_policy) if from_policy else None
         arm_next = learner_stats.get(to_policy)
 
+        payload = {
+            "preferred_policy": to_policy,
+            "alternative_policy": prev,
+            "learner": learner_name,
+            "context": context or {},
+            "prev_arm_stats": arm_prev,
+            "next_arm_stats": arm_next,
+        }
+
         prompt = (
-            "You are an explainer for a routing-policy bandit manager.\n"
-            "Explain concisely why the manager switched policies.\n"
-            "Be concrete: mention learner estimates / counts if present, and connect to minimizing latency.\n"
-            "Do NOT invent numbers.\n\n"
-            f"Learner: {learner_name}\n"
-            f"Switch: {prev} -> {to_policy}\n"
-            f"Context: {ctx}\n"
-            f"Prev arm stats: {arm_prev}\n"
-            f"New arm stats: {arm_next}\n"
-            "\nOutput format:\n"
-            "- One short headline\n"
-            "- 2-4 bullet points with evidence\n"
+            "You are explaining only ONE thing: why the currently preferred routing policy is favored.\n"
+            "Write exactly 2-3 short sentences, maximum 70 words total.\n"
+            "You must mention the preferred policy name and compare it directly against the alternative policy.\n"
+            "Use only the evidence in the JSON. Do not invent numbers. Do not give recommendations.\n"
+            "Be specific about estimated reward, sample count, exploration, or context when relevant.\n\n"
+            "Simulation snapshot JSON:\n"
+            f"{json.dumps(payload, ensure_ascii=False)}"
         )
 
         try:
-            client = OpenAI(api_key=key)
-            # Responses API pattern :contentReference[oaicite:1]{index=1}
-            resp = client.responses.create(
-                model=self.openai_model,
-                input=[{"role": "user", "content": prompt}],
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model=self.gemini_model,
+                contents=prompt,
             )
-            out = getattr(resp, "output_text", None)
-            if isinstance(out, str) and out.strip():
-                return out.strip()
+            text = getattr(response, "text", None)
+            if isinstance(text, str) and text.strip():
+                return text.strip()
             return None
         except Exception:
             return None

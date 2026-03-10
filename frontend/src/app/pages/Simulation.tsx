@@ -39,6 +39,9 @@ import {
   resetManager,
   getRecentExplanations,
   getNodeJobStatus,
+  pauseNode,
+  resumeNode,
+  clearNodeQueue,
   type AgentConfig,
   type NodeGroup,
   type JobExecutionRecord,
@@ -51,10 +54,20 @@ type Policy = "round-robin" | "least-loaded" | "resource-aware" | "random";
 interface NodeUI {
   id: string;
   name: string;
+  host: string;
+  port: number;
   cpuCapacity: number;
   memCapacity: number;
   cpuUsed: number;
   memUsed: number;
+  cpuPct: number;
+  memPct: number;
+  queueLen: number | null;
+  inFlight: number | null;
+  jobs60s: number | null;
+  ewmaMs: number | null;
+  p95Ms: number | null;
+  nodeSpeed: number | null;
   tasks: any[];
   status: "active" | "draining" | "offline";
 }
@@ -75,6 +88,11 @@ interface AgentState {
   lastDecisionTime: number;
   status: "exploring" | "optimizing" | "monitoring";
 }
+
+type RewardPoint = {
+  t: number;
+  [policy: string]: number;
+};
 
 type RealJobUI = JobExecutionRecord & {
   node_host?: string | null;
@@ -99,28 +117,6 @@ function parseArgs(input: string) {
     .filter(Boolean);
 }
 
-// function estimateJobProgress(job: Partial<RealJobUI>) {
-//   const combinedLogs = `${job.stdout ?? ""}\n${job.stderr ?? ""}`;
-//   const percentMatches = Array.from(combinedLogs.matchAll(/(\d{1,3})\s*%/g))
-//     .map((match) => Number(match[1]))
-//     .filter((value) => Number.isFinite(value) && value >= 0 && value <= 100);
-
-//   if (percentMatches.length > 0) {
-//     return percentMatches[percentMatches.length - 1];
-//   }
-
-//   if (job.status === "completed" || job.status === "failed" || job.status === "timeout") {
-//     return 100;
-//   }
-//   if (job.status === "running") {
-//     return 60;
-//   }
-//   if (job.status === "queued") {
-//     return 8;
-//   }
-//   return 0;
-// }
-
 const POLICY_COLORS: Record<Policy, string> = {
   "round-robin": "#6366f1",
   "least-loaded": "#10b981",
@@ -136,6 +132,11 @@ function safePct(x: any) {
   const n = Number(x);
   if (!Number.isFinite(n)) return 0;
   return Math.max(0, Math.min(100, n));
+}
+
+function fmtMetric(value: number | null | undefined, digits = 0) {
+  if (value == null || !Number.isFinite(value)) return "--";
+  return Number(value).toFixed(digits);
 }
 
 function mkJobId() {
@@ -170,6 +171,47 @@ function extractReward(stat: any): number {
   if (typeof stat.mean === "number") return stat.mean;
   if (typeof stat.mean_window === "number") return stat.mean_window;
   return 0;
+}
+
+function buildEmptyPolicyStats(): Record<Policy, PolicyStatUI> {
+  return {
+    "round-robin": {
+      policy: "round-robin",
+      completedTasks: 0,
+      totalLatency: 0,
+      avgLatency: 0,
+      recentLatency: [],
+      reward: 0,
+      selectionPct: 0,
+    },
+    "least-loaded": {
+      policy: "least-loaded",
+      completedTasks: 0,
+      totalLatency: 0,
+      avgLatency: 0,
+      recentLatency: [],
+      reward: 0,
+      selectionPct: 0,
+    },
+    "resource-aware": {
+      policy: "resource-aware",
+      completedTasks: 0,
+      totalLatency: 0,
+      avgLatency: 0,
+      recentLatency: [],
+      reward: 0,
+      selectionPct: 0,
+    },
+    random: {
+      policy: "random",
+      completedTasks: 0,
+      totalLatency: 0,
+      avgLatency: 0,
+      recentLatency: [],
+      reward: 0,
+      selectionPct: 0,
+    },
+  };
 }
 
 function buildPolicyStatsFromBackend(
@@ -247,10 +289,6 @@ export function Simulation() {
   const [isAgentControlled, setIsAgentControlled] = useState(false);
   const [policy, setPolicy] = useState<Policy>("round-robin");
 
-  type RewardPoint = {
-    t: number;
-    [policy: string]: number;
-  };
   const [rewardHistory, setRewardHistory] = useState<RewardPoint[]>([]);
   const [seenPolicies, setSeenPolicies] = useState<Set<Policy>>(new Set());
 
@@ -268,44 +306,9 @@ export function Simulation() {
   const [submittedJobs, setSubmittedJobs] = useState(0);
   const simStartMsRef = useRef<number | null>(null);
 
-  const [policyStats, setPolicyStats] = useState<Record<Policy, PolicyStatUI>>({
-    "round-robin": {
-      policy: "round-robin",
-      completedTasks: 0,
-      totalLatency: 0,
-      avgLatency: 0,
-      recentLatency: [],
-      reward: 0,
-      selectionPct: 0,
-    },
-    "least-loaded": {
-      policy: "least-loaded",
-      completedTasks: 0,
-      totalLatency: 0,
-      avgLatency: 0,
-      recentLatency: [],
-      reward: 0,
-      selectionPct: 0,
-    },
-    "resource-aware": {
-      policy: "resource-aware",
-      completedTasks: 0,
-      totalLatency: 0,
-      avgLatency: 0,
-      recentLatency: [],
-      reward: 0,
-      selectionPct: 0,
-    },
-    random: {
-      policy: "random",
-      completedTasks: 0,
-      totalLatency: 0,
-      avgLatency: 0,
-      recentLatency: [],
-      reward: 0,
-      selectionPct: 0,
-    },
-  });
+  const [policyStats, setPolicyStats] = useState<Record<Policy, PolicyStatUI>>(
+    buildEmptyPolicyStats()
+  );
 
   const [agent, setAgent] = useState<AgentState>({
     isActive: false,
@@ -326,6 +329,26 @@ export function Simulation() {
   const [submittingRealJob, setSubmittingRealJob] = useState(false);
   const [realJobs, setRealJobs] = useState<RealJobUI[]>([]);
   const autoSubmittingRealJobsRef = useRef(false);
+
+  const realJobsRef = useRef<RealJobUI[]>([]);
+  useEffect(() => {
+    realJobsRef.current = realJobs;
+  }, [realJobs]);
+
+  const isRunningRef = useRef(false);
+  useEffect(() => {
+    isRunningRef.current = isRunning;
+  }, [isRunning]);
+
+  const isAgentControlledRef = useRef(false);
+  useEffect(() => {
+    isAgentControlledRef.current = isAgentControlled;
+  }, [isAgentControlled]);
+
+  const explainOpenRef = useRef(false);
+  useEffect(() => {
+    explainOpenRef.current = explainOpen;
+  }, [explainOpen]);
 
   const POLICY_OPTIONS: { ui: Policy; backend: string; label: string }[] = useMemo(
     () => [
@@ -394,8 +417,21 @@ export function Simulation() {
     };
   }, [POLICY_OPTIONS, selectedPolicies, learnerKind, goalKind, seed, slaMs, tailWeight]);
 
+  const agentConfigKey = useMemo(
+    () =>
+      JSON.stringify({
+        learner_kind: agentConfig.learner_kind,
+        goal_kind: agentConfig.goal_kind,
+        seed: agentConfig.seed ?? null,
+        learner_kwargs: agentConfig.learner_kwargs ?? null,
+        goal_kwargs: agentConfig.goal_kwargs ?? null,
+      }),
+    [agentConfig]
+  );
+
   const { user } = useAuth() as { user?: { id?: string; email?: string } };
   const userId = user?.id ?? user?.email ?? "anon";
+
   const [connectedNodeKeys, setConnectedNodeKeys] = useState<string[]>([]);
   const [nodeGroups, setNodeGroups] = useState<NodeGroup[]>([]);
   const [selectedSimulationGroupId, setSelectedSimulationGroupId] = useState<number | null>(null);
@@ -426,9 +462,11 @@ export function Simulation() {
     };
 
     loadConnected();
+
     const onStorage = (e: StorageEvent) => {
       if (e.key === connectedStorageKey) loadConnected();
     };
+
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
   }, [connectedStorageKey]);
@@ -439,11 +477,14 @@ export function Simulation() {
       setSelectedSimulationGroupId(null);
       return;
     }
+
     let active = true;
+
     const loadGroups = async () => {
       try {
-        const groupsResp = await listNodeGroups(user.id!);
+        const groupsResp = await listNodeGroups(user.id);
         if (!active) return;
+
         const rows = groupsResp.rows ?? [];
         setNodeGroups(rows);
         setSelectedSimulationGroupId((prev) => {
@@ -456,7 +497,9 @@ export function Simulation() {
         setSelectedSimulationGroupId(null);
       }
     };
+
     void loadGroups();
+
     return () => {
       active = false;
     };
@@ -495,17 +538,28 @@ export function Simulation() {
   const renderNodes = useMemo<NodeUI[]>(() => {
     if (nodes.length > 0) return nodes;
     if (!selectedSimulationGroup) return [];
+
     return selectedSimulationGroup.nodes
       .filter((n) => connectedNodeKeySet.has(normalizeNodeKey(n.nodeKey)))
       .map((n) => ({
         id: `${n.host}:${n.port}`,
         name: n.nodeName || `${n.host}:${n.port}`,
+        host: n.host,
+        port: n.port,
         cpuCapacity: 100,
         memCapacity: 100,
         cpuUsed: 0,
         memUsed: 0,
+        cpuPct: 0,
+        memPct: 0,
+        queueLen: null,
+        inFlight: null,
+        jobs60s: null,
+        ewmaMs: null,
+        p95Ms: null,
+        nodeSpeed: null,
         tasks: [],
-        status: "offline",
+        status: "offline" as const,
       }));
   }, [nodes, selectedSimulationGroup, connectedNodeKeySet]);
 
@@ -521,6 +575,7 @@ export function Simulation() {
         const instanceId = normalizeNodeKey(n?.instance_id);
         const hostPortName = normalizeNodeKey(`${n?.host}:${n?.port}:${n?.name ?? ""}`);
         if (allowedNodeKeys.size === 0) return false;
+
         return (
           allowedNodeKeys.has(hostPort) ||
           allowedNodeKeys.has(name) ||
@@ -550,11 +605,21 @@ export function Simulation() {
 
         return {
           id: `${n.host}:${n.port}`,
-          name: (n.name ?? `${n.host}:${n.port}`).toLowerCase(),
+          name: String(n.name ?? `${n.host}:${n.port}`).toUpperCase(),
+          host: String(n.host ?? ""),
+          port: Number(n.port ?? 0),
           cpuCapacity: cpuCap,
           memCapacity: memCap,
           cpuUsed: (cpuPct / 100) * cpuCap,
           memUsed: (memPct / 100) * memCap,
+          cpuPct,
+          memPct,
+          queueLen: typeof n.queue_len === "number" ? n.queue_len : null,
+          inFlight: typeof n.in_flight === "number" ? n.in_flight : null,
+          jobs60s: typeof n.completed_last_60s === "number" ? n.completed_last_60s : null,
+          ewmaMs: typeof n.ewma_latency_ms === "number" ? n.ewma_latency_ms : null,
+          p95Ms: typeof n.p95_latency_ms === "number" ? n.p95_latency_ms : null,
+          nodeSpeed: typeof n.node_speed === "number" ? n.node_speed : null,
           tasks: [],
           status: online && isUserConnected ? "active" : "offline",
         };
@@ -566,6 +631,11 @@ export function Simulation() {
       setNodes([]);
     }
   }, [allowedNodeKeys, connectedNodeKeys]);
+
+  const pollNodesRef = useRef(pollNodes);
+  useEffect(() => {
+    pollNodesRef.current = pollNodes;
+  }, [pollNodes]);
 
   const serviceTimeMsFromCpu = useCallback((cpu: number) => {
     return Math.max(50, Math.round(150 + cpu * 12));
@@ -826,7 +896,6 @@ export function Simulation() {
     autoSubmittingRealJobsRef.current = true;
     try {
       for (const file of pendingFiles) {
-        // eslint-disable-next-line no-await-in-loop
         await submitQueuedRealJob(file);
       }
     } finally {
@@ -843,11 +912,31 @@ export function Simulation() {
   }, []);
 
   const spikeLoad = useCallback(async () => {
-    for (let i = 0; i < 10; i++) {
-      // eslint-disable-next-line no-await-in-loop
-      await submitOneJob({ spike: true, idx: i });
-    }
+    await Promise.all(
+      Array.from({ length: 10 }).map((_, i) => submitOneJob({ spike: true, idx: i }))
+    );
   }, [submitOneJob]);
+
+  const pauseEverything = useCallback(async () => {
+    setIsRunning(false);
+
+    try {
+      await Promise.all(rawNodes.map((n: any) => pauseNode(String(n.host), Number(n.port))));
+      await Promise.all(rawNodes.map((n: any) => clearNodeQueue(String(n.host), Number(n.port))));
+    } catch (err) {
+      console.error("Failed to pause nodes:", err);
+    }
+  }, [rawNodes]);
+
+  const resumeEverything = useCallback(async () => {
+    try {
+      await Promise.all(rawNodes.map((n: any) => resumeNode(String(n.host), Number(n.port))));
+    } catch (err) {
+      console.error("Failed to resume nodes:", err);
+    }
+
+    setIsRunning(true);
+  }, [rawNodes]);
 
   const fetchLatestExplanation = useCallback(async () => {
     try {
@@ -872,9 +961,9 @@ export function Simulation() {
   }, [agentConfig]);
 
   const maybePauseForExplanation = useCallback(async () => {
-    if (!isRunning) return;
-    if (!isAgentControlled) return;
-    if (explainOpen) return;
+    if (!isRunningRef.current) return;
+    if (!isAgentControlledRef.current) return;
+    if (explainOpenRef.current) return;
 
     const ev = await fetchLatestExplanation();
     const t = Number(ev?.t_ms ?? 0);
@@ -882,20 +971,24 @@ export function Simulation() {
     if (t <= lastExplainTmsRef.current) return;
 
     lastExplainTmsRef.current = t;
-    resumeRunningRef.current = isRunning;
+    resumeRunningRef.current = isRunningRef.current;
 
     setLatestExplanation(ev);
     setCurrentExplanation(ev);
     setExplainOpen(true);
     setIsRunning(false);
-  }, [explainOpen, fetchLatestExplanation, isAgentControlled, isRunning]);
+  }, [fetchLatestExplanation]);
 
   const continueAfterExplanation = useCallback(() => {
     setExplainOpen(false);
     setCurrentExplanation(null);
-    if (resumeRunningRef.current) setIsRunning(true);
+
+    if (resumeRunningRef.current) {
+      void resumeEverything();
+    }
+
     resumeRunningRef.current = false;
-  }, []);
+  }, [resumeEverything]);
 
   const pollManager = useCallback(async () => {
     try {
@@ -920,28 +1013,32 @@ export function Simulation() {
 
       setIncomingJobs(pendingIds.length);
 
-      setPolicyStats((prev) => {
-        const next = buildPolicyStatsFromBackend(learnerStats, latencyStats, prev, selectedPolicies);
+      const selectedPoliciesSnapshot = [...selectedPolicies];
 
-        const usedNow = (selectedPolicies as Policy[]).filter(
-          (p) => (next[p]?.completedTasks ?? 0) > 0
+      setPolicyStats((prev) => {
+        const next = buildPolicyStatsFromBackend(
+          learnerStats,
+          latencyStats,
+          prev,
+          selectedPoliciesSnapshot
         );
+
+        const usedNow = selectedPoliciesSnapshot.filter((p) => (next[p]?.completedTasks ?? 0) > 0);
 
         setSeenPolicies((old) => {
           const s = new Set(old);
           usedNow.forEach((p) => s.add(p));
-          return s;
-        });
 
-        setRewardHistory((h) => {
-          const keys = usedNow.length > 0 ? usedNow : Array.from(seenPolicies);
-
-          const point: RewardPoint = { t: h.length };
-          keys.forEach((p) => {
-            point[p] = next[p]?.reward ?? 0;
+          setRewardHistory((history) => {
+            const keys = usedNow.length > 0 ? usedNow : Array.from(s);
+            const point: RewardPoint = { t: history.length };
+            keys.forEach((p) => {
+              point[p] = next[p]?.reward ?? 0;
+            });
+            return [...history, point].slice(-200);
           });
 
-          return [...h, point].slice(-200);
+          return s;
         });
 
         return next;
@@ -955,14 +1052,15 @@ export function Simulation() {
       }
 
       setAgent((prev) => {
-        const nextExploration = isAgentControlled
+        const nextExploration = isAgentControlledRef.current
           ? Math.max(0.05, prev.explorationRate * 0.985)
           : prev.explorationRate;
+
         return {
           ...prev,
-          isActive: isAgentControlled,
+          isActive: isAgentControlledRef.current,
           explorationRate: nextExploration,
-          status: isAgentControlled
+          status: isAgentControlledRef.current
             ? nextExploration > 0.2
               ? "exploring"
               : "optimizing"
@@ -975,26 +1073,33 @@ export function Simulation() {
     } catch {
       setIncomingJobs(0);
     }
-  }, [agentConfig, isAgentControlled, selectedPolicies, maybePauseForExplanation, seenPolicies]);
+  }, [agentConfig, selectedPolicies, maybePauseForExplanation]);
+
+  const pollManagerRef = useRef(pollManager);
+  useEffect(() => {
+    pollManagerRef.current = pollManager;
+  }, [pollManager]);
 
   useEffect(() => {
+    if (!isRunning) return;
+
     void pollNodes();
-    const id = window.setInterval(() => void pollNodes(), 2000);
+    const id = window.setInterval(() => void pollNodesRef.current(), 2000);
     return () => window.clearInterval(id);
-  }, [pollNodes]);
+  }, [isRunning, pollNodes]);
 
   useEffect(() => {
+    if (!isRunning) return;
     if (realJobs.length === 0) return;
 
     const id = window.setInterval(async () => {
+      const jobsSnapshot = realJobsRef.current;
+
       const next = await Promise.all(
-        realJobs.map(async (job) => {
+        jobsSnapshot.map(async (job) => {
           if (!job) return job;
           if (job.status !== "queued" && job.status !== "running") {
-            return {
-              ...job,
-              // progressPct: estimateJobProgress(job),
-            };
+            return { ...job };
           }
 
           let host = job.node_host;
@@ -1022,10 +1127,7 @@ export function Simulation() {
               node_port: port,
             } as RealJobUI;
 
-            return {
-              ...mergedJob,
-              // progressPct: estimateJobProgress(mergedJob),
-            };
+            return { ...mergedJob };
           } catch {
             return job;
           }
@@ -1036,7 +1138,7 @@ export function Simulation() {
     }, 2000);
 
     return () => window.clearInterval(id);
-  }, [realJobs, rawNodes]);
+  }, [isRunning, rawNodes, realJobs.length]);
 
   const submitIntervalRef = useRef<number | null>(null);
   const pollIntervalRef = useRef<number | null>(null);
@@ -1053,7 +1155,7 @@ export function Simulation() {
     if (simStartMsRef.current == null) simStartMsRef.current = nowMs();
 
     void pollManager();
-    pollIntervalRef.current = window.setInterval(() => void pollManager(), 4000);
+    pollIntervalRef.current = window.setInterval(() => void pollManagerRef.current(), 4000);
 
     const jobsPerSec = Math.max(0, Number(simulationSpeed) || 0);
     if (jobsPerSec > 0) {
@@ -1078,67 +1180,32 @@ export function Simulation() {
     void submitAllQueuedRealJobs();
   }, [isRunning, queuedRealFiles, submitAllQueuedRealJobs]);
 
-  const resetSimulation = () => {
+  const clearSimulationView = useCallback(() => {
     setIsRunning(false);
     setIsAgentControlled(false);
+
     setIncomingJobs(0);
     setSubmittedJobs(0);
     setOverallAvgLatencyMs(0);
     setOverallLatencyTrail([]);
     simStartMsRef.current = null;
+
     setRewardHistory([]);
     setSeenPolicies(new Set());
     setPolicy("round-robin");
     setCurrentRouteStrategy("round-robin");
     setLastChosenNodeId(null);
     setLastChosenNodeLabel("—");
+
+    setExplainOpen(false);
+    setCurrentExplanation(null);
+    setLatestExplanation(null);
+    lastExplainTmsRef.current = 0;
+    resumeRunningRef.current = false;
+
     setScopeError(null);
 
-    setQueuedRealFiles([]);
-    setScriptArgs("");
-    setScriptTimeoutS(60);
-    setRealJobError(null);
-    setSubmittingRealJob(false);
-    setRealJobs([]);
-
-    setPolicyStats({
-      "round-robin": {
-        policy: "round-robin",
-        completedTasks: 0,
-        totalLatency: 0,
-        avgLatency: 0,
-        recentLatency: [],
-        reward: 0,
-        selectionPct: 0,
-      },
-      "least-loaded": {
-        policy: "least-loaded",
-        completedTasks: 0,
-        totalLatency: 0,
-        avgLatency: 0,
-        recentLatency: [],
-        reward: 0,
-        selectionPct: 0,
-      },
-      "resource-aware": {
-        policy: "resource-aware",
-        completedTasks: 0,
-        totalLatency: 0,
-        avgLatency: 0,
-        recentLatency: [],
-        reward: 0,
-        selectionPct: 0,
-      },
-      random: {
-        policy: "random",
-        completedTasks: 0,
-        totalLatency: 0,
-        avgLatency: 0,
-        recentLatency: [],
-        reward: 0,
-        selectionPct: 0,
-      },
-    });
+    setPolicyStats(buildEmptyPolicyStats());
 
     setAgent({
       isActive: false,
@@ -1149,11 +1216,54 @@ export function Simulation() {
 
     setNodes([]);
     setRawNodes([]);
+  }, []);
 
-    resetManager()
-      .then(() => pollManager())
-      .catch((e) => console.error("Backend reset failed:", e));
-  };
+  const clearSimulationViewRef = useRef(clearSimulationView);
+  useEffect(() => {
+    clearSimulationViewRef.current = clearSimulationView;
+  }, [clearSimulationView]);
+
+  const resetSimulation = useCallback(async () => {
+    clearSimulationView();
+
+    setQueuedRealFiles([]);
+    setScriptArgs("");
+    setScriptTimeoutS(60);
+    setRealJobError(null);
+    setSubmittingRealJob(false);
+    setRealJobs([]);
+    autoSubmittingRealJobsRef.current = false;
+
+    try {
+      await resetManager();
+      await Promise.all(rawNodes.map((n: any) => resumeNode(String(n.host), Number(n.port))));
+      await pollNodes();
+      await pollManager();
+    } catch (e) {
+      console.error("Backend reset failed:", e);
+    }
+  }, [clearSimulationView, rawNodes, pollNodes, pollManager]);
+
+  const didMountAgentConfigRef = useRef(false);
+
+  useEffect(() => {
+    if (!didMountAgentConfigRef.current) {
+      didMountAgentConfigRef.current = true;
+      return;
+    }
+
+    void (async () => {
+      clearSimulationViewRef.current();
+
+      try {
+        await resetManager();
+        await pollNodesRef.current();
+        await pollManagerRef.current();
+      } catch (e) {
+        console.error("Agent config reset failed:", e);
+      }
+    })();
+  }, [agentConfigKey]);
 
   const chartData = useMemo(() => {
     return nodes.map((n) => ({
@@ -1295,10 +1405,14 @@ export function Simulation() {
         <div className="flex items-center gap-3 rounded-xl border border-neutral-800 bg-neutral-900 p-2">
           <button
             onClick={() => {
-              setIsAgentControlled(!isAgentControlled);
-              if (!isRunning) setIsRunning(true);
+              const next = !isAgentControlled;
+              setIsAgentControlled(next);
 
-              if (isAgentControlled) {
+              if (!isRunning) {
+                void resumeEverything();
+              }
+
+              if (!next) {
                 setCurrentRouteStrategy(policy);
               }
             }}
@@ -1329,11 +1443,13 @@ export function Simulation() {
                   setScopeError("No connected nodes in this group. Connect group nodes first.");
                   return;
                 }
+
                 setScopeError(null);
-                setIsRunning(true);
+                void resumeEverything();
                 return;
               }
-              setIsRunning(false);
+
+              void pauseEverything();
             }}
             className={`flex items-center gap-2 rounded-lg px-4 py-2 font-medium transition-all ${
               isRunning
@@ -1350,7 +1466,7 @@ export function Simulation() {
           </button>
 
           <button
-            onClick={resetSimulation}
+            onClick={() => void resetSimulation()}
             className="rounded-lg p-2 text-neutral-400 transition-colors hover:bg-neutral-800 hover:text-white"
           >
             <RotateCcw className="h-4 w-4" />
@@ -1720,7 +1836,8 @@ export function Simulation() {
                   </div>
                 )}
                 <div className="mt-3 text-xs text-zinc-500">
-                  This submits real executable Python jobs instead of fake timed workloads. Start the simulation to auto-submit the whole queue, or use the button below.
+                  This submits real executable Python jobs instead of fake timed workloads. Start the
+                  simulation to auto-submit the whole queue, or use the button below.
                 </div>
               </div>
 
@@ -1875,61 +1992,92 @@ export function Simulation() {
               </div>
             ) : (
               <div className="z-10 mt-auto grid w-full grid-cols-2 gap-6 md:grid-cols-4">
-                {renderNodes.map((node) => (
-                  <div
-                    key={node.id}
-                    className={`rounded-xl border p-4 transition-all ${
-                      lastChosenNodeId && node.id === lastChosenNodeId
-                        ? "border-emerald-400 ring-2 ring-emerald-500/20 shadow-lg shadow-emerald-500/20"
-                        : "border-neutral-800 hover:border-neutral-700"
-                    } bg-neutral-900/80 backdrop-blur-sm`}
-                  >
-                    <div className="mb-4 flex items-start justify-between">
-                      <div>
-                        <h4 className="text-[10px] font-bold uppercase tracking-tight text-neutral-500">
-                          {node.name}
-                        </h4>
-                        <p className="font-mono text-sm font-bold text-neutral-300">
-                          {node.status === "offline" ? "Offline" : "Active"}
-                        </p>
+                {renderNodes.map((node) => {
+                  const saturation = Math.round((node.cpuUsed / Math.max(1, node.cpuCapacity)) * 100);
+
+                  return (
+                    <div
+                      key={node.id}
+                      className={`rounded-xl border p-4 transition-all ${
+                        lastChosenNodeId && node.id === lastChosenNodeId
+                          ? "border-emerald-400 ring-2 ring-emerald-500/20 shadow-lg shadow-emerald-500/20"
+                          : "border-neutral-800 hover:border-neutral-700"
+                      } bg-neutral-900/80 backdrop-blur-sm`}
+                    >
+                      <div className="mb-4 flex items-start justify-between">
+                        <div>
+                          <h4 className="text-[10px] font-bold uppercase tracking-tight text-neutral-500">
+                            {node.name}
+                          </h4>
+                          <p className="font-mono text-sm font-bold text-neutral-300">
+                            {node.status === "offline" ? "Offline" : "Online"}
+                          </p>
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          {lastChosenNodeId && node.id === lastChosenNodeId && (
+                            <span className="rounded-full border border-emerald-500/30 bg-emerald-500/15 px-2 py-0.5 text-[10px] font-bold text-emerald-400">
+                              CHOSEN
+                            </span>
+                          )}
+                          <div className="rounded-lg border border-neutral-700/50 bg-neutral-800/50 p-1.5">
+                            <Cpu className="h-3 w-3 text-neutral-500" />
+                          </div>
+                        </div>
                       </div>
 
-                      <div className="flex items-center gap-2">
-                        {lastChosenNodeId && node.id === lastChosenNodeId && (
-                          <span className="rounded-full border border-emerald-500/30 bg-emerald-500/15 px-2 py-0.5 text-[10px] font-bold text-emerald-400">
-                            CHOSEN
-                          </span>
-                        )}
-                        <div className="rounded-lg border border-neutral-700/50 bg-neutral-800/50 p-1.5">
-                          <Cpu className="h-3 w-3 text-neutral-500" />
+                      <div className="space-y-2">
+                        <div className="mb-1 flex justify-between text-[10px]">
+                          <span className="text-neutral-500">Saturation</span>
+                          <span className="font-mono text-neutral-300">{saturation}%</span>
+                        </div>
+
+                        <div className="h-1.5 overflow-hidden rounded-full border border-neutral-800/50 bg-neutral-950">
+                          <Motion.div
+                            animate={{
+                              width: `${Math.min(100, saturation)}%`,
+                              backgroundColor:
+                                node.status === "offline"
+                                  ? "#262626"
+                                  : isAgentControlled
+                                    ? "#a855f7"
+                                    : "#6366f1",
+                            }}
+                            className="h-full"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="mt-4 grid grid-cols-3 gap-x-4 gap-y-2 text-[11px]">
+                        <div className="text-neutral-500">CPU</div>
+                        <div className="text-neutral-500">MEM</div>
+                        <div className="text-neutral-500">Queue</div>
+
+                        <div className="font-mono text-neutral-200">{fmtMetric(node.cpuPct)}%</div>
+                        <div className="font-mono text-neutral-200">{fmtMetric(node.memPct)}%</div>
+                        <div className="font-mono text-neutral-200">{fmtMetric(node.queueLen)}</div>
+
+                        <div className="text-neutral-500">Jobs/60s</div>
+                        <div className="text-neutral-500">In-flight</div>
+                        <div className="text-neutral-500">Speed</div>
+
+                        <div className="font-mono text-neutral-200">{fmtMetric(node.jobs60s)}</div>
+                        <div className="font-mono text-neutral-200">{fmtMetric(node.inFlight)}</div>
+                        <div className="font-mono text-neutral-200">{fmtMetric(node.nodeSpeed, 1)}</div>
+
+                        <div className="text-neutral-500">EWMA</div>
+                        <div className="text-neutral-500">P95</div>
+                        <div className="text-neutral-500">Host</div>
+
+                        <div className="font-mono text-neutral-200">{fmtMetric(node.ewmaMs, 1)}</div>
+                        <div className="font-mono text-neutral-200">{fmtMetric(node.p95Ms, 1)}</div>
+                        <div className="truncate font-mono text-neutral-200">
+                          {node.host}:{node.port}
                         </div>
                       </div>
                     </div>
-
-                    <div className="space-y-2">
-                      <div className="mb-1 flex justify-between text-[10px]">
-                        <span className="text-neutral-500">Saturation</span>
-                        <span className="font-mono text-neutral-300">
-                          {Math.round((node.cpuUsed / Math.max(1, node.cpuCapacity)) * 100)}%
-                        </span>
-                      </div>
-                      <div className="h-1.5 overflow-hidden rounded-full border border-neutral-800/50 bg-neutral-950">
-                        <Motion.div
-                          animate={{
-                            width: `${Math.min(100, (node.cpuUsed / Math.max(1, node.cpuCapacity)) * 100)}%`,
-                            backgroundColor:
-                              node.status === "offline"
-                                ? "#262626"
-                                : isAgentControlled
-                                  ? "#a855f7"
-                                  : "#6366f1",
-                          }}
-                          className="h-full"
-                        />
-                      </div>
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
                 {renderNodes.length === 0 && (
                   <div className="col-span-2 rounded-xl border border-neutral-800 bg-neutral-900/80 p-4 text-sm text-neutral-400 md:col-span-4">
                     No connected nodes are selected for this user. Connect nodes in the Nodes page,
@@ -1955,14 +2103,6 @@ export function Simulation() {
             ) : (
               <div className="space-y-3">
                 {realJobs.map((job) => {
-                  // const progressPct = estimateJobProgress(job);
-                  // const progressTone =
-                  //   job.status === "completed"
-                  //     ? "bg-emerald-500"
-                  //     : job.status === "failed" || job.status === "timeout"
-                  //       ? "bg-rose-500"
-                  //       : "bg-cyan-500";
-
                   return (
                     <div
                       key={job.job_id}
@@ -1979,19 +2119,6 @@ export function Simulation() {
                           {job.node_name ? `Node: ${job.node_name}` : "Node pending"}
                         </div>
                       </div>
-
-                      {/* <div className="mt-3">
-                        <div className="mb-1 flex items-center justify-between text-[11px] text-zinc-400">
-                          <span>Progress</span>
-                          <span>{Math.round(progressPct)}%</span>
-                        </div>
-                        <div className="h-2 overflow-hidden rounded-full bg-white/5">
-                          <div
-                            className={`h-full transition-all duration-500 ${progressTone}`}
-                            style={{ width: `${Math.max(0, Math.min(100, progressPct))}%` }}
-                          />
-                        </div>
-                      </div> */}
 
                       <div className="mt-3 grid gap-2 text-xs text-zinc-300 md:grid-cols-4">
                         <div>Status: {job.status}</div>
@@ -2164,7 +2291,8 @@ ${job.stderr ?? ""}`}
             </div>
           </div>
 
-          {/* <div className="rounded-2xl border border-neutral-800 bg-neutral-900 p-6">
+          {/*
+          <div className="rounded-2xl border border-neutral-800 bg-neutral-900 p-6">
             <div className="mb-4 flex items-center gap-2">
               <History className="h-5 w-5 text-neutral-400" />
               <h3 className="font-semibold">Recent Policy Latencies</h3>
@@ -2199,7 +2327,8 @@ ${job.stderr ?? ""}`}
                 </LineChart>
               </ResponsiveContainer>
             </div>
-          </div> */}
+          </div>
+          */}
         </div>
       </div>
     </div>

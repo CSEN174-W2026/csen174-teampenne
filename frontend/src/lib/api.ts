@@ -545,6 +545,51 @@ export async function listEc2Nodes(token: string) {
 // }
 
 
+// export async function getNodeRecentJobs(host: string, port: number, limit = 20) {
+//   const res = await fetch(`http://${host}:${port}/jobs?limit=${limit}`);
+//   if (!res.ok) {
+//     throw new Error(`Failed to fetch node jobs: ${res.status} ${res.statusText}`);
+//   }
+//   return res.json() as Promise<JobExecutionRecord[]>;
+// }
+
+// export async function getNodeJobStatus(host: string, port: number, jobId: string) {
+//   const res = await fetch(`http://${host}:${port}/jobs/${encodeURIComponent(jobId)}`);
+//   if (!res.ok) {
+//     throw new Error(`Failed to fetch node job status: ${res.status} ${res.statusText}`);
+//   }
+//   return res.json() as Promise<JobExecutionRecord>;
+// }
+
+
+// export async function pauseNode(host: string, port: number) {
+//   return http<{ ok: boolean; paused: boolean; time_ms: number }>(
+//     `http://${host}:${port}/pause`,
+//     {
+//       method: "POST",
+//     }
+//   );
+// }
+
+// export async function resumeNode(host: string, port: number) {
+//   return http<{ ok: boolean; paused: boolean; time_ms: number }>(
+//     `http://${host}:${port}/resume`,
+//     {
+//       method: "POST",
+//     }
+//   );
+// }
+
+// export async function clearNodeQueue(host: string, port: number) {
+//   return http<{ ok: boolean; cleared: number; time_ms: number }>(
+//     `http://${host}:${port}/clear_queue`,
+//     {
+//       method: "POST",
+//     }
+//   );
+// }
+
+
 export async function getNodeRecentJobs(host: string, port: number, limit = 20) {
   const res = await fetch(`http://${host}:${port}/jobs?limit=${limit}`);
   if (!res.ok) {
@@ -559,4 +604,46 @@ export async function getNodeJobStatus(host: string, port: number, jobId: string
     throw new Error(`Failed to fetch node job status: ${res.status} ${res.statusText}`);
   }
   return res.json() as Promise<JobExecutionRecord>;
+}
+
+export async function pauseNode(host: string, port: number) {
+  const res = await fetch(`http://${host}:${port}/pause`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to pause node: ${res.status} ${res.statusText} ${text}`);
+  }
+
+  return res.json() as Promise<{ ok: boolean; paused: boolean; time_ms: number }>;
+}
+
+export async function resumeNode(host: string, port: number) {
+  const res = await fetch(`http://${host}:${port}/resume`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to resume node: ${res.status} ${res.statusText} ${text}`);
+  }
+
+  return res.json() as Promise<{ ok: boolean; paused: boolean; time_ms: number }>;
+}
+
+export async function clearNodeQueue(host: string, port: number) {
+  const res = await fetch(`http://${host}:${port}/clear_queue`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Failed to clear node queue: ${res.status} ${res.statusText} ${text}`);
+  }
+
+  return res.json() as Promise<{ ok: boolean; cleared: number; time_ms: number }>;
 }
