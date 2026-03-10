@@ -71,8 +71,9 @@ class NodeClient:
         if 200 <= r.status_code < 300:
             return r.json()
 
+        # Attempt 2: compatibility payload for stricter/older schemas
+        # (drop optional keys that may be rejected).
         if r.status_code == 422:
-            # Attempt 2: drop args/timeout_s for slightly stricter schemas.
             compat_payload = {
                 "job_id": job.job_id,
                 "user_id": job.user_id,
@@ -85,24 +86,6 @@ class NodeClient:
             r2 = requests.post(url, json=compat_payload, timeout=max(self.timeout_s, 10))
             if 200 <= r2.status_code < 300:
                 return r2.json()
-
-            # Attempt 3: legacy schema — exactly {job_id, user_id, service_time_ms, metadata}.
-            # This matches the original vm-info branch node_worker that only had these 4 fields.
-            if r2.status_code == 422:
-                legacy_payload = {
-                    "job_id": job.job_id,
-                    "user_id": job.user_id,
-                    "service_time_ms": service_ms,
-                    "metadata": job.metadata or {},
-                }
-                r3 = requests.post(url, json=legacy_payload, timeout=max(self.timeout_s, 10))
-                if 200 <= r3.status_code < 300:
-                    return r3.json()
-                detail = (r3.text or r2.text or r.text or "").strip()
-                raise RuntimeError(
-                    f"Node submit rejected (422) even with legacy payload. url={url} detail={detail}"
-                )
-
             detail = (r2.text or r.text or "").strip()
             raise RuntimeError(
                 f"Node submit rejected (422). url={url} detail={detail}"
@@ -112,4 +95,15 @@ class NodeClient:
         detail = (r.text or "").strip()
         raise RuntimeError(
             f"Node submit failed status={r.status_code}. url={url} detail={detail}"
+        )
+
+    # Fetches one job status from a node by job id.
+    def get_job_status(self, node: NodeSnapshot, job_id: str) -> Dict[str, Any]:
+        url = f"http://{node.host}:{node.port}/jobs/{job_id}"
+        r = requests.get(url, timeout=max(self.timeout_s, 10))
+        if 200 <= r.status_code < 300:
+            return r.json()
+        detail = (r.text or "").strip()
+        raise RuntimeError(
+            f"Node job status failed status={r.status_code}. url={url} detail={detail}"
         )

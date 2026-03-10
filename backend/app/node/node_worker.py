@@ -178,13 +178,21 @@ async def _run_python_job(job: _InternalJob, started_at: int) -> JobRecord:
 
     proc = None
     try:
+        exec_env = os.environ.copy()
+        run_dir_abs = str(run_dir.resolve())
+        # Allow uploaded scripts to import project modules (e.g. node.virtualbox)
+        # while keeping the per-job run dir importable.
+        extra_paths = [run_dir_abs, "/opt/csen174/backend/app", "/opt/csen174/backend", "/opt/csen174"]
+        existing_pp = exec_env.get("PYTHONPATH", "")
+        exec_env["PYTHONPATH"] = os.pathsep.join(extra_paths + ([existing_pp] if existing_pp else []))
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
             safe_name,
             *(job.args or []),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=str(run_dir.resolve()),
+            cwd=run_dir_abs,
+            env=exec_env,
         )
 
         stdout_b, stderr_b = await asyncio.wait_for(
@@ -373,13 +381,21 @@ async def _run_python_job(job: _InternalJob, started_at: int) -> JobRecord:
     proc = None
 
     try:
+        exec_env = os.environ.copy()
+        run_dir_abs = str(run_dir.resolve())
+        # Allow uploaded scripts to import project modules (e.g. node.virtualbox)
+        # while keeping the per-job run dir importable.
+        extra_paths = [run_dir_abs, "/opt/csen174/backend/app", "/opt/csen174/backend", "/opt/csen174"]
+        existing_pp = exec_env.get("PYTHONPATH", "")
+        exec_env["PYTHONPATH"] = os.pathsep.join(extra_paths + ([existing_pp] if existing_pp else []))
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
             safe_name,
             *(job.args or []),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=str(run_dir.resolve()),
+            cwd=run_dir_abs,
+            env=exec_env,
         )
 
         stdout_b, stderr_b = await asyncio.wait_for(

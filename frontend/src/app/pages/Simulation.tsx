@@ -91,6 +91,93 @@ type RealJobUI = JobExecutionRecord & {
   node_port?: number | null;
 };
 
+type SelectOptionWithDescription = {
+  value: string;
+  label: string;
+  description: string;
+};
+
+function HoverInfoSelect({
+  label,
+  value,
+  onChange,
+  options,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  options: SelectOptionWithDescription[];
+}) {
+  const [open, setOpen] = useState(false);
+  const [hovered, setHovered] = useState<SelectOptionWithDescription | null>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const onPointerDown = (ev: MouseEvent) => {
+      if (!rootRef.current) return;
+      if (!rootRef.current.contains(ev.target as Node)) {
+        setOpen(false);
+        setHovered(null);
+      }
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    return () => document.removeEventListener("mousedown", onPointerDown);
+  }, []);
+
+  const selected = options.find((o) => o.value === value) ?? options[0];
+
+  return (
+    <div className="space-y-2" ref={rootRef}>
+      <label className="text-sm font-medium text-neutral-400">{label}</label>
+      <div className="relative">
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="flex w-full items-center justify-between rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-200 hover:border-neutral-700"
+        >
+          <span>{selected?.label ?? value}</span>
+          <span className="text-neutral-500">{open ? "▴" : "▾"}</span>
+        </button>
+
+        {open ? (
+          <div className="absolute left-0 right-0 top-full z-[85] mt-1 overflow-hidden rounded-xl border border-neutral-700 bg-neutral-950 shadow-2xl">
+            {options.map((o) => (
+              <button
+                key={o.value}
+                type="button"
+                onMouseEnter={() => setHovered(o)}
+                onMouseLeave={() => setHovered(null)}
+                onClick={() => {
+                  onChange(o.value);
+                  setOpen(false);
+                  setHovered(null);
+                }}
+                className={`w-full px-3 py-2 text-left text-sm transition-colors ${
+                  value === o.value
+                    ? "bg-indigo-500/20 text-indigo-300"
+                    : "text-neutral-200 hover:bg-neutral-800"
+                }`}
+              >
+                {o.label}
+              </button>
+            ))}
+          </div>
+        ) : null}
+
+        {open && hovered ? (
+          <div className="pointer-events-none absolute left-full top-0 z-[90] ml-3 w-96 rounded-xl border border-neutral-700 bg-neutral-900 p-4 shadow-2xl">
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-neutral-400">
+              {label} Description
+            </div>
+            <div className="mt-1 text-sm font-semibold text-neutral-100">{hovered.label}</div>
+            <div className="mt-2 text-sm leading-relaxed text-neutral-300">{hovered.description}</div>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 const POLICY_COLORS: Record<Policy, string> = {
   "round-robin": "#6366f1",
   "least-loaded": "#10b981",
@@ -110,6 +197,23 @@ function safePct(x: any) {
 
 function mkJobId() {
   return `job_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+}
+
+function buildCpuSpikeScript(durationSeconds: number, workScale: number): string {
+  return `
+import math
+import time
+
+end_t = time.time() + ${Math.max(1, durationSeconds)}
+acc = 0.0
+scale = ${Math.max(1, workScale)}
+
+while time.time() < end_t:
+    for i in range(200000 * scale):
+        acc += math.sqrt((i % 1000) + 1)
+
+print("cpu_spike_done", round(acc, 3))
+`.trim();
 }
 
 function normalizeNodeKey(x: unknown): string {
@@ -147,7 +251,7 @@ function buildPolicyStatsFromBackend(
   latencyStats: Record<string, any>,
   rewardStats: Record<string, any>,
   prev: Record<Policy, PolicyStatUI>,
-  selectedPolicies: Policy[]
+  selectedPolicies: Policy[] = []
 ): Record<Policy, PolicyStatUI> {
   const next: Record<Policy, PolicyStatUI> = { ...prev };
 
@@ -187,7 +291,20 @@ function buildPolicyStatsFromBackend(
     };
   }
 
-  const active = selectedPolicies.length ? selectedPolicies : (Object.keys(next) as Policy[]);
+  // Prefer realized reward from backend goal mapping when available.
+  // This keeps UI reward aligned with configured goal/weights.
+  for (const [k, v] of Object.entries(rewardStats || {})) {
+    const ui = backendKeyToUiPolicy(k);
+    if (!ui) continue;
+    const avgReward = typeof (v as any)?.avg_reward === "number" ? (v as any).avg_reward : null;
+    if (avgReward == null || !Number.isFinite(avgReward)) continue;
+    next[ui] = {
+      ...next[ui],
+      reward: avgReward,
+    };
+  }
+
+  const active = (selectedPolicies?.length ? selectedPolicies : (Object.keys(next) as Policy[])) as Policy[];
   const totalCompleted = active.reduce((acc, p) => acc + (next[p]?.completedTasks || 0), 0);
 
   for (const p of active) {
@@ -226,6 +343,7 @@ export function Simulation() {
   };
   const [rewardHistory, setRewardHistory] = useState<RewardPoint[]>([]);
   const [seenPolicies, setSeenPolicies] = useState<Set<Policy>>(new Set());
+  const rewardTickRef = useRef<number>(0);
 
   const [currentRouteStrategy, setCurrentRouteStrategy] = useState<Policy>("round-robin");
 
@@ -291,6 +409,7 @@ export function Simulation() {
   const [overallLatencyTrail, setOverallLatencyTrail] = useState<number[]>([]);
 
   const [manualTask, setManualTask] = useState({ cpu: 20, mem: 128, duration: 10 });
+  const [spikeParallelJobs, setSpikeParallelJobs] = useState(20);
 
   const [uploadedFileName, setUploadedFileName] = useState("");
   const [uploadedScript, setUploadedScript] = useState("");
@@ -600,8 +719,8 @@ export function Simulation() {
 
       setNodes(mapped);
     } catch {
-      setRawNodes([]);
-      setNodes([]);
+      // Keep last known good metrics on transient poll errors so UI
+      // does not snap to fake zero/offline values.
     }
   }, [allowedNodeKeys, connectedNodeKeys]);
 
@@ -743,7 +862,7 @@ export function Simulation() {
     const job = {
       job_id: jobId,
       user_id: userId,
-      job_type: "python_script" as const,
+      job_type: "python" as const,
       script_name: uploadedFileName || "job.py",
       script_content: uploadedScript,
       args: scriptArgs
@@ -787,7 +906,7 @@ export function Simulation() {
         {
           job_id: jobId,
           user_id: userId,
-          job_type: "python_script",
+          job_type: "python",
           script_name: uploadedFileName || "job.py",
           status: "queued",
           queued_at_ms: Date.now(),
@@ -829,11 +948,94 @@ export function Simulation() {
 
   const spikeLoad = useCallback(async () => {
     setSpikeEvents((v) => v + 1);
-    for (let i = 0; i < 10; i++) {
-      // eslint-disable-next-line no-await-in-loop
-      await submitOneJob({ spike: true, idx: i });
+    // Constrain spike routing to nodes currently running in this simulation scope.
+    const jobsToSend = Math.max(1, Math.floor(Number(spikeParallelJobs) || 1));
+    const activeNodeKeys = nodes
+      .filter((n) => n.status === "active")
+      .map((n) => normalizeNodeKey(n.id));
+
+    if (activeNodeKeys.length === 0) {
+      setScopeError("No active simulation nodes available for spike load.");
+      return;
     }
-  }, [submitOneJob]);
+
+    const manualPolicyBackend =
+      policy === "none" ? null : POLICY_OPTIONS.find((p) => p.ui === policy)?.backend ?? null;
+    const spikeDurationS = Math.max(2, Math.min(30, Math.floor(Number(manualTask.duration) || 6)));
+    const workScale = Math.max(1, Math.min(4, Math.floor((Number(manualTask.mem) || 128) / 128)));
+    const spikeScript = buildCpuSpikeScript(spikeDurationS, workScale);
+
+    const burst = Array.from({ length: jobsToSend }, async (_, i) => {
+      const job = {
+        job_id: mkJobId(),
+        user_id: userId,
+        job_type: "python" as const,
+        script_name: `cpu_spike_${i + 1}.py`,
+        script_content: spikeScript,
+        args: [],
+        timeout_s: Math.max(15, spikeDurationS + 10),
+        metadata: {
+          spike: true,
+          idx: i,
+          cpu_intensity: manualTask.cpu,
+          selected_group_id: selectedSimulationGroup?.id ?? null,
+          selected_group_name: selectedSimulationGroup?.name ?? null,
+          allowed_node_keys: activeNodeKeys,
+          manual_policy: isAgentControlled ? null : manualPolicyBackend,
+          spike_jobs_requested: jobsToSend,
+          spike_mode: "cpu_bound_python",
+        },
+      };
+
+      try {
+        const resp: any = await submitJob({ config: agentConfig, job });
+        setSubmittedJobs((p) => p + 1);
+        const host = resp?.decision?.node?.host ?? resp?.decision?.host ?? null;
+        const port = resp?.decision?.node?.port ?? resp?.decision?.port ?? null;
+        const nodeName = resp?.decision?.node?.name ?? resp?.decision?.node_name ?? null;
+
+        if (host && port != null) {
+          const id = `${host}:${port}`;
+          setLastChosenNodeId(id);
+          setLastChosenNodeLabel(nodeName ? `${nodeName} (${id})` : id);
+        } else if (nodeName) {
+          setLastChosenNodeId(nodeName);
+          setLastChosenNodeLabel(nodeName);
+        }
+
+        if (isAgentControlled) {
+          const chosen =
+            resp?.decision?.policy ??
+            resp?.decision?.policy_name ??
+            resp?.decision?.policy_kind ??
+            null;
+          const ui = typeof chosen === "string" ? backendKeyToUiPolicy(chosen) : null;
+          if (ui) setCurrentRouteStrategy(ui);
+        } else if (policy !== "none") {
+          setCurrentRouteStrategy(policy);
+        }
+      } catch (e) {
+        console.error("spike submit failed:", e);
+      }
+    });
+
+    await Promise.allSettled(burst);
+    // Pull fresh metrics right after burst dispatch.
+    await pollNodes();
+  }, [
+    spikeParallelJobs,
+    manualTask.duration,
+    manualTask.mem,
+    nodes,
+    pollNodes,
+    policy,
+    POLICY_OPTIONS,
+    isAgentControlled,
+    userId,
+    selectedSimulationGroup?.id,
+    selectedSimulationGroup?.name,
+    agentConfig,
+  ]);
 
   const fetchLatestExplanation = useCallback(async () => {
     try {
@@ -909,26 +1111,25 @@ export function Simulation() {
       setIncomingJobs(pendingIds.length);
 
       setPolicyStats((prev) => {
-        const next = buildPolicyStatsFromBackend(learnerStats, latencyStats, prev, selectedPolicies);
-
-        const usedNow = (selectedPolicies as Policy[]).filter(
-          (p) => (next[p]?.completedTasks ?? 0) > 0
+        const next = buildPolicyStatsFromBackend(
+          learnerStats,
+          latencyStats,
+          rewardStats,
+          prev,
+          selectedPolicies
         );
 
-        setSeenPolicies((old) => {
-          const s = new Set(old);
-          usedNow.forEach((p) => s.add(p));
-          return s;
-        });
+        const keys =
+          selectedPolicies.length > 0 ? selectedPolicies : (Object.keys(next) as Policy[]);
+
+        // Keep chart series stable/visible even before first completion.
+        setSeenPolicies(new Set(keys));
 
         setRewardHistory((h) => {
-          const keys = usedNow.length > 0 ? usedNow : Array.from(seenPolicies);
-
-          const point: RewardPoint = { t: h.length };
+          const point: RewardPoint = { t: rewardTickRef.current++ };
           keys.forEach((p) => {
             point[p] = next[p]?.reward ?? 0;
           });
-
           return [...h, point].slice(-200);
         });
 
@@ -963,7 +1164,7 @@ export function Simulation() {
     } catch {
       setIncomingJobs(0);
     }
-  }, [agentConfig, isAgentControlled, selectedPolicies, maybePauseForExplanation, seenPolicies]);
+  }, [agentConfig, isAgentControlled, selectedPolicies, maybePauseForExplanation]);
 
   useEffect(() => {
     void pollNodes();
@@ -1056,6 +1257,7 @@ export function Simulation() {
     setOverallLatencyTrail([]);
     simStartMsRef.current = null;
     setRewardHistory([]);
+    rewardTickRef.current = 0;
     setSeenPolicies(new Set());
     setPolicy("none");
     setCurrentRouteStrategy("round-robin");
@@ -1366,7 +1568,9 @@ export function Simulation() {
               if (!isRunning) setIsRunning(true);
 
               if (isAgentControlled) {
-                setCurrentRouteStrategy(policy);
+                if (policy !== "none") {
+                  setCurrentRouteStrategy(policy);
+                }
               }
             }}
             className={`flex items-center gap-2 rounded-lg px-4 py-2 font-medium transition-all ${
@@ -1541,35 +1745,19 @@ export function Simulation() {
                 </p>
               </div>
 
-              <div className="space-y-2">
-                <label className="text-sm font-medium text-neutral-400">Learner</label>
-                <select
-                  value={learnerKind}
-                  onChange={(e) => setLearnerKind(e.target.value)}
-                  className="w-full rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-200"
-                >
-                  {LEARNER_OPTIONS.map((o) => (
-                    <option key={o.value} value={o.value}>
-                      {o.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
+              <HoverInfoSelect
+                label="Learner"
+                value={learnerKind}
+                onChange={setLearnerKind}
+                options={LEARNER_OPTIONS}
+              />
 
-              <div className="space-y-2">
-                <label className="text-sm font-medium text-neutral-400">Goal</label>
-                <select
-                  value={goalKind}
-                  onChange={(e) => setGoalKind(e.target.value)}
-                  className="w-full rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-200"
-                >
-                  {GOAL_OPTIONS.map((o) => (
-                    <option key={o.value} value={o.value}>
-                      {o.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
+              <HoverInfoSelect
+                label="Goal"
+                value={goalKind}
+                onChange={setGoalKind}
+                options={GOAL_OPTIONS}
+              />
 
               {goalKind === "min_latency_with_sla" && (
                 <div className="space-y-2">
@@ -1714,6 +1902,22 @@ export function Simulation() {
 
               <div className="space-y-2">
                 <div className="flex justify-between text-xs text-neutral-500">
+                  <span>Spike Parallel Jobs</span>
+                  <span>{spikeParallelJobs}</span>
+                </div>
+                <input
+                  type="range"
+                  min="1"
+                  max="120"
+                  step="1"
+                  value={spikeParallelJobs}
+                  onChange={(e) => setSpikeParallelJobs(Math.max(1, Number(e.target.value) || 1))}
+                  className="h-1 w-full appearance-none rounded-lg bg-neutral-800 accent-rose-500"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex justify-between text-xs text-neutral-500">
                   <span>Simulation Speed</span>
                   <span>{simulationSpeed} jobs/s</span>
                 </div>
@@ -1732,7 +1936,7 @@ export function Simulation() {
                 onClick={spikeLoad}
                 className="w-full rounded-lg border border-emerald-500/30 bg-emerald-500/10 py-2 text-sm font-medium text-emerald-500 transition-colors hover:bg-emerald-500/20"
               >
-                Spike Load
+                Spike Load ({spikeParallelJobs} parallel)
               </button>
             </div>
           </div>
@@ -1971,6 +2175,62 @@ export function Simulation() {
                           }}
                           className="h-full"
                         />
+                      </div>
+                      <div className="grid grid-cols-2 gap-x-3 gap-y-1 pt-1 text-[10px]">
+                        <div className="flex justify-between">
+                          <span className="text-neutral-500">CPU</span>
+                          <span className="font-mono text-neutral-300">
+                            {node.status === "offline" ? "--" : `${node.cpuPct.toFixed(0)}%`}
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-neutral-500">MEM</span>
+                          <span className="font-mono text-neutral-300">
+                            {node.status === "offline" ? "--" : `${node.memPct.toFixed(0)}%`}
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-neutral-500">Queue</span>
+                          <span className="font-mono text-neutral-300">
+                            {node.status === "offline" ? "--" : (node.queueLen ?? 0)}
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-neutral-500">In-flight</span>
+                          <span className="font-mono text-neutral-300">
+                            {node.status === "offline" ? "--" : (node.inFlight ?? 0)}
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-neutral-500">Jobs/60s</span>
+                          <span className="font-mono text-neutral-300">
+                            {node.status === "offline" ? "--" : (node.completedLast60s ?? 0)}
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-neutral-500">Speed</span>
+                          <span className="font-mono text-neutral-300">
+                            {node.status === "offline" || node.nodeSpeed == null
+                              ? "--"
+                              : `${node.nodeSpeed.toFixed(1)}`}
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-neutral-500">EWMA</span>
+                          <span className="font-mono text-neutral-300">
+                            {node.status === "offline" || node.ewmaLatencyMs == null
+                              ? "--"
+                              : `${Math.round(node.ewmaLatencyMs)}ms`}
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-neutral-500">P95</span>
+                          <span className="font-mono text-neutral-300">
+                            {node.status === "offline" || node.p95LatencyMs == null
+                              ? "--"
+                              : `${Math.round(node.p95LatencyMs)}ms`}
+                          </span>
+                        </div>
                       </div>
                     </div>
                   </div>

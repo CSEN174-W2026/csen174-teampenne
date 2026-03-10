@@ -39,7 +39,7 @@ if [ -f /opt/csen174/backend/requirements.txt ]; then
 fi
 
 # Fallback runtime deps.
-pip install fastapi "uvicorn[standard]" pydantic psutil requests
+pip install fastapi "uvicorn[standard]" pydantic psutil requests python-dotenv
 
 cat >/etc/systemd/system/csen174-node.service <<'EOF'
 [Unit]
@@ -49,7 +49,8 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/csen174/backend
-ExecStart=/bin/bash -lc 'source venv/bin/activate && python -m uvicorn app.node.node_worker:app --host 0.0.0.0 --port 5001 --reload'
+Environment=NODE_WORKER_CONCURRENCY=4
+ExecStart=/bin/bash -lc 'source venv/bin/activate && python -m uvicorn app.node.node_worker:app --host 0.0.0.0 --port 5001'
 Restart=always
 RestartSec=3
 

@@ -118,7 +118,7 @@ variable "requirements_file" {
 variable "extra_pip_packages" {
   description = "Additional pip packages installed in node venv"
   type        = list(string)
-  default     = ["fastapi", "uvicorn[standard]", "pydantic", "psutil", "requests"]
+  default     = ["fastapi", "uvicorn[standard]", "pydantic", "psutil", "requests", "python-dotenv"]
 }
 
 variable "node_service_name" {

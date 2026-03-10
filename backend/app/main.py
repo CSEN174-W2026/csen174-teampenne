@@ -1111,6 +1111,21 @@ def submit_job(request: SubmitJobRequest):
     )
 
 
+@app.get("/nodes/job_status")
+def get_node_job_status(host: str, port: int, job_id: str):
+    node_stub = NodeSnapshot(
+        name=host,
+        host=host,
+        port=port,
+        cpus=0,
+        memory_mb=0,
+    )
+    try:
+        return client.get_job_status(node_stub, job_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch node job status: {e}")
+
+
 @app.post("/agents/learner_stats")
 def agent_learner_stats(cfg: AgentConfig):
     agent = get_agent(

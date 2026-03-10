@@ -75,7 +75,7 @@ export type AgentConfig = {
   goal_kwargs?: Record<string, any> | null;
 };
 
-export type JobType = "simulated" | "python_script" | "ml_script";
+export type JobType = "simulated" | "python" | "python_script" | "ml_script";
 
 export type JobRequest = {
   job_id: string;
@@ -564,9 +564,7 @@ export async function getNodeRecentJobs(host: string, port: number, limit = 20) 
 }
 
 export async function getNodeJobStatus(host: string, port: number, jobId: string) {
-  const res = await fetch(`http://${host}:${port}/jobs/${encodeURIComponent(jobId)}`);
-  if (!res.ok) {
-    throw new Error(`Failed to fetch node job status: ${res.status} ${res.statusText}`);
-  }
-  return res.json() as Promise<JobExecutionRecord>;
+  return http<JobExecutionRecord>(
+    `/nodes/job_status?host=${encodeURIComponent(host)}&port=${encodeURIComponent(port)}&job_id=${encodeURIComponent(jobId)}`
+  );
 }

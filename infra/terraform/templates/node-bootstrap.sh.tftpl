@@ -41,6 +41,11 @@ if [ -f "${repo_clone_dir}/${requirements_file}" ]; then
   pip install -r "${repo_clone_dir}/${requirements_file}"
 fi
 
+# Install optional node-worker-specific requirements when present.
+if [ -f "${repo_clone_dir}/backend/app/node/requirements.txt" ]; then
+  pip install -r "${repo_clone_dir}/backend/app/node/requirements.txt"
+fi
+
 %{ for pkg in extra_pip_packages ~}
 pip install "${pkg}"
 %{ endfor ~}
@@ -53,6 +58,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=${repo_clone_dir}/${node_working_dir}
+Environment=NODE_WORKER_CONCURRENCY=4
 ExecStart=/bin/bash -lc '${node_start_command}'
 Restart=always
 RestartSec=3
