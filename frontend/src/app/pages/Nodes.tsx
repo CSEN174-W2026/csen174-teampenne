@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import { Server, Search, Filter, HardDrive, Cpu, Wifi, Link2, Unlink, Save, Trash2 } from "lucide-react";
 import { motion } from "motion/react";
 import {
+  cancelScopedJobs,
   createNodeGroup,
   deleteNodeGroup,
   getNodeGroupSelection,
@@ -147,13 +148,25 @@ export function Nodes() {
     });
   }, [uiNodes, query, statusFilter]);
 
-  const toggleConnect = (instanceId: string) => {
-    setConnectedIds((prev) => {
-      const has = prev.includes(instanceId);
-      const next = has ? prev.filter((id) => id !== instanceId) : [...prev, instanceId];
-      localStorage.setItem(connectedStorageKey, JSON.stringify(next));
-      return next;
-    });
+  const toggleConnect = async (instanceId: string) => {
+    const wasConnected = connectedIds.includes(instanceId);
+    const next = wasConnected
+      ? connectedIds.filter((id) => id !== instanceId)
+      : [...connectedIds, instanceId];
+    setConnectedIds(next);
+    localStorage.setItem(connectedStorageKey, JSON.stringify(next));
+
+    if (wasConnected && userId) {
+      try {
+        await cancelScopedJobs({
+          user_id: userId,
+          allowed_node_keys: [instanceId],
+          include_running: true,
+        });
+      } catch (e: any) {
+        setError(e?.message ?? "Failed to cancel jobs on disconnected node");
+      }
+    }
   };
 
   const connectedCount = connectedIds.length;
@@ -248,10 +261,23 @@ export function Nodes() {
     localStorage.setItem(connectedStorageKey, JSON.stringify(next));
   };
 
-  const disconnectSelectedGroups = () => {
+  const disconnectSelectedGroups = async () => {
+    const removed = connectedIds.filter((id) => selectedGroupNodeKeys.has(id));
     const next = connectedIds.filter((id) => !selectedGroupNodeKeys.has(id));
     setConnectedIds(next);
     localStorage.setItem(connectedStorageKey, JSON.stringify(next));
+
+    if (removed.length > 0 && userId) {
+      try {
+        await cancelScopedJobs({
+          user_id: userId,
+          allowed_node_keys: removed,
+          include_running: true,
+        });
+      } catch (e: any) {
+        setError(e?.message ?? "Failed to cancel jobs for disconnected group nodes");
+      }
+    }
   };
 
   const onDeleteGroup = async (groupId: number) => {
@@ -380,7 +406,7 @@ export function Nodes() {
               Connect Selected Groups
             </button>
             <button
-              onClick={disconnectSelectedGroups}
+              onClick={() => void disconnectSelectedGroups()}
               className="inline-flex items-center gap-2 px-3 py-1.5 rounded border border-rose-500/40 text-rose-300 hover:bg-rose-500/10 text-xs font-medium"
             >
               Disconnect Selected Groups
@@ -482,7 +508,7 @@ export function Nodes() {
               <span className="text-xs text-neutral-500 italic">Last seen: {node.lastSeen}</span>
               <button
                 disabled={node.status !== "online"}
-                onClick={() => toggleConnect(node.instanceId)}
+                onClick={() => void toggleConnect(node.instanceId)}
                 className={`inline-flex items-center gap-1.5 text-xs font-bold disabled:opacity-50 disabled:cursor-not-allowed ${
                   isConnected(node.instanceId) ? "text-rose-400 hover:text-rose-300" : "text-sky-400 hover:text-sky-300"
                 }`}

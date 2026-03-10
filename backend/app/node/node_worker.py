@@ -9,7 +9,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, Dict, List, Optional
+from typing import Deque, Dict, List, Optional, Set
 
 import psutil
 from fastapi import FastAPI, HTTPException
@@ -35,6 +35,11 @@ class SubmitJobResponse(BaseModel):
     accepted: bool
     queued_at_ms: int
     status: str
+
+class CancelJobsRequest(BaseModel):
+    user_id: Optional[str] = None
+    job_ids: List[str] = Field(default_factory=list)
+    include_running: bool = True
 
 
 class MetricsResponse(BaseModel):
@@ -85,6 +90,8 @@ class _InternalJob:
 
 _job_queue: asyncio.Queue[_InternalJob] = asyncio.Queue()
 _in_flight = 0
+_cancel_requested: Set[str] = set()
+_running_procs: Dict[str, asyncio.subprocess.Process] = {}
 
 _recent_jobs: Deque[JobRecord] = deque(maxlen=500)
 _completion_times_ms: Deque[int] = deque(maxlen=2000)
@@ -314,7 +321,30 @@ def _measure_node_cpu_pct() -> float:
 # -----------------------------
 async def _run_simulated_job(job: _InternalJob, started_at: int) -> JobRecord:
     duration_ms = job.service_time_ms or 1000
-    await asyncio.sleep(duration_ms / 1000.0)
+    remaining = duration_ms / 1000.0
+    while remaining > 0:
+        if job.job_id in _cancel_requested:
+            finished_at = _now_ms()
+            observed_latency = finished_at - job.queued_at_ms
+            return JobRecord(
+                job_id=job.job_id,
+                user_id=job.user_id,
+                job_type="simulated",
+                script_name=None,
+                status="cancelled",
+                queued_at_ms=job.queued_at_ms,
+                started_at_ms=started_at,
+                finished_at_ms=finished_at,
+                observed_latency_ms=observed_latency,
+                service_time_ms=job.service_time_ms,
+                exit_code=None,
+                stdout="",
+                stderr="Cancelled by simulation stop",
+                metadata=job.metadata or {},
+            )
+        step = min(0.1, remaining)
+        await asyncio.sleep(step)
+        remaining -= step
 
     finished_at = _now_ms()
     observed_latency = finished_at - job.queued_at_ms
@@ -367,6 +397,7 @@ async def _run_python_job(job: _InternalJob, started_at: int) -> JobRecord:
             cwd=run_dir_abs,
             env=exec_env,
         )
+        _running_procs[job.job_id] = proc
 
         stdout_b, stderr_b = await asyncio.wait_for(
             proc.communicate(),
@@ -382,7 +413,11 @@ async def _run_python_job(job: _InternalJob, started_at: int) -> JobRecord:
             user_id=job.user_id,
             job_type=job.job_type,
             script_name=safe_name,
-            status="completed" if exit_code == 0 else "failed",
+            status=(
+                "cancelled"
+                if job.job_id in _cancel_requested
+                else ("completed" if exit_code == 0 else "failed")
+            ),
             queued_at_ms=job.queued_at_ms,
             started_at_ms=started_at,
             finished_at_ms=finished_at,
@@ -390,7 +425,11 @@ async def _run_python_job(job: _InternalJob, started_at: int) -> JobRecord:
             service_time_ms=None,
             exit_code=exit_code,
             stdout=stdout_b.decode("utf-8", errors="replace"),
-            stderr=stderr_b.decode("utf-8", errors="replace"),
+            stderr=(
+                "Cancelled by simulation stop"
+                if job.job_id in _cancel_requested
+                else stderr_b.decode("utf-8", errors="replace")
+            ),
             metadata=job.metadata or {},
         )
 
@@ -441,6 +480,8 @@ async def _run_python_job(job: _InternalJob, started_at: int) -> JobRecord:
             stderr=str(exc),
             metadata=job.metadata or {},
         )
+    finally:
+        _running_procs.pop(job.job_id, None)
 
 
 async def _worker_loop() -> None:
@@ -448,6 +489,29 @@ async def _worker_loop() -> None:
 
     while True:
         job = await _job_queue.get()
+        if job.job_id in _cancel_requested:
+            finished_at = _now_ms()
+            cancelled = JobRecord(
+                job_id=job.job_id,
+                user_id=job.user_id,
+                job_type=job.job_type,
+                script_name=job.script_name,
+                status="cancelled",
+                queued_at_ms=job.queued_at_ms,
+                started_at_ms=None,
+                finished_at_ms=finished_at,
+                observed_latency_ms=finished_at - job.queued_at_ms,
+                service_time_ms=job.service_time_ms,
+                exit_code=None,
+                stdout="",
+                stderr="Cancelled by simulation stop",
+                metadata=job.metadata or {},
+            )
+            _job_status[job.job_id] = cancelled
+            _recent_jobs.append(cancelled)
+            _completion_times_ms.append(finished_at)
+            _job_queue.task_done()
+            continue
         _in_flight += 1
         started_at = _now_ms()
 
@@ -609,6 +673,46 @@ async def submit_job(req: SubmitJobRequest):
         queued_at_ms=queued_at,
         status="queued",
     )
+
+
+@app.post("/jobs/cancel")
+async def cancel_jobs(req: CancelJobsRequest):
+    now = _now_ms()
+    requested_ids = {str(j).strip() for j in (req.job_ids or []) if str(j).strip()}
+    cancelled_queued = 0
+    cancelled_running = 0
+
+    for job_id, rec in list(_job_status.items()):
+        by_user = bool(req.user_id) and rec.user_id == req.user_id
+        by_id = job_id in requested_ids
+        if not (by_user or by_id):
+            continue
+
+        if rec.status == "queued":
+            _cancel_requested.add(job_id)
+            _set_job_status(
+                job_id,
+                status="cancelled",
+                finished_at_ms=now,
+                observed_latency_ms=max(0, now - (rec.queued_at_ms or now)),
+                stderr="Cancelled by simulation stop",
+                exit_code=None,
+            )
+            cancelled_queued += 1
+        elif req.include_running and rec.status == "running":
+            _cancel_requested.add(job_id)
+            proc = _running_procs.get(job_id)
+            if proc is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+            cancelled_running += 1
+
+    return {
+        "ok": True,
+        "cancelled_queued": cancelled_queued,
+        "cancelled_running": cancelled_running,
+        "time_ms": now,
+    }
 
 
 @app.get("/recent_jobs", response_model=List[JobRecord])

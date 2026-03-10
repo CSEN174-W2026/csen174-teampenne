@@ -107,3 +107,17 @@ class NodeClient:
         raise RuntimeError(
             f"Node job status failed status={r.status_code}. url={url} detail={detail}"
         )
+
+    def cancel_jobs(self, node: NodeSnapshot, user_id: Optional[str], include_running: bool = True) -> Dict[str, Any]:
+        url = f"http://{node.host}:{node.port}/jobs/cancel"
+        payload = {
+            "user_id": user_id,
+            "include_running": include_running,
+        }
+        r = requests.post(url, json=payload, timeout=max(self.timeout_s, 10))
+        if 200 <= r.status_code < 300:
+            return r.json()
+        detail = (r.text or "").strip()
+        raise RuntimeError(
+            f"Node cancel jobs failed status={r.status_code}. url={url} detail={detail}"
+        )

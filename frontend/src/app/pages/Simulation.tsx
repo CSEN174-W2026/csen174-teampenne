@@ -40,6 +40,7 @@ import {
   resetManager,
   getRecentExplanations,
   getNodeJobStatus,
+  cancelScopedJobs,
   type AgentConfig,
   type NodeGroup,
   type JobExecutionRecord,
@@ -89,6 +90,15 @@ interface AgentState {
 type RealJobUI = JobExecutionRecord & {
   node_host?: string | null;
   node_port?: number | null;
+};
+
+type SpikeDispatchTrace = {
+  jobId: string;
+  nodeLabel: string;
+  policy: string;
+  status: "queued" | "error";
+  atMs: number;
+  error?: string;
 };
 
 type SelectOptionWithDescription = {
@@ -199,20 +209,43 @@ function mkJobId() {
   return `job_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
 }
 
-function buildCpuSpikeScript(durationSeconds: number, workScale: number): string {
+function buildCpuSpikeScript(durationSeconds: number, cpuIntensity: number, memMb: number): string {
+  const safeDuration = Math.max(1, Math.floor(durationSeconds));
+  const safeIntensity = Math.max(10, Math.min(100, Math.floor(cpuIntensity)));
+  const workerCount = Math.max(1, Math.min(4, Math.ceil(safeIntensity / 28)));
+  const loopScale = Math.max(1, Math.ceil(safeIntensity / 22));
+  const memPerWorkerMb = Math.max(2, Math.min(16, Math.floor(memMb / 48)));
   return `
 import math
+import multiprocessing as mp
+import os
 import time
 
-end_t = time.time() + ${Math.max(1, durationSeconds)}
-acc = 0.0
-scale = ${Math.max(1, workScale)}
+END_T = time.time() + ${safeDuration}
+WORKERS = ${workerCount}
+LOOP_SCALE = ${loopScale}
+MEM_PER_WORKER_MB = ${memPerWorkerMb}
 
-while time.time() < end_t:
-    for i in range(200000 * scale):
-        acc += math.sqrt((i % 1000) + 1)
+def burn(worker_id: int):
+    arr = bytearray(MEM_PER_WORKER_MB * 1024 * 1024)
+    acc = 0.0
+    idx = 0
+    while time.time() < END_T:
+        for i in range(120000 * LOOP_SCALE):
+            acc += math.sqrt((i % 1000) + 1)
+            idx = (idx + 4096) % len(arr)
+            arr[idx] = (arr[idx] + worker_id + i) % 251
+    print("worker_done", worker_id, round(acc, 3), len(arr))
 
-print("cpu_spike_done", round(acc, 3))
+if __name__ == "__main__":
+    procs = []
+    for wid in range(WORKERS):
+        p = mp.Process(target=burn, args=(wid,))
+        p.start()
+        procs.append(p)
+    for p in procs:
+        p.join()
+    print("cpu_spike_done", WORKERS, LOOP_SCALE, MEM_PER_WORKER_MB)
 `.trim();
 }
 
@@ -409,7 +442,9 @@ export function Simulation() {
   const [overallLatencyTrail, setOverallLatencyTrail] = useState<number[]>([]);
 
   const [manualTask, setManualTask] = useState({ cpu: 20, mem: 128, duration: 10 });
-  const [spikeParallelJobs, setSpikeParallelJobs] = useState(20);
+  const [spikeParallelJobs, setSpikeParallelJobs] = useState(10);
+  const [isSpiking, setIsSpiking] = useState(false);
+  const [spikeDispatches, setSpikeDispatches] = useState<SpikeDispatchTrace[]>([]);
 
   const [uploadedFileName, setUploadedFileName] = useState("");
   const [uploadedScript, setUploadedScript] = useState("");
@@ -946,24 +981,27 @@ export function Simulation() {
     POLICY_OPTIONS,
   ]);
 
-  const spikeLoad = useCallback(async () => {
+  const spikeLoad = useCallback(async (): Promise<boolean> => {
     setSpikeEvents((v) => v + 1);
     // Constrain spike routing to nodes currently running in this simulation scope.
-    const jobsToSend = Math.max(1, Math.floor(Number(spikeParallelJobs) || 1));
+    const jobsToSend = Math.max(1, Math.min(10, Math.floor(Number(spikeParallelJobs) || 1)));
     const activeNodeKeys = nodes
       .filter((n) => n.status === "active")
       .map((n) => normalizeNodeKey(n.id));
 
     if (activeNodeKeys.length === 0) {
       setScopeError("No active simulation nodes available for spike load.");
-      return;
+      return false;
     }
 
     const manualPolicyBackend =
       policy === "none" ? null : POLICY_OPTIONS.find((p) => p.ui === policy)?.backend ?? null;
-    const spikeDurationS = Math.max(2, Math.min(30, Math.floor(Number(manualTask.duration) || 6)));
-    const workScale = Math.max(1, Math.min(4, Math.floor((Number(manualTask.mem) || 128) / 128)));
-    const spikeScript = buildCpuSpikeScript(spikeDurationS, workScale);
+    const spikeDurationS = Math.max(2, Math.min(45, Math.floor(Number(manualTask.duration) || 8)));
+    const spikeScript = buildCpuSpikeScript(
+      spikeDurationS,
+      Math.max(10, Math.min(100, Number(manualTask.cpu) || 20)),
+      Math.max(32, Math.min(768, Number(manualTask.mem) || 128))
+    );
 
     const burst = Array.from({ length: jobsToSend }, async (_, i) => {
       const job = {
@@ -993,6 +1031,17 @@ export function Simulation() {
         const host = resp?.decision?.node?.host ?? resp?.decision?.host ?? null;
         const port = resp?.decision?.node?.port ?? resp?.decision?.port ?? null;
         const nodeName = resp?.decision?.node?.name ?? resp?.decision?.node_name ?? null;
+        const chosenPolicy =
+          resp?.decision?.policy ??
+          resp?.decision?.policy_name ??
+          resp?.decision?.policy_kind ??
+          "unknown";
+        const nodeLabel =
+          host && port != null
+            ? nodeName
+              ? `${nodeName} (${host}:${port})`
+              : `${host}:${port}`
+            : (nodeName ?? "unknown-node");
 
         if (host && port != null) {
           const id = `${host}:${port}`;
@@ -1004,26 +1053,45 @@ export function Simulation() {
         }
 
         if (isAgentControlled) {
-          const chosen =
-            resp?.decision?.policy ??
-            resp?.decision?.policy_name ??
-            resp?.decision?.policy_kind ??
-            null;
-          const ui = typeof chosen === "string" ? backendKeyToUiPolicy(chosen) : null;
+          const ui = typeof chosenPolicy === "string" ? backendKeyToUiPolicy(chosenPolicy) : null;
           if (ui) setCurrentRouteStrategy(ui);
         } else if (policy !== "none") {
           setCurrentRouteStrategy(policy);
         }
+
+        setSpikeDispatches((prev) => [
+          {
+            jobId: job.job_id,
+            nodeLabel,
+            policy: String(chosenPolicy),
+            status: "queued" as const,
+            atMs: Date.now(),
+          },
+          ...prev,
+        ].slice(0, 24));
       } catch (e) {
         console.error("spike submit failed:", e);
+        setSpikeDispatches((prev) => [
+          {
+            jobId: job.job_id,
+            nodeLabel: "dispatch failed",
+            policy: "n/a",
+            status: "error" as const,
+            atMs: Date.now(),
+            error: e instanceof Error ? e.message : "unknown dispatch error",
+          },
+          ...prev,
+        ].slice(0, 24));
       }
     });
 
     await Promise.allSettled(burst);
     // Pull fresh metrics right after burst dispatch.
     await pollNodes();
+    return true;
   }, [
     spikeParallelJobs,
+    manualTask.cpu,
     manualTask.duration,
     manualTask.mem,
     nodes,
@@ -1036,6 +1104,43 @@ export function Simulation() {
     selectedSimulationGroup?.name,
     agentConfig,
   ]);
+
+  const spikeIntervalRef = useRef<number | null>(null);
+  const spikeLoadRef = useRef(spikeLoad);
+
+  useEffect(() => {
+    spikeLoadRef.current = spikeLoad;
+  }, [spikeLoad]);
+
+  const toggleSpiking = useCallback(async () => {
+    if (!isRunning) {
+      setScopeError("Start Sim before enabling spike mode.");
+      return;
+    }
+    if (isSpiking) {
+      if (spikeIntervalRef.current) window.clearInterval(spikeIntervalRef.current);
+      spikeIntervalRef.current = null;
+      setIsSpiking(false);
+      return;
+    }
+
+    const started = await spikeLoadRef.current();
+    if (!started) {
+      setIsSpiking(false);
+      return;
+    }
+
+    setIsSpiking(true);
+    spikeIntervalRef.current = window.setInterval(() => void spikeLoadRef.current(), 3500);
+  }, [isRunning, isSpiking]);
+
+  // Apply manual override display immediately while simulation is running.
+  useEffect(() => {
+    if (!isRunning) return;
+    if (isAgentControlled) return;
+    if (policy === "none") return;
+    setCurrentRouteStrategy(policy);
+  }, [isRunning, isAgentControlled, policy]);
 
   const fetchLatestExplanation = useCallback(async () => {
     try {
@@ -1166,6 +1271,12 @@ export function Simulation() {
     }
   }, [agentConfig, isAgentControlled, selectedPolicies, maybePauseForExplanation]);
 
+  // Push agent config and manual override changes through immediately.
+  useEffect(() => {
+    if (!isRunning) return;
+    void pollManager();
+  }, [isRunning, pollManager, agentConfig, policy, isAgentControlled]);
+
   useEffect(() => {
     void pollNodes();
     const id = window.setInterval(() => void pollNodes(), 2000);
@@ -1226,6 +1337,9 @@ export function Simulation() {
       if (pollIntervalRef.current) window.clearInterval(pollIntervalRef.current);
       submitIntervalRef.current = null;
       pollIntervalRef.current = null;
+      if (spikeIntervalRef.current) window.clearInterval(spikeIntervalRef.current);
+      spikeIntervalRef.current = null;
+      setIsSpiking(false);
       return;
     }
 
@@ -1247,6 +1361,13 @@ export function Simulation() {
       pollIntervalRef.current = null;
     };
   }, [isRunning, pollManager, submitOneJob, simulationSpeed]);
+
+  useEffect(() => {
+    return () => {
+      if (spikeIntervalRef.current) window.clearInterval(spikeIntervalRef.current);
+      spikeIntervalRef.current = null;
+    };
+  }, []);
 
   const resetSimulation = () => {
     setIsRunning(false);
@@ -1272,6 +1393,10 @@ export function Simulation() {
     setRealJobError(null);
     setSubmittingRealJob(false);
     setRealJobs([]);
+    if (spikeIntervalRef.current) window.clearInterval(spikeIntervalRef.current);
+    spikeIntervalRef.current = null;
+    setIsSpiking(false);
+    setSpikeDispatches([]);
 
     setPolicyStats({
       "round-robin": {
@@ -1586,7 +1711,7 @@ export function Simulation() {
           <div className="mx-1 h-6 w-px bg-neutral-800" />
 
           <button
-            onClick={() => {
+            onClick={async () => {
               if (!isRunning) {
                 if (nodeGroups.length > 0 && !selectedSimulationGroup) {
                   setScopeError("Select a node group before starting the simulation.");
@@ -1605,6 +1730,16 @@ export function Simulation() {
                 return;
               }
               setIsRunning(false);
+              setIncomingJobs(0);
+              try {
+                await cancelScopedJobs({
+                  user_id: userId,
+                  allowed_node_keys: Array.from(allowedNodeKeys),
+                  include_running: true,
+                });
+              } catch (err) {
+                console.error("cancelScopedJobs failed:", err);
+              }
             }}
             className={`flex items-center gap-2 rounded-lg px-4 py-2 font-medium transition-all ${
               isRunning
@@ -1908,10 +2043,12 @@ export function Simulation() {
                 <input
                   type="range"
                   min="1"
-                  max="120"
+                  max="10"
                   step="1"
                   value={spikeParallelJobs}
-                  onChange={(e) => setSpikeParallelJobs(Math.max(1, Number(e.target.value) || 1))}
+                  onChange={(e) =>
+                    setSpikeParallelJobs(Math.max(1, Math.min(10, Number(e.target.value) || 1)))
+                  }
                   className="h-1 w-full appearance-none rounded-lg bg-neutral-800 accent-rose-500"
                 />
               </div>
@@ -1933,11 +2070,55 @@ export function Simulation() {
               </div>
 
               <button
-                onClick={spikeLoad}
-                className="w-full rounded-lg border border-emerald-500/30 bg-emerald-500/10 py-2 text-sm font-medium text-emerald-500 transition-colors hover:bg-emerald-500/20"
+                onClick={toggleSpiking}
+                disabled={!isRunning}
+                className={`w-full rounded-lg border py-2 text-sm font-medium transition-colors ${
+                  isSpiking
+                    ? "border-emerald-300/70 bg-emerald-400/30 text-emerald-100 shadow-lg shadow-emerald-400/30 hover:bg-emerald-400/40"
+                    : "border-emerald-700/40 bg-emerald-900/20 text-emerald-400 hover:bg-emerald-800/30"
+                } disabled:cursor-not-allowed disabled:opacity-50`}
               >
-                Spike Load ({spikeParallelJobs} parallel)
+                {isSpiking
+                  ? `Spiking ON (${spikeParallelJobs} parallel)`
+                  : `Spiking OFF (${spikeParallelJobs} parallel)`}
               </button>
+
+              <div className="rounded-lg border border-neutral-800 bg-neutral-950/70 p-3">
+                <div className="mb-2 flex items-center justify-between">
+                  <div className="text-xs font-semibold uppercase tracking-wide text-neutral-400">
+                    Spike Job Routing Trace
+                  </div>
+                  <div className="text-[10px] text-neutral-500">latest 24 dispatches</div>
+                </div>
+                {spikeDispatches.length === 0 ? (
+                  <div className="text-xs text-neutral-500">
+                    No spike jobs dispatched yet.
+                  </div>
+                ) : (
+                  <div className="max-h-40 space-y-1 overflow-y-auto pr-1">
+                    {spikeDispatches.map((d) => (
+                      <div
+                        key={`${d.jobId}_${d.atMs}`}
+                        className="rounded border border-neutral-800 bg-neutral-900/60 px-2 py-1 text-[10px]"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-mono text-neutral-300">{d.jobId}</span>
+                          <span
+                            className={
+                              d.status === "error" ? "text-rose-400" : "text-emerald-400"
+                            }
+                          >
+                            {d.status}
+                          </span>
+                        </div>
+                        <div className="text-neutral-400">node: {d.nodeLabel}</div>
+                        <div className="text-neutral-500">policy: {d.policy}</div>
+                        {d.error ? <div className="text-rose-400">{d.error}</div> : null}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
           </div>
 

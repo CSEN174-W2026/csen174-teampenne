@@ -530,6 +530,12 @@ class SubmitJobResult(BaseModel):
     agent_key: Dict[str, Any]
 
 
+class CancelScopeRequest(BaseModel):
+    user_id: str
+    allowed_node_keys: List[str] = Field(default_factory=list)
+    include_running: bool = True
+
+
 class SimulationExplainRequest(BaseModel):
     config: AgentConfig
     context: Dict[str, Any] = Field(default_factory=dict)
@@ -1124,6 +1130,57 @@ def get_node_job_status(host: str, port: int, job_id: str):
         return client.get_job_status(node_stub, job_id)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to fetch node job status: {e}")
+
+
+@app.post("/jobs/cancel_scope")
+def cancel_jobs_scope(req: CancelScopeRequest):
+    allowed = {_normalize_node_key(x) for x in (req.allowed_node_keys or []) if _normalize_node_key(x)}
+    snaps = live_snapshots()
+    if allowed:
+        snaps = [s for s in snaps if _snapshot_matches_allowed_keys(s, allowed)]
+
+    if not snaps:
+        return {"ok": True, "nodes_attempted": 0, "cancelled_queued": 0, "cancelled_running": 0, "errors": []}
+
+    queued_total = 0
+    running_total = 0
+    errors: List[str] = []
+
+    for snap in snaps:
+        node_stub = NodeSnapshot(
+            name=snap.name,
+            host=snap.host,
+            port=snap.port,
+            cpus=snap.cpus,
+            memory_mb=snap.memory_mb,
+        )
+        try:
+            out = client.cancel_jobs(node_stub, user_id=req.user_id, include_running=req.include_running)
+            queued_total += int(out.get("cancelled_queued", 0) or 0)
+            running_total += int(out.get("cancelled_running", 0) or 0)
+        except Exception as exc:
+            errors.append(f"{snap.name}@{snap.host}:{snap.port}: {exc}")
+
+    append_log(
+        "info",
+        "jobs",
+        "Cancel scope request",
+        {
+            "user_id": req.user_id,
+            "nodes_attempted": len(snaps),
+            "cancelled_queued": queued_total,
+            "cancelled_running": running_total,
+            "errors": errors[:10],
+        },
+    )
+
+    return {
+        "ok": len(errors) == 0,
+        "nodes_attempted": len(snaps),
+        "cancelled_queued": queued_total,
+        "cancelled_running": running_total,
+        "errors": errors,
+    }
 
 
 @app.post("/agents/learner_stats")

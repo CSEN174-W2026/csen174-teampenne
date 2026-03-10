@@ -100,7 +100,8 @@ export type RealJobStatus =
   | "running"
   | "completed"
   | "failed"
-  | "timeout";
+  | "timeout"
+  | "cancelled";
 
 export type JobExecutionRecord = {
   job_id: string;
@@ -567,4 +568,21 @@ export async function getNodeJobStatus(host: string, port: number, jobId: string
   return http<JobExecutionRecord>(
     `/nodes/job_status?host=${encodeURIComponent(host)}&port=${encodeURIComponent(port)}&job_id=${encodeURIComponent(jobId)}`
   );
+}
+
+export async function cancelScopedJobs(payload: {
+  user_id: string;
+  allowed_node_keys: string[];
+  include_running?: boolean;
+}) {
+  return http<{
+    ok: boolean;
+    nodes_attempted: number;
+    cancelled_queued: number;
+    cancelled_running: number;
+    errors: string[];
+  }>("/jobs/cancel_scope", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
 }
