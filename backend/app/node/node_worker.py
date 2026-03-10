@@ -15,20 +15,10 @@ import psutil
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-import os
-import sys
-import contextlib
-from pathlib import Path
 
 # -----------------------------
 # Models (API payloads)
 # -----------------------------
-# class SubmitJobRequest(BaseModel):
-#     job_id: str
-#     user_id: str
-#     service_time_ms: int = Field(ge=1, description="Simulated job duration")
-#     metadata: dict = {}
-
 class SubmitJobRequest(BaseModel):
     job_id: str
     user_id: str
@@ -41,14 +31,11 @@ class SubmitJobRequest(BaseModel):
     metadata: dict = Field(default_factory=dict)
 
 
-# class SubmitJobResponse(BaseModel):
-#     accepted: bool
-#     queued_at_ms: int
-
 class SubmitJobResponse(BaseModel):
     accepted: bool
     queued_at_ms: int
     status: str
+
 
 class MetricsResponse(BaseModel):
     node_time_ms: int
@@ -61,15 +48,6 @@ class MetricsResponse(BaseModel):
     completed_last_60s: int
     node_speed: Optional[float] = None
 
-
-# class JobRecord(BaseModel):
-#     job_id: str
-#     user_id: str
-#     queued_at_ms: int
-#     started_at_ms: int
-#     finished_at_ms: int
-#     observed_latency_ms: int
-#     service_time_ms: int
 
 class JobRecord(BaseModel):
     job_id: str
@@ -91,14 +69,6 @@ class JobRecord(BaseModel):
 # -----------------------------
 # Internal state
 # -----------------------------
-# @dataclass
-# class _InternalJob:
-#     job_id: str
-#     user_id: str
-#     service_time_ms: int
-#     metadata: dict
-#     queued_at_ms: int
-
 @dataclass
 class _InternalJob:
     job_id: str
@@ -125,139 +95,6 @@ _EWMA_ALPHA = 0.2
 
 JOB_RUNS_DIR = Path("./job_runs")
 JOB_RUNS_DIR.mkdir(parents=True, exist_ok=True)
-
-_job_status: Dict[str, JobRecord] = {}
-JOB_RUNS_DIR = Path("./job_runs")
-JOB_RUNS_DIR.mkdir(parents=True, exist_ok=True)
-
-def _set_job_status(job_id: str, **updates):
-    current = _job_status.get(job_id)
-    if current is None:
-        return
-    data = current.model_dump()
-    data.update(updates)
-    _job_status[job_id] = JobRecord(**data)
-
-
-async def _run_simulated_job(job: _InternalJob, started_at: int) -> JobRecord:
-    await asyncio.sleep((job.service_time_ms or 1000) / 1000.0)
-    finished_at = _now_ms()
-    observed_latency = finished_at - job.queued_at_ms
-
-    return JobRecord(
-        job_id=job.job_id,
-        user_id=job.user_id,
-        job_type="simulated",
-        script_name=None,
-        status="completed",
-        queued_at_ms=job.queued_at_ms,
-        started_at_ms=started_at,
-        finished_at_ms=finished_at,
-        observed_latency_ms=observed_latency,
-        service_time_ms=job.service_time_ms,
-        exit_code=0,
-        stdout=None,
-        stderr=None,
-        metadata=job.metadata or {},
-    )
-
-
-async def _run_python_job(job: _InternalJob, started_at: int) -> JobRecord:
-    run_dir = JOB_RUNS_DIR / job.job_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    safe_name = os.path.basename(job.script_name or "job.py")
-    if not safe_name.endswith(".py"):
-        safe_name = f"{safe_name}.py"
-
-    script_path = run_dir / safe_name
-    script_path.write_text(job.script_content or "", encoding="utf-8")
-
-    proc = None
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            str(script_path),
-            *(job.args or []),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(run_dir),
-        )
-
-        stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(),
-            timeout=job.timeout_s,
-        )
-
-        finished_at = _now_ms()
-        observed_latency = finished_at - job.queued_at_ms
-        exit_code = proc.returncode
-
-        return JobRecord(
-            job_id=job.job_id,
-            user_id=job.user_id,
-            job_type=job.job_type,
-            script_name=safe_name,
-            status="completed" if exit_code == 0 else "failed",
-            queued_at_ms=job.queued_at_ms,
-            started_at_ms=started_at,
-            finished_at_ms=finished_at,
-            observed_latency_ms=observed_latency,
-            service_time_ms=None,
-            exit_code=exit_code,
-            stdout=stdout_b.decode("utf-8", errors="replace"),
-            stderr=stderr_b.decode("utf-8", errors="replace"),
-            metadata=job.metadata or {},
-        )
-
-    except asyncio.TimeoutError:
-        if proc is not None:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-            with contextlib.suppress(Exception):
-                await proc.communicate()
-
-        finished_at = _now_ms()
-        observed_latency = finished_at - job.queued_at_ms
-
-        return JobRecord(
-            job_id=job.job_id,
-            user_id=job.user_id,
-            job_type=job.job_type,
-            script_name=safe_name,
-            status="timeout",
-            queued_at_ms=job.queued_at_ms,
-            started_at_ms=started_at,
-            finished_at_ms=finished_at,
-            observed_latency_ms=observed_latency,
-            service_time_ms=None,
-            exit_code=None,
-            stdout="",
-            stderr=f"Job timed out after {job.timeout_s} seconds",
-            metadata=job.metadata or {},
-        )
-
-    except Exception as exc:
-        finished_at = _now_ms()
-        observed_latency = finished_at - job.queued_at_ms
-
-        return JobRecord(
-            job_id=job.job_id,
-            user_id=job.user_id,
-            job_type=job.job_type,
-            script_name=safe_name,
-            status="failed",
-            queued_at_ms=job.queued_at_ms,
-            started_at_ms=started_at,
-            finished_at_ms=finished_at,
-            observed_latency_ms=observed_latency,
-            service_time_ms=None,
-            exit_code=None,
-            stdout="",
-            stderr=str(exc),
-            metadata=job.metadata or {},
-        )
-
 
 
 # -----------------------------
@@ -450,7 +287,7 @@ async def _worker_loop() -> None:
         try:
             if job.job_type == "simulated":
                 record = await _run_simulated_job(job, started_at)
-            elif job.job_type == "python":
+            elif job.job_type in {"python", "python_script", "ml_script"}:
                 record = await _run_python_job(job, started_at)
             else:
                 finished_at = _now_ms()
@@ -538,19 +375,6 @@ def get_metrics():
     )
 
 
-# @app.post("/submit", response_model=SubmitJobResponse)
-# async def submit_job(req: SubmitJobRequest):
-#     job = _InternalJob(
-#         job_id=req.job_id,
-#         user_id=req.user_id,
-#         service_time_ms=req.service_time_ms,
-#         metadata=req.metadata,
-#         queued_at_ms=_now_ms(),
-#     )
-#     await _job_queue.put(job)
-#     return SubmitJobResponse(accepted=True, queued_at_ms=job.queued_at_ms)
-
-
 @app.post("/submit", response_model=SubmitJobResponse)
 async def submit_job(req: SubmitJobRequest):
     queued_at = _now_ms()
@@ -586,6 +410,7 @@ async def submit_job(req: SubmitJobRequest):
     )
 
     await _job_queue.put(job)
+
     return SubmitJobResponse(
         accepted=True,
         queued_at_ms=queued_at,
