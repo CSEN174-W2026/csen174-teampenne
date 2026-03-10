@@ -122,6 +122,9 @@ _job_status: Dict[str, JobRecord] = {}
 
 _ewma_latency_ms: Optional[float] = None
 _EWMA_ALPHA = 0.2
+_DEFAULT_CONCURRENCY = max(2, min(8, os.cpu_count() or 2))
+WORKER_CONCURRENCY = max(1, int(os.getenv("NODE_WORKER_CONCURRENCY", str(_DEFAULT_CONCURRENCY))))
+_PROC = psutil.Process(os.getpid())
 
 JOB_RUNS_DIR = Path("./job_runs")
 JOB_RUNS_DIR.mkdir(parents=True, exist_ok=True)
@@ -305,6 +308,27 @@ def _estimate_node_speed(now_ms: int) -> Optional[float]:
             work_ms += jr.service_time_ms or 0
 
     return (work_ms / 60.0) if work_ms > 0 else None
+
+
+def _measure_node_cpu_pct() -> float:
+    """
+    Prefer process+children CPU utilization for this node worker, with
+    system CPU as fallback floor.
+    """
+    system_cpu = psutil.cpu_percent(interval=None)
+    proc_cpu = 0.0
+    child_cpu = 0.0
+
+    with contextlib.suppress(Exception):
+        proc_cpu = float(_PROC.cpu_percent(interval=None))
+
+    with contextlib.suppress(Exception):
+        for child in _PROC.children(recursive=True):
+            with contextlib.suppress(Exception):
+                child_cpu += float(child.cpu_percent(interval=None))
+
+    node_cpu = proc_cpu + child_cpu
+    return max(0.0, min(100.0, max(system_cpu, node_cpu)))
 
 
 # -----------------------------
@@ -496,13 +520,23 @@ async def _worker_loop() -> None:
 # -----------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    worker_task = asyncio.create_task(_worker_loop())
+    # Prime psutil CPU counters so first metrics sample is meaningful.
+    with contextlib.suppress(Exception):
+        psutil.cpu_percent(interval=None)
+        _PROC.cpu_percent(interval=None)
+        for child in _PROC.children(recursive=True):
+            with contextlib.suppress(Exception):
+                child.cpu_percent(interval=None)
+
+    worker_tasks = [asyncio.create_task(_worker_loop()) for _ in range(WORKER_CONCURRENCY)]
     try:
         yield
     finally:
-        worker_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
+        for task in worker_tasks:
+            task.cancel()
+        for task in worker_tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 app = FastAPI(title="CSEN174 Node Agent", lifespan=lifespan)
@@ -512,7 +546,7 @@ app = FastAPI(title="CSEN174 Node Agent", lifespan=lifespan)
 def get_metrics():
     now = _now_ms()
 
-    cpu = psutil.cpu_percent(interval=0.1)
+    cpu = _measure_node_cpu_pct()
     mem = psutil.virtual_memory().percent
 
     latencies = [
