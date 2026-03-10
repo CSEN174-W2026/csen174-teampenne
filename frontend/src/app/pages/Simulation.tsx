@@ -12,9 +12,21 @@ import {
   Trophy,
   History,
   Activity,
+  FileCode2,
 } from "lucide-react";
 import { motion as Motion, AnimatePresence } from "motion/react";
-import { BarChart, Bar, XAxis, YAxis, ResponsiveContainer, Cell, LineChart, Tooltip, Legend, Line } from "recharts";
+import {
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  ResponsiveContainer,
+  Cell,
+  LineChart,
+  Tooltip,
+  Legend,
+  Line,
+} from "recharts";
 
 import {
   explainSimulation,
@@ -25,11 +37,12 @@ import {
   getPending,
   getLatencyStats,
   getStats,
-  // (optional) resetManager if you added it
   resetManager,
   getRecentExplanations,
+  getNodeJobStatus,
   type AgentConfig,
   type NodeGroup,
+  type JobExecutionRecord,
 } from "../../lib/api";
 
 type Json = Record<string, any>;
@@ -58,12 +71,12 @@ interface NodeUI {
 
 interface PolicyStatUI {
   policy: Policy;
-  completedTasks: number; // observed completed jobs for this policy (from latency_stats[p].n)
-  totalLatency: number; // ms
-  avgLatency: number; // ms
-  recentLatency: number[]; // last N
-  reward: number; // learner estimated reward / value for this policy
-  selectionPct: number; // 0..100 based on completedTasks / totalCompleted
+  completedTasks: number;
+  totalLatency: number;
+  avgLatency: number;
+  recentLatency: number[];
+  reward: number;
+  selectionPct: number;
 }
 
 interface AgentState {
@@ -73,98 +86,16 @@ interface AgentState {
   status: "exploring" | "optimizing" | "monitoring";
 }
 
-type ExplainOption = {
-  value: string;
-  label: string;
-  description: string;
+type RealJobUI = JobExecutionRecord & {
+  node_host?: string | null;
+  node_port?: number | null;
 };
 
-function HoverExplainSelect({
-  label,
-  value,
-  onChange,
-  options,
-}: {
-  label: string;
-  value: string;
-  onChange: (next: string) => void;
-  options: ExplainOption[];
-}) {
-  const [open, setOpen] = useState(false);
-  const [hovered, setHovered] = useState<ExplainOption | null>(null);
-  const rootRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    const onDocMouseDown = (ev: MouseEvent) => {
-      if (!rootRef.current) return;
-      if (!rootRef.current.contains(ev.target as Node)) {
-        setOpen(false);
-        setHovered(null);
-      }
-    };
-    document.addEventListener("mousedown", onDocMouseDown);
-    return () => document.removeEventListener("mousedown", onDocMouseDown);
-  }, []);
-
-  const selected = options.find((o) => o.value === value) ?? options[0];
-  const shown = hovered ?? selected;
-
-  return (
-    <div className="space-y-2" ref={rootRef}>
-      <label className="text-sm font-medium text-neutral-400">{label}</label>
-      <div className="relative">
-        <button
-          type="button"
-          onClick={() => setOpen((v) => !v)}
-          className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-200 flex items-center justify-between hover:border-neutral-700 transition-colors"
-        >
-          <span>{selected?.label ?? value}</span>
-          <span className="text-neutral-500">{open ? "▴" : "▾"}</span>
-        </button>
-
-        {open ? (
-          <div className="absolute left-0 right-0 top-full mt-1 z-[85] rounded-xl border border-neutral-700 bg-neutral-950 shadow-2xl overflow-hidden">
-            {options.map((o) => (
-              <button
-                key={o.value}
-                type="button"
-                onMouseEnter={() => setHovered(o)}
-                onClick={() => {
-                  onChange(o.value);
-                  setOpen(false);
-                  setHovered(null);
-                }}
-                className={`w-full text-left px-3 py-2 text-sm transition-colors ${
-                  value === o.value
-                    ? "bg-indigo-500/20 text-indigo-300"
-                    : "text-neutral-200 hover:bg-neutral-800"
-                }`}
-              >
-                {o.label}
-              </button>
-            ))}
-          </div>
-        ) : null}
-
-        {open ? (
-          <div className="pointer-events-none absolute left-full top-0 ml-3 z-[90] w-96 rounded-xl border border-neutral-700 bg-neutral-900/95 backdrop-blur p-4 shadow-2xl">
-            <div className="text-[11px] uppercase tracking-wider text-indigo-300 font-semibold">
-              {label} Details
-            </div>
-            <div className="mt-1 text-sm text-neutral-100 font-semibold">{shown?.label}</div>
-            <div className="mt-2 text-sm leading-relaxed text-neutral-300">{shown?.description}</div>
-          </div>
-        ) : null}
-      </div>
-    </div>
-  );
-}
-
 const POLICY_COLORS: Record<Policy, string> = {
-  "round-robin": "#6366f1",     // indigo
-  "least-loaded": "#10b981",    // emerald
-  "resource-aware": "#a855f7",  // purple
-  random: "#f59e0b",            // amber
+  "round-robin": "#6366f1",
+  "least-loaded": "#10b981",
+  "resource-aware": "#a855f7",
+  random: "#f59e0b",
 };
 
 function nowMs() {
@@ -192,20 +123,18 @@ function normalizePolicyKey(k: string): string {
 function backendKeyToUiPolicy(k: string): Policy | null {
   const kk = normalizePolicyKey(k);
   if (kk.includes("round") && kk.includes("robin")) return "round-robin";
-  if (kk.includes("least") && (kk.includes("load") || kk.includes("loaded")))
+  if (kk.includes("least") && (kk.includes("load") || kk.includes("loaded"))) {
     return "least-loaded";
-  if (kk.includes("resource") && (kk.includes("aware") || kk.includes("awareness")))
+  }
+  if (kk.includes("resource") && (kk.includes("aware") || kk.includes("awareness"))) {
     return "resource-aware";
+  }
   if (kk.includes("random")) return "random";
   return null;
 }
 
-// Rewards from learner_stats
 function extractReward(stat: any): number {
   if (!stat || typeof stat !== "object") return 0;
-  // common keys from your learners:
-  // - SampleAverage / EMA / UCB1: { n, Q }
-  // - Thompson: { n, mean, std }
   if (typeof stat.mean_reward === "number") return stat.mean_reward;
   if (typeof stat.Q === "number") return stat.Q;
   if (typeof stat.mean === "number") return stat.mean;
@@ -213,7 +142,6 @@ function extractReward(stat: any): number {
   return 0;
 }
 
-// Latency stats from ManagerAgent.latency_stats(): { policy: {n,total_latency_ms,avg_latency_ms} }
 function buildPolicyStatsFromBackend(
   learnerStats: Record<string, any>,
   latencyStats: Record<string, any>,
@@ -223,7 +151,6 @@ function buildPolicyStatsFromBackend(
 ): Record<Policy, PolicyStatUI> {
   const next: Record<Policy, PolicyStatUI> = { ...prev };
 
-  // 1) apply latency stats (real observed)
   for (const [k, v] of Object.entries(latencyStats || {})) {
     const ui = backendKeyToUiPolicy(k);
     if (!ui) continue;
@@ -249,7 +176,6 @@ function buildPolicyStatsFromBackend(
     };
   }
 
-  // 2) apply reward stats (learner estimates)
   for (const [k, v] of Object.entries(learnerStats || {})) {
     const ui = backendKeyToUiPolicy(k);
     if (!ui) continue;
@@ -261,19 +187,6 @@ function buildPolicyStatsFromBackend(
     };
   }
 
-  // 2b) apply realized goal rewards (preferred over learner estimates)
-  for (const [k, v] of Object.entries(rewardStats || {})) {
-    const ui = backendKeyToUiPolicy(k);
-    if (!ui) continue;
-    const avgReward = typeof (v as any)?.avg_reward === "number" ? (v as any).avg_reward : undefined;
-    if (typeof avgReward !== "number" || !Number.isFinite(avgReward)) continue;
-    next[ui] = {
-      ...next[ui],
-      reward: avgReward,
-    };
-  }
-
-  // 3) selection frequency (%)
   const active = selectedPolicies.length ? selectedPolicies : (Object.keys(next) as Policy[]);
   const totalCompleted = active.reduce((acc, p) => acc + (next[p]?.completedTasks || 0), 0);
 
@@ -285,7 +198,6 @@ function buildPolicyStatsFromBackend(
     };
   }
 
-  // for policies not active, set pct 0
   const all: Policy[] = ["round-robin", "least-loaded", "resource-aware", "random"];
   for (const p of all) {
     if (!active.includes(p)) next[p] = { ...next[p], selectionPct: 0 };
@@ -297,7 +209,6 @@ function buildPolicyStatsFromBackend(
 export function Simulation() {
   const [isRunning, setIsRunning] = useState(false);
 
-  // ---- NEW: Explanation modal state ----
   const [explainOpen, setExplainOpen] = useState(false);
   const [currentExplanation, setCurrentExplanation] = useState<any | null>(null);
   const [latestExplanation, setLatestExplanation] = useState<any | null>(null);
@@ -310,24 +221,21 @@ export function Simulation() {
   const [policy, setPolicy] = useState<ManualOverridePolicy>("none");
 
   type RewardPoint = {
-  t: number;
-  [policy: string]: number;
+    t: number;
+    [policy: string]: number;
   };
   const [rewardHistory, setRewardHistory] = useState<RewardPoint[]>([]);
   const [seenPolicies, setSeenPolicies] = useState<Set<Policy>>(new Set());
 
-  // DISPLAY as the current routing strategy
-  // - In manual mode: follows `policy`
-  // - In agent mode: updated from backend submit response decision
   const [currentRouteStrategy, setCurrentRouteStrategy] = useState<Policy>("round-robin");
 
-  // track which node was chosen by the backend for the last submitted job
   const [lastChosenNodeId, setLastChosenNodeId] = useState<string | null>(null);
   const [lastChosenNodeLabel, setLastChosenNodeLabel] = useState<string>("—");
 
   const [simulationSpeed, setSimulationSpeed] = useState(1);
 
   const [nodes, setNodes] = useState<NodeUI[]>([]);
+  const [rawNodes, setRawNodes] = useState<any[]>([]);
 
   const [incomingJobs, setIncomingJobs] = useState(0);
   const [submittedJobs, setSubmittedJobs] = useState(0);
@@ -383,6 +291,14 @@ export function Simulation() {
   const [overallLatencyTrail, setOverallLatencyTrail] = useState<number[]>([]);
 
   const [manualTask, setManualTask] = useState({ cpu: 20, mem: 128, duration: 10 });
+
+  const [uploadedFileName, setUploadedFileName] = useState("");
+  const [uploadedScript, setUploadedScript] = useState("");
+  const [scriptArgs, setScriptArgs] = useState("");
+  const [scriptTimeoutS, setScriptTimeoutS] = useState(60);
+  const [realJobError, setRealJobError] = useState<string | null>(null);
+  const [submittingRealJob, setSubmittingRealJob] = useState(false);
+  const [realJobs, setRealJobs] = useState<RealJobUI[]>([]);
 
   const POLICY_OPTIONS: { ui: Policy; backend: string; label: string }[] = useMemo(
     () => [
@@ -470,7 +386,6 @@ export function Simulation() {
       (p) => p.backend
     );
 
-    // IMPORTANT: your ManagerAgent only reads learner_kwargs.policy_allowlist
     const learner_kwargs: Json = {
       policy_allowlist: backendPolicies,
     };
@@ -505,6 +420,7 @@ export function Simulation() {
   const [nodeGroups, setNodeGroups] = useState<NodeGroup[]>([]);
   const [selectedSimulationGroupId, setSelectedSimulationGroupId] = useState<number | null>(null);
   const [scopeError, setScopeError] = useState<string | null>(null);
+
   const connectedStorageKey = useMemo(
     () => `nodes.connected.${user?.id ?? "anonymous"}`,
     [user?.id]
@@ -624,9 +540,10 @@ export function Simulation() {
   const pollNodes = useCallback(async () => {
     try {
       const nodesResp = await getNodes();
-      const rawNodes = nodesResp.nodes || [];
+      const fetchedRawNodes = nodesResp.nodes || [];
       const connectedSet = new Set<string>(connectedNodeKeys.map((k) => normalizeNodeKey(k)));
-      const filteredRaw = rawNodes.filter((n: any) => {
+
+      const filteredRaw = fetchedRawNodes.filter((n: any) => {
         const hostPort = normalizeNodeKey(`${n?.host}:${n?.port}`);
         const name = normalizeNodeKey(n?.name);
         const instanceId = normalizeNodeKey(n?.instance_id);
@@ -640,12 +557,15 @@ export function Simulation() {
         );
       });
 
+      setRawNodes(filteredRaw);
+
       const mapped: NodeUI[] = filteredRaw.map((n: any) => {
         const cpuPct = safePct(n.cpu_pct);
         const memPct = safePct(n.mem_pct);
         const cpuCap = 100;
         const memCap = 100;
         const online = !(n as any).error && (n.cpu_pct != null || n.mem_pct != null);
+
         const hostPort = normalizeNodeKey(`${n?.host}:${n?.port}`);
         const name = normalizeNodeKey(n?.name);
         const instanceId = normalizeNodeKey(n?.instance_id);
@@ -655,6 +575,7 @@ export function Simulation() {
           connectedSet.has(name) ||
           connectedSet.has(instanceId) ||
           connectedSet.has(hostPortName);
+
         return {
           id: `${n.host}:${n.port}`,
           name: (n.name ?? `${n.host}:${n.port}`).toLowerCase(),
@@ -676,8 +597,10 @@ export function Simulation() {
           status: online && isUserConnected ? "active" : "offline",
         };
       });
+
       setNodes(mapped);
     } catch {
+      setRawNodes([]);
       setNodes([]);
     }
   }, [allowedNodeKeys, connectedNodeKeys]);
@@ -698,6 +621,7 @@ export function Simulation() {
           return;
         }
       }
+
       const manualPolicyBackend =
         policy === "none" ? null : POLICY_OPTIONS.find((p) => p.ui === policy)?.backend ?? null;
 
@@ -712,20 +636,15 @@ export function Simulation() {
           selected_group_id: selectedSimulationGroup?.id ?? null,
           selected_group_name: selectedSimulationGroup?.name ?? null,
           allowed_node_keys: Array.from(allowedNodeKeys),
-
-          // backend expects underscore keys
           manual_policy: isAgentControlled ? null : manualPolicyBackend,
-
           ...metadata,
         },
       };
 
       try {
-        // capture response so we can display the backend’s chosen policy
         const resp: any = await submitJob({ config: agentConfig, job });
         setSubmittedJobs((p) => p + 1);
 
-        // extract chosen node from response and store for UI highlight
         const host = resp?.decision?.node?.host ?? resp?.decision?.host ?? null;
         const port = resp?.decision?.node?.port ?? resp?.decision?.port ?? null;
         const nodeName = resp?.decision?.node?.name ?? resp?.decision?.node_name ?? null;
@@ -742,8 +661,7 @@ export function Simulation() {
           setLastChosenNodeLabel("—");
         }
 
-        // Update the displayed route strategy
-        if (isAgentControlled || policy === "none") {
+        if (isAgentControlled) {
           const chosen =
             resp?.decision?.policy ??
             resp?.decision?.policy_name ??
@@ -772,10 +690,142 @@ export function Simulation() {
       selectedSimulationGroup?.id,
       selectedSimulationGroup?.name,
       allowedNodeKeys,
-      setScopeError,
+      userId,
       serviceTimeMsFromCpu,
     ]
   );
+
+  const onPythonFileSelected = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+
+      if (!file.name.toLowerCase().endsWith(".py")) {
+        setRealJobError("Please upload a .py file");
+        return;
+      }
+
+      try {
+        const text = await file.text();
+        setUploadedFileName(file.name);
+        setUploadedScript(text);
+        setRealJobError(null);
+      } catch (err) {
+        console.error("Failed to read uploaded file:", err);
+        setRealJobError("Failed to read the uploaded file");
+      }
+    },
+    []
+  );
+
+  const submitRealJob = useCallback(async () => {
+    if (!uploadedScript.trim()) {
+      setRealJobError("Upload a Python script first.");
+      return;
+    }
+
+    if (nodeGroups.length > 0) {
+      if (!selectedSimulationGroup) {
+        setRealJobError("Select a node group before submitting real jobs.");
+        return;
+      }
+      if (allowedNodeKeys.size === 0) {
+        setRealJobError("No connected nodes in this group. Connect group nodes first.");
+        return;
+      }
+    }
+
+    const manualPolicyBackend =
+      POLICY_OPTIONS.find((p) => p.ui === policy)?.backend ?? "round_robin";
+
+    const jobId = mkJobId();
+
+    const job = {
+      job_id: jobId,
+      user_id: userId,
+      job_type: "python_script" as const,
+      script_name: uploadedFileName || "job.py",
+      script_content: uploadedScript,
+      args: scriptArgs
+        .split(" ")
+        .map((x) => x.trim())
+        .filter(Boolean),
+      timeout_s: scriptTimeoutS,
+      metadata: {
+        selected_group_id: selectedSimulationGroup?.id ?? null,
+        selected_group_name: selectedSimulationGroup?.name ?? null,
+        allowed_node_keys: Array.from(allowedNodeKeys),
+        manual_policy: isAgentControlled ? null : manualPolicyBackend,
+      },
+    };
+
+    try {
+      setSubmittingRealJob(true);
+      setRealJobError(null);
+
+      const resp: any = await submitJob({ config: agentConfig, job });
+
+      const host =
+        resp?.node_response?.node_host ??
+        resp?.decision?.node?.host ??
+        resp?.decision?.host ??
+        null;
+
+      const port =
+        resp?.node_response?.node_port ??
+        resp?.decision?.node?.port ??
+        resp?.decision?.port ??
+        null;
+
+      const nodeName =
+        resp?.node_response?.node_name ??
+        resp?.decision?.node?.name ??
+        resp?.decision?.node_name ??
+        null;
+
+      setRealJobs((prev) => [
+        {
+          job_id: jobId,
+          user_id: userId,
+          job_type: "python_script",
+          script_name: uploadedFileName || "job.py",
+          status: "queued",
+          queued_at_ms: Date.now(),
+          started_at_ms: null,
+          finished_at_ms: null,
+          observed_latency_ms: null,
+          service_time_ms: null,
+          exit_code: null,
+          stdout: null,
+          stderr: null,
+          node_name: nodeName ?? null,
+          node_host: host ?? null,
+          node_port: port ?? null,
+        },
+        ...prev,
+      ]);
+    } catch (err: any) {
+      console.error("submitRealJob failed:", err);
+      setRealJobError(err?.message ?? "Failed to submit real job");
+    } finally {
+      setSubmittingRealJob(false);
+    }
+  }, [
+    uploadedScript,
+    uploadedFileName,
+    scriptArgs,
+    scriptTimeoutS,
+    nodeGroups.length,
+    selectedSimulationGroup,
+    selectedSimulationGroup?.id,
+    selectedSimulationGroup?.name,
+    allowedNodeKeys,
+    policy,
+    isAgentControlled,
+    agentConfig,
+    userId,
+    POLICY_OPTIONS,
+  ]);
 
   const spikeLoad = useCallback(async () => {
     setSpikeEvents((v) => v + 1);
@@ -785,13 +835,11 @@ export function Simulation() {
     }
   }, [submitOneJob]);
 
-  // ---- explanation polling helpers ----
   const fetchLatestExplanation = useCallback(async () => {
     try {
       const data = await getRecentExplanations(agentConfig, 25);
       const events: any[] = data?.events ?? [];
 
-      // Only use real switch events with text
       const last =
         [...events]
           .sort((a, b) => (a.t_ms ?? 0) - (b.t_ms ?? 0))
@@ -817,10 +865,8 @@ export function Simulation() {
     const ev = await fetchLatestExplanation();
     const t = Number(ev?.t_ms ?? 0);
     if (!ev || !t) return;
-
     if (t <= lastExplainTmsRef.current) return;
 
-    // New explanation detected -> pause sim and show modal
     lastExplainTmsRef.current = t;
     resumeRunningRef.current = isRunning;
 
@@ -834,11 +880,10 @@ export function Simulation() {
     setExplainOpen(false);
     setCurrentExplanation(null);
     if (resumeRunningRef.current) setIsRunning(true);
-    resumeRunningRef.current = false; // ✅ important
+    resumeRunningRef.current = false;
   }, []);
 
   const pollManager = useCallback(async () => {
-    // Stats
     try {
       let pendingIds: string[] = [];
       let learnerStats: Record<string, any> = {};
@@ -864,27 +909,19 @@ export function Simulation() {
       setIncomingJobs(pendingIds.length);
 
       setPolicyStats((prev) => {
-        const next = buildPolicyStatsFromBackend(
-          learnerStats,
-          latencyStats,
-          rewardStats,
-          prev,
-          selectedPolicies
+        const next = buildPolicyStatsFromBackend(learnerStats, latencyStats, prev, selectedPolicies);
+
+        const usedNow = (selectedPolicies as Policy[]).filter(
+          (p) => (next[p]?.completedTasks ?? 0) > 0
         );
 
-        // policies that have actually been used at least once
-        const usedNow = (selectedPolicies as Policy[]).filter((p) => (next[p]?.completedTasks ?? 0) > 0);
-
-        // update seen policies
         setSeenPolicies((old) => {
           const s = new Set(old);
           usedNow.forEach((p) => s.add(p));
           return s;
         });
 
-        // append reward history point (only for used policies)
         setRewardHistory((h) => {
-          // use "usedNow" if any exists; otherwise keep previous seen policies
           const keys = usedNow.length > 0 ? usedNow : Array.from(seenPolicies);
 
           const point: RewardPoint = { t: h.length };
@@ -898,9 +935,12 @@ export function Simulation() {
         return next;
       });
 
-      const backendOverall = typeof summary?.mean_latency_ms === "number" ? summary.mean_latency_ms : 0;
+      const backendOverall =
+        typeof summary?.mean_latency_ms === "number" ? summary.mean_latency_ms : 0;
       setOverallAvgLatencyMs(backendOverall);
-      if (backendOverall > 0) setOverallLatencyTrail((prev) => [...prev, backendOverall].slice(-25));
+      if (backendOverall > 0) {
+        setOverallLatencyTrail((prev) => [...prev, backendOverall].slice(-25));
+      }
 
       setAgent((prev) => {
         const nextExploration = isAgentControlled
@@ -910,23 +950,71 @@ export function Simulation() {
           ...prev,
           isActive: isAgentControlled,
           explorationRate: nextExploration,
-          status: isAgentControlled ? (nextExploration > 0.2 ? "exploring" : "optimizing") : "monitoring",
+          status: isAgentControlled
+            ? nextExploration > 0.2
+              ? "exploring"
+              : "optimizing"
+            : "monitoring",
           lastDecisionTime: nowMs(),
         };
       });
 
-      // 3) Explanation: if agent produced a new explanation, pause and show it
       await maybePauseForExplanation();
     } catch {
       setIncomingJobs(0);
     }
-  }, [agentConfig, isAgentControlled, selectedPolicies, maybePauseForExplanation]);
+  }, [agentConfig, isAgentControlled, selectedPolicies, maybePauseForExplanation, seenPolicies]);
 
   useEffect(() => {
     void pollNodes();
     const id = window.setInterval(() => void pollNodes(), 2000);
     return () => window.clearInterval(id);
   }, [pollNodes]);
+
+  useEffect(() => {
+    if (realJobs.length === 0) return;
+
+    const id = window.setInterval(async () => {
+      const next = await Promise.all(
+        realJobs.map(async (job) => {
+          if (!job) return job;
+          if (job.status !== "queued" && job.status !== "running") return job;
+
+          let host = job.node_host;
+          let port = job.node_port;
+
+          if ((!host || !port) && job.node_name) {
+            const fallback = rawNodes.find(
+              (n: any) =>
+                String(n?.name ?? "").toLowerCase() === String(job.node_name ?? "").toLowerCase()
+            );
+            if (fallback) {
+              host = fallback.host;
+              port = fallback.port;
+            }
+          }
+
+          if (!host || !port) return job;
+
+          try {
+            const fresh = await getNodeJobStatus(host, port, job.job_id);
+            return {
+              ...job,
+              ...fresh,
+              node_host: host,
+              node_port: port,
+            };
+          } catch {
+            return job;
+          }
+        })
+      );
+
+      setRealJobs(next);
+    }, 2000);
+
+    return () => window.clearInterval(id);
+  }, [realJobs, rawNodes]);
 
   const submitIntervalRef = useRef<number | null>(null);
   const pollIntervalRef = useRef<number | null>(null);
@@ -942,13 +1030,13 @@ export function Simulation() {
 
     if (simStartMsRef.current == null) simStartMsRef.current = nowMs();
 
-    pollManager();
-    pollIntervalRef.current = window.setInterval(() => pollManager(), 1500);
+    void pollManager();
+    pollIntervalRef.current = window.setInterval(() => void pollManager(), 1500);
 
     const jobsPerSec = Math.max(0, Number(simulationSpeed) || 0);
     if (jobsPerSec > 0) {
       const intervalMs = Math.max(50, Math.floor(1000 / jobsPerSec));
-      submitIntervalRef.current = window.setInterval(() => submitOneJob(), intervalMs);
+      submitIntervalRef.current = window.setInterval(() => void submitOneJob(), intervalMs);
     }
 
     return () => {
@@ -958,7 +1046,7 @@ export function Simulation() {
       pollIntervalRef.current = null;
     };
   }, [isRunning, pollManager, submitOneJob, simulationSpeed]);
-  
+
   const resetSimulation = () => {
     setIsRunning(false);
     setIsAgentControlled(false);
@@ -971,23 +1059,66 @@ export function Simulation() {
     setSeenPolicies(new Set());
     setPolicy("none");
     setCurrentRouteStrategy("round-robin");
-
     setLastChosenNodeId(null);
     setLastChosenNodeLabel("—");
+    setScopeError(null);
+
+    setUploadedFileName("");
+    setUploadedScript("");
+    setScriptArgs("");
+    setScriptTimeoutS(60);
+    setRealJobError(null);
+    setSubmittingRealJob(false);
+    setRealJobs([]);
 
     setPolicyStats({
-      "round-robin": { policy: "round-robin", completedTasks: 0, totalLatency: 0, avgLatency: 0, recentLatency: [], reward: 0, selectionPct: 0 },
-      "least-loaded": { policy: "least-loaded", completedTasks: 0, totalLatency: 0, avgLatency: 0, recentLatency: [], reward: 0, selectionPct: 0 },
-      "resource-aware": { policy: "resource-aware", completedTasks: 0, totalLatency: 0, avgLatency: 0, recentLatency: [], reward: 0, selectionPct: 0 },
-      random: { policy: "random", completedTasks: 0, totalLatency: 0, avgLatency: 0, recentLatency: [], reward: 0, selectionPct: 0 },
+      "round-robin": {
+        policy: "round-robin",
+        completedTasks: 0,
+        totalLatency: 0,
+        avgLatency: 0,
+        recentLatency: [],
+        reward: 0,
+        selectionPct: 0,
+      },
+      "least-loaded": {
+        policy: "least-loaded",
+        completedTasks: 0,
+        totalLatency: 0,
+        avgLatency: 0,
+        recentLatency: [],
+        reward: 0,
+        selectionPct: 0,
+      },
+      "resource-aware": {
+        policy: "resource-aware",
+        completedTasks: 0,
+        totalLatency: 0,
+        avgLatency: 0,
+        recentLatency: [],
+        reward: 0,
+        selectionPct: 0,
+      },
+      random: {
+        policy: "random",
+        completedTasks: 0,
+        totalLatency: 0,
+        avgLatency: 0,
+        recentLatency: [],
+        reward: 0,
+        selectionPct: 0,
+      },
     });
+
     setAgent({
       isActive: false,
       explorationRate: 1.0,
       lastDecisionTime: Date.now(),
       status: "exploring",
     });
+
     setNodes([]);
+    setRawNodes([]);
 
     resetManager()
       .then(() => pollManager())
@@ -1128,7 +1259,6 @@ export function Simulation() {
 
   return (
     <div className="space-y-8 pb-12">
-      {/* ------------------ Explanation Modal ------------------ */}
       <AnimatePresence>
         {explainOpen && currentExplanation ? (
           <Motion.div
@@ -1160,14 +1290,14 @@ export function Simulation() {
                   {currentExplanation?.text ?? "(no explanation text)"}
                 </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs text-neutral-300">
+                <div className="grid grid-cols-1 gap-3 text-xs text-neutral-300 md:grid-cols-3">
                   <div className="rounded-xl border border-white/10 bg-white/5 p-3">
                     <div className="text-neutral-400">Job</div>
-                    <div className="mt-1 font-mono break-all">{currentExplanation?.job_id ?? "—"}</div>
+                    <div className="mt-1 break-all font-mono">{currentExplanation?.job_id ?? "—"}</div>
                   </div>
                   <div className="rounded-xl border border-white/10 bg-white/5 p-3">
                     <div className="text-neutral-400">Node</div>
-                    <div className="mt-1 font-mono break-all">{currentExplanation?.node ?? "—"}</div>
+                    <div className="mt-1 break-all font-mono">{currentExplanation?.node ?? "—"}</div>
                   </div>
                   <div className="rounded-xl border border-white/10 bg-white/5 p-3">
                     <div className="text-neutral-400">Reward / Latency</div>
@@ -1185,7 +1315,7 @@ export function Simulation() {
                 </div>
 
                 <details className="rounded-xl border border-white/10 bg-white/5 p-3">
-                  <summary className="cursor-pointer text-xs text-neutral-300 select-none">
+                  <summary className="cursor-pointer select-none text-xs text-neutral-300">
                     Raw metadata (for debugging)
                   </summary>
                   <pre className="mt-2 max-h-56 overflow-auto text-[11px] leading-snug text-neutral-400">
@@ -1204,7 +1334,7 @@ export function Simulation() {
 
               <div className="flex items-center justify-end gap-2 border-t border-white/10 px-5 py-4">
                 <button
-                  className="rounded-xl bg-white text-black px-4 py-2 text-sm font-semibold hover:opacity-90"
+                  className="rounded-xl bg-white px-4 py-2 text-sm font-semibold text-black hover:opacity-90"
                   onClick={continueAfterExplanation}
                 >
                   Continue
@@ -1215,47 +1345,41 @@ export function Simulation() {
         ) : null}
       </AnimatePresence>
 
-      {/* ------------------ Original page below ------------------ */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+      <div className="flex flex-col justify-between gap-4 md:flex-row md:items-center">
         <div>
           <h1 className="text-3xl font-bold tracking-tight">Agentic Resource Simulator</h1>
-          <p className="text-neutral-400 mt-1">
+          <p className="mt-1 text-neutral-400">
             A manager agent that learns the optimal routing policy to minimize latency.
           </p>
-          <p className="text-neutral-500 mt-1 text-xs">
+          <p className="mt-1 text-xs text-neutral-500">
             {selectedSimulationGroup
               ? `Group: ${selectedSimulationGroup.name} • connected+visible nodes: ${nodes.length}`
               : `Connected nodes visible to this user: ${nodes.length}`}
           </p>
-          {scopeError ? <p className="text-rose-400 mt-1 text-xs">{scopeError}</p> : null}
+          {scopeError ? <p className="mt-1 text-xs text-rose-400">{scopeError}</p> : null}
         </div>
 
-        <div className="flex items-center gap-3 bg-neutral-900 border border-neutral-800 p-2 rounded-xl">
+        <div className="flex items-center gap-3 rounded-xl border border-neutral-800 bg-neutral-900 p-2">
           <button
             onClick={() => {
               setIsAgentControlled(!isAgentControlled);
               if (!isRunning) setIsRunning(true);
 
-              if (!isAgentControlled) {
-                // turning ON agent: backend will update route strategy on submit
-              } else {
-                // turning OFF agent: display manual policy
-                if (policy !== "none") {
-                  setCurrentRouteStrategy(policy);
-                }
+              if (isAgentControlled) {
+                setCurrentRouteStrategy(policy);
               }
             }}
-            className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-all ${
+            className={`flex items-center gap-2 rounded-lg px-4 py-2 font-medium transition-all ${
               isAgentControlled
                 ? "bg-purple-500 text-white shadow-lg shadow-purple-500/20"
                 : "bg-neutral-800 text-neutral-400 hover:text-white"
             }`}
           >
-            <Cpu className="w-4 h-4" />
+            <Cpu className="h-4 w-4" />
             {isAgentControlled ? "Agent Running" : "Enable Manager Agent"}
           </button>
 
-          <div className="h-6 w-px bg-neutral-800 mx-1" />
+          <div className="mx-1 h-6 w-px bg-neutral-800" />
 
           <button
             onClick={() => {
@@ -1278,53 +1402,52 @@ export function Simulation() {
               }
               setIsRunning(false);
             }}
-            className={`flex items-center gap-2 px-4 py-2 rounded-lg font-medium transition-all ${
+            className={`flex items-center gap-2 rounded-lg px-4 py-2 font-medium transition-all ${
               isRunning
                 ? "bg-amber-500/10 text-amber-500 hover:bg-amber-500/20"
-                : "bg-indigo-600 text-white hover:bg-indigo-700 shadow-lg shadow-indigo-500/20"
+                : "bg-indigo-600 text-white shadow-lg shadow-indigo-500/20 hover:bg-indigo-700"
             }`}
           >
             {isRunning ? (
-              <Pause className="w-4 h-4 fill-current" />
+              <Pause className="h-4 w-4 fill-current" />
             ) : (
-              <Play className="w-4 h-4 fill-current" />
+              <Play className="h-4 w-4 fill-current" />
             )}
             {isRunning ? "Pause" : "Start Sim"}
           </button>
 
           <button
             onClick={resetSimulation}
-            className="p-2 text-neutral-400 hover:text-white hover:bg-neutral-800 rounded-lg transition-colors"
+            className="rounded-lg p-2 text-neutral-400 transition-colors hover:bg-neutral-800 hover:text-white"
           >
-            <RotateCcw className="w-4 h-4" />
+            <RotateCcw className="h-4 w-4" />
           </button>
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-        {/* Sidebar */}
-        <div className="lg:col-span-1 space-y-6 relative z-[70]">
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-4">
+        <div className="space-y-6 lg:col-span-1">
           <AnimatePresence>
             {isAgentControlled && (
               <Motion.div
                 initial={{ opacity: 0, y: -20 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -20 }}
-                className="bg-purple-950/20 border border-purple-500/30 rounded-2xl p-6 relative overflow-hidden group"
+                className="group relative overflow-hidden rounded-2xl border border-purple-500/30 bg-purple-950/20 p-6"
               >
-                <div className="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
-                  <Cpu className="w-12 h-12 text-purple-400" />
+                <div className="absolute right-0 top-0 p-4 opacity-10 transition-opacity group-hover:opacity-20">
+                  <Cpu className="h-12 w-12 text-purple-400" />
                 </div>
 
-                <div className="flex items-center gap-2 mb-4">
-                  <div className="w-2 h-2 rounded-full bg-purple-400 animate-pulse" />
+                <div className="mb-4 flex items-center gap-2">
+                  <div className="h-2 w-2 animate-pulse rounded-full bg-purple-400" />
                   <h3 className="font-semibold text-purple-300">Agent Intelligence</h3>
                 </div>
 
-                <div className="space-y-4 relative z-10">
-                  <div className="flex justify-between items-center text-xs">
-                    <span className="text-purple-400 uppercase font-bold tracking-tighter">Status</span>
-                    <span className="text-white capitalize px-2 py-0.5 rounded bg-purple-500/40 border border-purple-400/30">
+                <div className="relative z-10 space-y-4">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-bold uppercase tracking-tighter text-purple-400">Status</span>
+                    <span className="rounded border border-purple-400/30 bg-purple-500/40 px-2 py-0.5 capitalize text-white">
                       {agent.status}
                     </span>
                   </div>
@@ -1334,7 +1457,7 @@ export function Simulation() {
                       <span>Exploration Rate</span>
                       <span className="font-mono">{(agent.explorationRate * 100).toFixed(0)}%</span>
                     </div>
-                    <div className="h-1 bg-purple-900/50 rounded-full overflow-hidden">
+                    <div className="h-1 overflow-hidden rounded-full bg-purple-900/50">
                       <Motion.div
                         animate={{ width: `${agent.explorationRate * 100}%` }}
                         className="h-full bg-purple-400"
@@ -1342,9 +1465,8 @@ export function Simulation() {
                     </div>
                   </div>
 
-                  {/* show selection frequency + reward */}
-                  <div className="space-y-2 pt-2 border-t border-purple-500/20">
-                    <p className="text-[10px] text-purple-400 uppercase font-bold mb-2">
+                  <div className="space-y-2 border-t border-purple-500/20 pt-2">
+                    <p className="mb-2 text-[10px] font-bold uppercase text-purple-400">
                       Policy Reward + Selection
                     </p>
 
@@ -1356,14 +1478,18 @@ export function Simulation() {
                       return (
                         <div key={p} className="space-y-1">
                           <div className="flex justify-between text-[10px]">
-                            <span className={`capitalize ${policy === p ? "text-white" : "text-purple-400/60"}`}>
+                            <span
+                              className={`capitalize ${
+                                policy === p ? "text-white" : "text-purple-400/60"
+                              }`}
+                            >
                               {p.replace("-", " ")}
                             </span>
-                            <span className="text-white font-mono">
+                            <span className="font-mono text-white">
                               {pct > 0 ? `${pct.toFixed(0)}%` : "0%"} · r={reward.toFixed(3)}
                             </span>
                           </div>
-                          <div className="h-1 bg-purple-900/30 rounded-full overflow-hidden">
+                          <div className="h-1 overflow-hidden rounded-full bg-purple-900/30">
                             <Motion.div
                               animate={{
                                 width: `${Math.min(100, Math.max(0, pct))}%`,
@@ -1381,10 +1507,9 @@ export function Simulation() {
             )}
           </AnimatePresence>
 
-          {/* --- everything below = your original JSX structure --- */}
-          <div className="bg-neutral-900 border border-neutral-800 rounded-2xl p-6">
-            <div className="flex items-center gap-2 mb-6">
-              <Network className="w-5 h-5 text-purple-400" />
+          <div className="rounded-2xl border border-neutral-800 bg-neutral-900 p-6">
+            <div className="mb-6 flex items-center gap-2">
+              <Network className="h-5 w-5 text-purple-400" />
               <h3 className="font-semibold">Agent Config</h3>
             </div>
 
@@ -1398,7 +1523,7 @@ export function Simulation() {
                     setSelectedSimulationGroupId(v === "" ? null : Number(v));
                     setScopeError(null);
                   }}
-                  className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-200"
+                  className="w-full rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-200"
                 >
                   <option value="">
                     {nodeGroups.length > 0
@@ -1411,24 +1536,40 @@ export function Simulation() {
                     </option>
                   ))}
                 </select>
-                <p className="text-[11px] text-neutral-500 leading-snug">
+                <p className="text-[11px] leading-snug text-neutral-500">
                   Simulation uses only nodes in the selected group that you are currently connected to.
                 </p>
               </div>
 
-              <HoverExplainSelect
-                label="Learner"
-                value={learnerKind}
-                onChange={setLearnerKind}
-                options={LEARNER_OPTIONS}
-              />
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-neutral-400">Learner</label>
+                <select
+                  value={learnerKind}
+                  onChange={(e) => setLearnerKind(e.target.value)}
+                  className="w-full rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-200"
+                >
+                  {LEARNER_OPTIONS.map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
 
-              <HoverExplainSelect
-                label="Goal"
-                value={goalKind}
-                onChange={setGoalKind}
-                options={GOAL_OPTIONS}
-              />
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-neutral-400">Goal</label>
+                <select
+                  value={goalKind}
+                  onChange={(e) => setGoalKind(e.target.value)}
+                  className="w-full rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-200"
+                >
+                  {GOAL_OPTIONS.map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
 
               {goalKind === "min_latency_with_sla" && (
                 <div className="space-y-2">
@@ -1438,7 +1579,7 @@ export function Simulation() {
                     min={1}
                     value={slaMs}
                     onChange={(e) => setSlaMs(Math.max(1, Number(e.target.value) || 1))}
-                    className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-200"
+                    className="w-full rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-200"
                   />
                 </div>
               )}
@@ -1453,7 +1594,7 @@ export function Simulation() {
                     step={0.05}
                     value={tailWeight}
                     onChange={(e) => setTailWeight(Math.max(0, Number(e.target.value) || 0))}
-                    className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-200"
+                    className="w-full rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-200"
                   />
                 </div>
               )}
@@ -1473,9 +1614,9 @@ export function Simulation() {
                             return next.length === 0 ? prev : next;
                           });
                         }}
-                        className={`text-left px-3 py-2 rounded-lg text-sm transition-all border ${
+                        className={`rounded-lg border px-3 py-2 text-left text-sm transition-all ${
                           checked
-                            ? "bg-purple-500/10 text-purple-300 border-purple-500/30"
+                            ? "border-purple-500/30 bg-purple-500/10 text-purple-300"
                             : "border-transparent text-neutral-500 hover:bg-neutral-800"
                         }`}
                       >
@@ -1484,7 +1625,7 @@ export function Simulation() {
                     );
                   })}
                 </div>
-                <p className="text-[11px] text-neutral-500 leading-snug">
+                <p className="text-[11px] leading-snug text-neutral-500">
                   Sent to backend via <span className="font-mono">learner_kwargs.policy_allowlist</span>.
                 </p>
               </div>
@@ -1495,16 +1636,16 @@ export function Simulation() {
                   type="number"
                   value={seed ?? ""}
                   onChange={(e) => setSeed(e.target.value === "" ? null : Number(e.target.value))}
-                  className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-sm text-neutral-200"
+                  className="w-full rounded-lg border border-neutral-800 bg-neutral-950 px-3 py-2 text-sm text-neutral-200"
                   placeholder="null"
                 />
               </div>
             </div>
           </div>
 
-          <div className="bg-neutral-900 border border-neutral-800 rounded-2xl p-6">
-            <div className="flex items-center gap-2 mb-6">
-              <Settings2 className="w-5 h-5 text-indigo-400" />
+          <div className="rounded-2xl border border-neutral-800 bg-neutral-900 p-6">
+            <div className="mb-6 flex items-center gap-2">
+              <Settings2 className="h-5 w-5 text-indigo-400" />
               <h3 className="font-semibold">Manual Overrides</h3>
             </div>
 
@@ -1533,11 +1674,11 @@ export function Simulation() {
                       setPolicy(p);
                       if (!isAgentControlled) setCurrentRouteStrategy(p);
                     }}
-                    className={`text-left px-3 py-2 rounded-lg text-sm capitalize transition-all border ${
+                    className={`rounded-lg border px-3 py-2 text-left text-sm capitalize transition-all ${
                       policy === p && !isAgentControlled
-                        ? "bg-indigo-500/10 text-indigo-400 border-indigo-500/30"
+                        ? "border-indigo-500/30 bg-indigo-500/10 text-indigo-400"
                         : "border-transparent text-neutral-500 hover:bg-neutral-800"
-                    } disabled:opacity-50 disabled:cursor-not-allowed`}
+                    } disabled:cursor-not-allowed disabled:opacity-50`}
                   >
                     {p.replace("-", " ")}
                   </button>
@@ -1546,9 +1687,9 @@ export function Simulation() {
             </div>
           </div>
 
-          <div className="bg-neutral-900 border border-neutral-800 rounded-2xl p-6">
-            <div className="flex items-center gap-2 mb-4">
-              <Plus className="w-5 h-5 text-emerald-400" />
+          <div className="rounded-2xl border border-neutral-800 bg-neutral-900 p-6">
+            <div className="mb-4 flex items-center gap-2">
+              <Plus className="h-5 w-5 text-emerald-400" />
               <h3 className="font-semibold">Test Workload</h3>
             </div>
 
@@ -1564,35 +1705,105 @@ export function Simulation() {
                   max="80"
                   step="5"
                   value={manualTask.cpu}
-                  onChange={(e) => setManualTask((prev) => ({ ...prev, cpu: parseInt(e.target.value) }))}
-                  className="w-full h-1 bg-neutral-800 rounded-lg appearance-none accent-emerald-500"
+                  onChange={(e) =>
+                    setManualTask((prev) => ({ ...prev, cpu: parseInt(e.target.value, 10) }))
+                  }
+                  className="h-1 w-full appearance-none rounded-lg bg-neutral-800 accent-emerald-500"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex justify-between text-xs text-neutral-500">
+                  <span>Simulation Speed</span>
+                  <span>{simulationSpeed} jobs/s</span>
+                </div>
+                <input
+                  type="range"
+                  min="1"
+                  max="10"
+                  step="1"
+                  value={simulationSpeed}
+                  onChange={(e) => setSimulationSpeed(Math.max(1, Number(e.target.value) || 1))}
+                  className="h-1 w-full appearance-none rounded-lg bg-neutral-800 accent-indigo-500"
                 />
               </div>
 
               <button
                 onClick={spikeLoad}
-                className="w-full py-2 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-500 border border-emerald-500/30 rounded-lg text-sm font-medium transition-colors"
+                className="w-full rounded-lg border border-emerald-500/30 bg-emerald-500/10 py-2 text-sm font-medium text-emerald-500 transition-colors hover:bg-emerald-500/20"
               >
                 Spike Load
               </button>
             </div>
           </div>
+
+          <div className="rounded-2xl border border-white/10 bg-zinc-900/60 p-6">
+            <div className="mb-4 flex items-center gap-2">
+              <FileCode2 className="h-5 w-5 text-cyan-400" />
+              <h3 className="font-semibold">Real Job Submission</h3>
+            </div>
+
+            <div className="space-y-4">
+              <input
+                type="file"
+                accept=".py"
+                onChange={onPythonFileSelected}
+                className="block w-full text-sm text-zinc-300"
+              />
+
+              <input
+                type="text"
+                value={scriptArgs}
+                onChange={(e) => setScriptArgs(e.target.value)}
+                placeholder="Arguments, e.g. --epochs 5 --lr 0.01"
+                className="w-full rounded-xl border border-white/10 bg-zinc-800 px-3 py-2 text-sm text-white"
+              />
+
+              <input
+                type="number"
+                min={1}
+                max={3600}
+                value={scriptTimeoutS}
+                onChange={(e) => setScriptTimeoutS(Number(e.target.value) || 60)}
+                placeholder="Timeout (seconds)"
+                className="w-full rounded-xl border border-white/10 bg-zinc-800 px-3 py-2 text-sm text-white"
+              />
+
+              <div className="rounded-xl border border-white/10 bg-zinc-950/50 p-3">
+                <div className="text-sm text-zinc-400">Uploaded file</div>
+                <div className="mt-1 text-sm text-white">{uploadedFileName || "None"}</div>
+                <div className="mt-3 text-xs text-zinc-500">
+                  This submits a real executable Python job instead of a fake timed workload.
+                </div>
+              </div>
+
+              <button
+                onClick={submitRealJob}
+                disabled={submittingRealJob}
+                className="w-full rounded-xl bg-indigo-500 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
+              >
+                {submittingRealJob ? "Submitting..." : "Submit Python Job"}
+              </button>
+
+              {realJobError && <div className="text-sm text-red-400">{realJobError}</div>}
+            </div>
+          </div>
         </div>
 
-        {/* Main */}
-        <div className="lg:col-span-3 space-y-6 relative z-10">
-          <div className="relative bg-neutral-900 border border-neutral-800 rounded-2xl p-8 min-h-[420px] flex flex-col items-center overflow-hidden">
-            <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.02)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.02)_1px,transparent_1px)] bg-[size:32px_32px] [mask-image:radial-gradient(ellipse_at_center,black,transparent)] pointer-events-none" />
+        <div className="space-y-6 lg:col-span-3">
+          <div className="relative flex min-h-[420px] flex-col items-center overflow-hidden rounded-2xl border border-neutral-800 bg-neutral-900 p-8">
+            <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.02)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.02)_1px,transparent_1px)] bg-[size:32px_32px] [mask-image:radial-gradient(ellipse_at_center,black,transparent)]" />
 
-            <div className="absolute top-6 left-6 flex items-center gap-3">
-              <div className="p-2 rounded-lg bg-neutral-800 border border-neutral-700">
-                <History className="w-4 h-4 text-neutral-400" />
+            <div className="absolute left-6 top-6 flex items-center gap-3">
+              <div className="rounded-lg border border-neutral-700 bg-neutral-800 p-2">
+                <History className="h-4 w-4 text-neutral-400" />
               </div>
               <div>
-                <p className="text-[10px] font-bold text-neutral-500 uppercase">Incoming Jobs</p>
-                <p className="text-xl font-mono font-bold">{incomingJobs}</p>
+                <p className="text-[10px] font-bold uppercase text-neutral-500">Incoming Jobs</p>
+                <p className="font-mono text-xl font-bold">{incomingJobs}</p>
               </div>
             </div>
+
             {nodeGroups.length > 0 && selectedSimulationGroup ? (
               <button
                 onClick={() => {
@@ -1600,32 +1811,36 @@ export function Simulation() {
                   setScopeError(null);
                   setIsRunning(false);
                 }}
-                className="absolute top-6 right-6 z-20 rounded-lg border border-neutral-700 bg-neutral-900/80 px-3 py-1.5 text-xs text-neutral-300 hover:bg-neutral-800"
+                className="absolute right-6 top-6 z-20 rounded-lg border border-neutral-700 bg-neutral-900/80 px-3 py-1.5 text-xs text-neutral-300 hover:bg-neutral-800"
               >
                 Back to Groups
               </button>
             ) : null}
 
-            <div className="z-10 flex flex-col items-center gap-4 mb-16">
+            <div className="z-10 mb-16 flex flex-col items-center gap-4">
               <Motion.div
                 animate={{
                   scale: [1, 1.05, 1],
-                  borderColor: isAgentControlled ? "rgba(168, 85, 247, 0.5)" : "rgba(99, 102, 241, 0.5)",
+                  borderColor: isAgentControlled
+                    ? "rgba(168, 85, 247, 0.5)"
+                    : "rgba(99, 102, 241, 0.5)",
                 }}
                 transition={{ duration: 2, repeat: Infinity }}
-                className="p-5 rounded-2xl border bg-neutral-950 flex flex-col items-center gap-3 relative"
+                className="relative flex flex-col items-center gap-3 rounded-2xl border bg-neutral-950 p-5"
               >
                 {isAgentControlled && (
-                  <div className="absolute -top-3 left-1/2 -translate-x-1/2 px-3 py-1 bg-purple-500 text-[10px] font-bold text-white rounded-full uppercase tracking-widest shadow-lg shadow-purple-500/30">
+                  <div className="absolute -top-3 left-1/2 -translate-x-1/2 rounded-full bg-purple-500 px-3 py-1 text-[10px] font-bold uppercase tracking-widest text-white shadow-lg shadow-purple-500/30">
                     Agent Controlled
                   </div>
                 )}
                 <div
-                  className={`w-14 h-14 rounded-xl flex items-center justify-center shadow-lg transition-colors ${
-                    isAgentControlled ? "bg-purple-600 shadow-purple-500/30" : "bg-indigo-600 shadow-indigo-500/30"
+                  className={`flex h-14 w-14 items-center justify-center rounded-xl shadow-lg transition-colors ${
+                    isAgentControlled
+                      ? "bg-purple-600 shadow-purple-500/30"
+                      : "bg-indigo-600 shadow-indigo-500/30"
                   }`}
                 >
-                  <Network className="w-8 h-8 text-white" />
+                  <Network className="h-8 w-8 text-white" />
                 </div>
                 <div className="text-center">
                   <span
@@ -1636,16 +1851,18 @@ export function Simulation() {
                     Current Route Strategy
                   </span>
 
-                  <h4 className="text-lg font-bold capitalize">{currentRouteStrategy.replace("-", " ")}</h4>
+                  <h4 className="text-lg font-bold capitalize">
+                    {currentRouteStrategy.replace("-", " ")}
+                  </h4>
 
-                  <p className="text-[11px] text-neutral-400 mt-1">
+                  <p className="mt-1 text-[11px] text-neutral-400">
                     Last routed to: <span className="font-mono text-white">{lastChosenNodeLabel}</span>
                   </p>
                 </div>
               </Motion.div>
             </div>
 
-            <div className="absolute top-[160px] inset-x-0 h-[100px] pointer-events-none">
+            <div className="pointer-events-none absolute inset-x-0 top-[160px] h-[100px]">
               <AnimatePresence>
                 {Array.from({ length: Math.min(12, incomingJobs) }).map((_, i) => (
                   <Motion.div
@@ -1657,13 +1874,15 @@ export function Simulation() {
                     className="absolute left-1/2 -ml-4"
                   >
                     <div
-                      className={`w-8 h-8 rounded-lg flex items-center justify-center border shadow-sm ${
+                      className={`flex h-8 w-8 items-center justify-center rounded-lg border shadow-sm ${
                         isAgentControlled
-                          ? "bg-purple-900/50 border-purple-500/30"
-                          : "bg-neutral-800 border-neutral-700"
+                          ? "border-purple-500/30 bg-purple-900/50"
+                          : "border-neutral-700 bg-neutral-800"
                       }`}
                     >
-                      <Zap className={`w-4 h-4 ${isAgentControlled ? "text-purple-400" : "text-indigo-400"}`} />
+                      <Zap
+                        className={`h-4 w-4 ${isAgentControlled ? "text-purple-400" : "text-indigo-400"}`}
+                      />
                     </div>
                   </Motion.div>
                 ))}
@@ -1671,9 +1890,9 @@ export function Simulation() {
             </div>
 
             {nodeGroups.length > 0 && !selectedSimulationGroup ? (
-              <div className="w-full z-10 mt-auto">
+              <div className="z-10 mt-auto w-full">
                 <div className="mb-3 text-xs text-neutral-400">Pick a group to view its nodes</div>
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
                   {nodeGroups.map((g) => (
                     <button
                       key={g.id}
@@ -1681,157 +1900,162 @@ export function Simulation() {
                         setSelectedSimulationGroupId(g.id);
                         setScopeError(null);
                       }}
-                      className="text-left rounded-xl border border-neutral-800 bg-neutral-900/80 p-4 hover:border-indigo-500/40 hover:bg-neutral-900 transition-colors"
+                      className="rounded-xl border border-neutral-800 bg-neutral-900/80 p-4 text-left transition-colors hover:border-indigo-500/40 hover:bg-neutral-900"
                     >
                       <div className="flex items-center justify-between gap-2">
                         <div className="text-sm font-semibold text-neutral-100">{g.name}</div>
-                        <span className="w-3 h-3 rounded-full" style={{ backgroundColor: g.color }} />
+                        <span className="h-3 w-3 rounded-full" style={{ backgroundColor: g.color }} />
                       </div>
                       <div className="mt-1 text-xs text-neutral-400">
                         {g.nodes.length} node(s) •{" "}
                         {
-                          g.nodes.filter((n) => connectedNodeKeySet.has(normalizeNodeKey(n.nodeKey))).length
-                        } connected
+                          g.nodes.filter((n) => connectedNodeKeySet.has(normalizeNodeKey(n.nodeKey)))
+                            .length
+                        }{" "}
+                        connected
                       </div>
                     </button>
                   ))}
                 </div>
               </div>
             ) : (
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-6 w-full z-10 mt-auto">
-              {renderNodes.map((node) => (
-                <div
-                  key={node.id}
-                  className={`bg-neutral-900/80 backdrop-blur-sm border rounded-xl p-4 transition-all ${
-                    lastChosenNodeId && node.id === lastChosenNodeId
-                      ? "border-emerald-400 shadow-lg shadow-emerald-500/20 ring-2 ring-emerald-500/20"
-                      : "border-neutral-800 hover:border-neutral-700"
-                  }`}
-                >
-                  <div className="flex justify-between items-start mb-4">
-                    <div>
-                      <h4 className="text-[10px] font-bold text-neutral-500 uppercase tracking-tight">{node.name}</h4>
-                      <p className="text-sm font-mono font-bold text-neutral-300">
-                        {node.status === "offline" ? "Offline" : "Active"}
-                      </p>
+              <div className="z-10 mt-auto grid w-full grid-cols-2 gap-6 md:grid-cols-4">
+                {renderNodes.map((node) => (
+                  <div
+                    key={node.id}
+                    className={`rounded-xl border p-4 transition-all ${
+                      lastChosenNodeId && node.id === lastChosenNodeId
+                        ? "border-emerald-400 ring-2 ring-emerald-500/20 shadow-lg shadow-emerald-500/20"
+                        : "border-neutral-800 hover:border-neutral-700"
+                    } bg-neutral-900/80 backdrop-blur-sm`}
+                  >
+                    <div className="mb-4 flex items-start justify-between">
+                      <div>
+                        <h4 className="text-[10px] font-bold uppercase tracking-tight text-neutral-500">
+                          {node.name}
+                        </h4>
+                        <p className="font-mono text-sm font-bold text-neutral-300">
+                          {node.status === "offline" ? "Offline" : "Active"}
+                        </p>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        {lastChosenNodeId && node.id === lastChosenNodeId && (
+                          <span className="rounded-full border border-emerald-500/30 bg-emerald-500/15 px-2 py-0.5 text-[10px] font-bold text-emerald-400">
+                            CHOSEN
+                          </span>
+                        )}
+                        <div className="rounded-lg border border-neutral-700/50 bg-neutral-800/50 p-1.5">
+                          <Cpu className="h-3 w-3 text-neutral-500" />
+                        </div>
+                      </div>
                     </div>
 
-                    <div className="flex items-center gap-2">
-                      {lastChosenNodeId && node.id === lastChosenNodeId && (
-                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
-                          CHOSEN
+                    <div className="space-y-2">
+                      <div className="mb-1 flex justify-between text-[10px]">
+                        <span className="text-neutral-500">Saturation</span>
+                        <span className="font-mono text-neutral-300">
+                          {Math.round((node.cpuUsed / Math.max(1, node.cpuCapacity)) * 100)}%
                         </span>
-                      )}
-                      <div className="p-1.5 rounded-lg bg-neutral-800/50 border border-neutral-700/50">
-                        <Cpu className="w-3 h-3 text-neutral-500" />
+                      </div>
+                      <div className="h-1.5 overflow-hidden rounded-full border border-neutral-800/50 bg-neutral-950">
+                        <Motion.div
+                          animate={{
+                            width: `${Math.min(100, (node.cpuUsed / Math.max(1, node.cpuCapacity)) * 100)}%`,
+                            backgroundColor:
+                              node.status === "offline"
+                                ? "#262626"
+                                : isAgentControlled
+                                  ? "#a855f7"
+                                  : "#6366f1",
+                          }}
+                          className="h-full"
+                        />
                       </div>
                     </div>
                   </div>
-
-                  <div className="space-y-2">
-                    <div className="flex justify-between text-[10px] mb-1">
-                      <span className="text-neutral-500">Saturation</span>
-                      <span className="text-neutral-300 font-mono">
-                        {Math.round((node.cpuUsed / Math.max(1, node.cpuCapacity)) * 100)}%
-                      </span>
-                    </div>
-                    <div className="h-1.5 bg-neutral-950 rounded-full overflow-hidden border border-neutral-800/50">
-                      <Motion.div
-                        animate={{
-                          width: `${Math.min(100, (node.cpuUsed / Math.max(1, node.cpuCapacity)) * 100)}%`,
-                          backgroundColor:
-                            node.status === "offline"
-                              ? "#262626"
-                              : isAgentControlled
-                                ? "#a855f7"
-                                : "#6366f1",
-                        }}
-                        className="h-full"
-                      />
-                    </div>
-                    <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[10px] pt-1">
-                      <div className="flex justify-between">
-                        <span className="text-neutral-500">CPU</span>
-                        <span className="font-mono text-neutral-300">
-                          {node.status === "offline" ? "--" : `${node.cpuPct.toFixed(0)}%`}
-                        </span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-neutral-500">MEM</span>
-                        <span className="font-mono text-neutral-300">
-                          {node.status === "offline" ? "--" : `${node.memPct.toFixed(0)}%`}
-                        </span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-neutral-500">Queue</span>
-                        <span className="font-mono text-neutral-300">
-                          {node.status === "offline" ? "--" : (node.queueLen ?? 0)}
-                        </span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-neutral-500">In-flight</span>
-                        <span className="font-mono text-neutral-300">
-                          {node.status === "offline" ? "--" : (node.inFlight ?? 0)}
-                        </span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-neutral-500">Jobs/60s</span>
-                        <span className="font-mono text-neutral-300">
-                          {node.status === "offline" ? "--" : (node.completedLast60s ?? 0)}
-                        </span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-neutral-500">Speed</span>
-                        <span className="font-mono text-neutral-300">
-                          {node.status === "offline" || node.nodeSpeed == null
-                            ? "--"
-                            : `${node.nodeSpeed.toFixed(1)}`}
-                        </span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-neutral-500">EWMA</span>
-                        <span className="font-mono text-neutral-300">
-                          {node.status === "offline" || node.ewmaLatencyMs == null
-                            ? "--"
-                            : `${Math.round(node.ewmaLatencyMs)}ms`}
-                        </span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-neutral-500">P95</span>
-                        <span className="font-mono text-neutral-300">
-                          {node.status === "offline" || node.p95LatencyMs == null
-                            ? "--"
-                            : `${Math.round(node.p95LatencyMs)}ms`}
-                        </span>
-                      </div>
-                    </div>
+                ))}
+                {renderNodes.length === 0 && (
+                  <div className="col-span-2 rounded-xl border border-neutral-800 bg-neutral-900/80 p-4 text-sm text-neutral-400 md:col-span-4">
+                    No connected nodes are selected for this user. Connect nodes in the Nodes page,
+                    then return here.
                   </div>
-                </div>
-              ))}
-              {renderNodes.length === 0 && (
-                <div className="col-span-2 md:col-span-4 rounded-xl border border-neutral-800 bg-neutral-900/80 p-4 text-sm text-neutral-400">
-                  No connected nodes are selected for this user. Connect nodes in the Nodes page, then return here.
-                </div>
-              )}
-            </div>
+                )}
+              </div>
             )}
           </div>
 
-          {/* Leaderboard + Diagnostics */}
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-            <div className="md:col-span-2 bg-neutral-900 border border-neutral-800 rounded-2xl p-6">
-              <div className="flex items-center justify-between mb-6">
+          <div className="rounded-2xl border border-white/10 bg-zinc-900/60 p-5">
+            <div className="mb-4 flex items-center justify-between">
+              <h3 className="text-lg font-semibold text-white">Live Real Job Monitor</h3>
+              <span className="text-xs text-zinc-400">
+                Upload a Python script and watch its execution status
+              </span>
+            </div>
+
+            {realJobs.length === 0 ? (
+              <div className="rounded-xl border border-white/10 bg-black/20 p-4 text-sm text-zinc-400">
+                No real jobs submitted yet.
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {realJobs.map((job) => (
+                  <div
+                    key={job.job_id}
+                    className="rounded-xl border border-white/10 bg-zinc-950/40 p-4"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <div className="text-sm font-medium text-white">
+                          {job.script_name || job.job_id}
+                        </div>
+                        <div className="text-xs text-zinc-500">{job.job_id}</div>
+                      </div>
+                      <div className="text-xs text-zinc-300">
+                        {job.node_name ? `Node: ${job.node_name}` : "Node pending"}
+                      </div>
+                    </div>
+
+                    <div className="mt-3 grid gap-2 text-xs text-zinc-300 md:grid-cols-4">
+                      <div>Status: {job.status}</div>
+                      <div>Exit code: {job.exit_code ?? "-"}</div>
+                      <div>Latency: {job.observed_latency_ms ?? "-"} ms</div>
+                      <div>Type: {job.job_type}</div>
+                    </div>
+
+                    {(job.stdout || job.stderr) && (
+                      <details className="mt-3 rounded-lg bg-black/30 p-3">
+                        <summary className="cursor-pointer text-sm text-zinc-200">Logs</summary>
+                        <pre className="mt-2 whitespace-pre-wrap text-xs text-zinc-300">
+{`STDOUT:
+${job.stdout ?? ""}
+
+STDERR:
+${job.stderr ?? ""}`}
+                        </pre>
+                      </details>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
+            <div className="rounded-2xl border border-neutral-800 bg-neutral-900 p-6 md:col-span-2">
+              <div className="mb-6 flex items-center justify-between">
                 <div className="flex items-center gap-2">
-                  <Trophy className="w-5 h-5 text-amber-500" />
+                  <Trophy className="h-5 w-5 text-amber-500" />
                   <h3 className="font-semibold">Policy Performance Log</h3>
                 </div>
-                <div className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest bg-neutral-800 px-3 py-1 rounded-full border border-neutral-700">
+                <div className="rounded-full border border-neutral-700 bg-neutral-800 px-3 py-1 text-[10px] font-bold uppercase tracking-widest text-neutral-500">
                   RL Enabled
                 </div>
               </div>
-              <div className="bg-neutral-900 border border-neutral-800 rounded-2xl p-6">
-                <div className="flex items-center gap-2 mb-4">
-                  <Activity className="w-5 h-5 text-purple-400" />
+
+              <div className="mb-6 rounded-2xl border border-neutral-800 bg-neutral-900 p-6">
+                <div className="mb-4 flex items-center gap-2">
+                  <Activity className="h-5 w-5 text-purple-400" />
                   <h3 className="font-semibold">Policy Reward Over Time</h3>
                 </div>
 
@@ -1859,27 +2083,26 @@ export function Simulation() {
                 </div>
               </div>
 
-
               <div className="overflow-x-auto">
                 <table className="w-full text-left">
                   <thead>
-                    <tr className="border-b border-neutral-800 text-neutral-500 text-[10px] uppercase tracking-wider">
+                    <tr className="border-b border-neutral-800 text-[10px] uppercase tracking-wider text-neutral-500">
                       <th className="pb-3 font-medium">Rank</th>
                       <th className="pb-3 font-medium">Policy</th>
-                      <th className="pb-3 font-medium text-right">Tasks</th>
-                      <th className="pb-3 font-medium text-right">Avg Latency</th>
-                      <th className="pb-3 font-medium text-right">Reward</th>
-                      <th className="pb-3 font-medium text-right">Optimization</th>
+                      <th className="pb-3 text-right font-medium">Tasks</th>
+                      <th className="pb-3 text-right font-medium">Avg Latency</th>
+                      <th className="pb-3 text-right font-medium">Reward</th>
+                      <th className="pb-3 text-right font-medium">Optimization</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-neutral-800/50">
                     {leaderboard.map((stat, index) => (
-                      <tr key={stat.policy} className={`${policy === stat.policy ? "bg-indigo-500/5" : ""}`}>
+                      <tr key={stat.policy} className={policy === stat.policy ? "bg-indigo-500/5" : ""}>
                         <td className="py-3">
                           <div
-                            className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${
+                            className={`flex h-5 w-5 items-center justify-center rounded-full text-[10px] font-bold ${
                               index === 0
-                                ? "bg-amber-500/20 text-amber-500 border border-amber-500/30"
+                                ? "border border-amber-500/30 bg-amber-500/20 text-amber-500"
                                 : "bg-neutral-800 text-neutral-500"
                             }`}
                           >
@@ -1890,15 +2113,21 @@ export function Simulation() {
                         <td className="py-3">
                           <span
                             className={`text-sm font-medium capitalize ${
-                              policy === stat.policy ? "text-indigo-400 font-bold" : "text-neutral-400"
+                              policy === stat.policy
+                                ? "font-bold text-indigo-400"
+                                : "text-neutral-400"
                             }`}
                           >
                             {stat.policy.replace("-", " ")}
                           </span>
-                          <div className="text-[10px] text-neutral-600">selected {stat.selectionPct.toFixed(0)}%</div>
+                          <div className="text-[10px] text-neutral-600">
+                            selected {stat.selectionPct.toFixed(0)}%
+                          </div>
                         </td>
 
-                        <td className="py-3 text-right text-xs font-mono text-neutral-500">{stat.completedTasks}</td>
+                        <td className="py-3 text-right text-xs font-mono text-neutral-500">
+                          {stat.completedTasks}
+                        </td>
 
                         <td className="py-3 text-right text-xs font-mono">
                           <span className={stat.avgLatency > 0 ? "text-neutral-200" : "text-neutral-500"}>
@@ -1920,7 +2149,7 @@ export function Simulation() {
                               return (
                                 <div
                                   key={i}
-                                  className={`w-1 h-3 rounded-full ${
+                                  className={`h-3 w-1 rounded-full ${
                                     improved == null
                                       ? "bg-neutral-700/60"
                                       : improved
@@ -1939,15 +2168,17 @@ export function Simulation() {
               </div>
             </div>
 
-            <div className="bg-neutral-900 border border-neutral-800 rounded-2xl p-6 flex flex-col">
-              <div className="flex items-center gap-2 mb-6">
-                <Activity className="w-5 h-5 text-indigo-400" />
-                <h3 className="font-semibold text-sm">System Diagnostics</h3>
+            <div className="flex flex-col rounded-2xl border border-neutral-800 bg-neutral-900 p-6">
+              <div className="mb-6 flex items-center gap-2">
+                <Activity className="h-5 w-5 text-indigo-400" />
+                <h3 className="text-sm font-semibold">System Diagnostics</h3>
               </div>
 
-              <div className="space-y-6 flex-1">
-                <div className="p-4 rounded-xl bg-neutral-800/30 border border-neutral-700/30">
-                  <p className="text-[10px] text-neutral-500 uppercase font-bold mb-3">Live Saturation Flow</p>
+              <div className="flex-1 space-y-6">
+                <div className="rounded-xl border border-neutral-700/30 bg-neutral-800/30 p-4">
+                  <p className="mb-3 text-[10px] font-bold uppercase text-neutral-500">
+                    Live Saturation Flow
+                  </p>
                   <div className="h-[120px]">
                     <ResponsiveContainer width="100%" height="100%">
                       <BarChart data={chartData}>
@@ -1957,7 +2188,13 @@ export function Simulation() {
                           {chartData.map((entry, index) => (
                             <Cell
                               key={`cell-${index}`}
-                              fill={entry.cpu > 80 ? "#f43f5e" : isAgentControlled ? "#a855f7" : "#6366f1"}
+                              fill={
+                                entry.cpu > 80
+                                  ? "#f43f5e"
+                                  : isAgentControlled
+                                    ? "#a855f7"
+                                    : "#6366f1"
+                              }
                             />
                           ))}
                         </Bar>
@@ -1966,7 +2203,6 @@ export function Simulation() {
                   </div>
                 </div>
 
-                {/* Explanation Box (Latest switch) */}
                 <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-2">
@@ -1987,7 +2223,7 @@ export function Simulation() {
                     </div>
                   </div>
 
-                  <div className="mt-3 text-sm leading-relaxed whitespace-pre-wrap text-neutral-200">
+                  <div className="mt-3 whitespace-pre-wrap text-sm leading-relaxed text-neutral-200">
                     {latestExplanation?.text
                       ? latestExplanation.text
                       : "No policy switches yet. When the agent switches strategies, you’ll see the explanation here (and the sim will pause)."}
@@ -1995,7 +2231,8 @@ export function Simulation() {
 
                   {latestExplanation?.meta?.from_policy && latestExplanation?.meta?.to_policy ? (
                     <div className="mt-3 text-xs text-neutral-400">
-                      Switch: {String(latestExplanation.meta.from_policy)} → {String(latestExplanation.meta.to_policy)}
+                      Switch: {String(latestExplanation.meta.from_policy)} →{" "}
+                      {String(latestExplanation.meta.to_policy)}
                     </div>
                   ) : null}
                   {latestExplanation?.meta?.source ? (
@@ -2015,15 +2252,17 @@ export function Simulation() {
                   )}
                 </div>
 
-                <div className="space-y-3 mt-auto">
+                <div className="mt-auto space-y-3">
                   <div className="flex justify-between text-xs">
                     <span className="text-neutral-500">System Throughput</span>
-                    <span className="text-emerald-500 font-mono font-bold">{throughput.toFixed(1)} j/s</span>
+                    <span className="font-mono font-bold text-emerald-500">
+                      {throughput.toFixed(1)} j/s
+                    </span>
                   </div>
 
                   <div className="flex justify-between text-xs">
                     <span className="text-neutral-500">Avg Observed Latency</span>
-                    <span className="text-neutral-200 font-mono font-bold">
+                    <span className="font-mono font-bold text-neutral-200">
                       {overallAvgLatencyMs > 0 ? `${overallAvgLatencyMs.toFixed(0)}ms` : "---"}
                     </span>
                   </div>
@@ -2042,7 +2281,7 @@ export function Simulation() {
 
                   <div className="flex justify-between text-xs">
                     <span className="text-neutral-500">Best Policy (by reward)</span>
-                    <span className="text-purple-400 font-mono font-bold">
+                    <span className="font-mono font-bold text-purple-400">
                       {bestByReward ? bestByReward.replace("-", " ") : "---"}
                     </span>
                   </div>
@@ -2050,8 +2289,6 @@ export function Simulation() {
               </div>
             </div>
           </div>
-
-          {/* If you want: add a UI knob for simulationSpeed too */}
         </div>
       </div>
     </div>

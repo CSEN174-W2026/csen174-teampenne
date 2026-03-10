@@ -75,11 +75,48 @@ export type AgentConfig = {
   goal_kwargs?: Record<string, any> | null;
 };
 
+export type JobType = "simulated" | "python_script" | "ml_script";
+
 export type JobRequest = {
   job_id: string;
   user_id: string;
-  service_time_ms: number;
+
+  // simulated jobs
+  service_time_ms?: number;
+
+  // real jobs
+  job_type?: JobType;
+  script_name?: string;
+  script_content?: string;
+  args?: string[];
+  timeout_s?: number;
+
   metadata?: Record<string, any>;
+};
+
+
+export type RealJobStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "timeout";
+
+export type JobExecutionRecord = {
+  job_id: string;
+  user_id: string;
+  job_type: JobType;
+  script_name?: string | null;
+  status: RealJobStatus;
+  queued_at_ms: number;
+  started_at_ms?: number | null;
+  finished_at_ms?: number | null;
+  observed_latency_ms?: number | null;
+  service_time_ms?: number | null;
+  exit_code?: number | null;
+  stdout?: string | null;
+  stderr?: string | null;
+  node_name?: string | null;
 };
 
 // ----------------------------------------------------
@@ -494,25 +531,42 @@ export async function listEc2Nodes(token: string) {
 }
 
 
-// Dockerize Functions
-export async function createDockerNode(token: string, port: number) {
-  return http("/docker/nodes/create", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ port }),
-  });
+// // Dockerize Functions
+// export async function createDockerNode(token: string, port: number) {
+//   return http("/docker/nodes/create", {
+//     method: "POST",
+//     headers: { Authorization: `Bearer ${token}` },
+//     body: JSON.stringify({ port }),
+//   });
+// }
+
+// export async function stopDockerNode(token: string, name: string) {
+//   return http(`/docker/nodes/${name}/stop`, {
+//     method: "POST",
+//     headers: { Authorization: `Bearer ${token}` },
+//   });
+// }
+
+// export async function deleteDockerNode(token: string, name: string) {
+//   return http(`/docker/nodes/${name}`, {
+//     method: "DELETE",
+//     headers: { Authorization: `Bearer ${token}` },
+//   });
+// }
+
+
+export async function getNodeRecentJobs(host: string, port: number, limit = 20) {
+  const res = await fetch(`http://${host}:${port}/jobs?limit=${limit}`);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch node jobs: ${res.status} ${res.statusText}`);
+  }
+  return res.json() as Promise<JobExecutionRecord[]>;
 }
 
-export async function stopDockerNode(token: string, name: string) {
-  return http(`/docker/nodes/${name}/stop`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}` },
-  });
-}
-
-export async function deleteDockerNode(token: string, name: string) {
-  return http(`/docker/nodes/${name}`, {
-    method: "DELETE",
-    headers: { Authorization: `Bearer ${token}` },
-  });
+export async function getNodeJobStatus(host: string, port: number, jobId: string) {
+  const res = await fetch(`http://${host}:${port}/jobs/${encodeURIComponent(jobId)}`);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch node job status: ${res.status} ${res.statusText}`);
+  }
+  return res.json() as Promise<JobExecutionRecord>;
 }

@@ -230,8 +230,6 @@ Provision EC2 worker nodes that the manager auto-discovers by tag:
 
 ```bash
 cd /root/csen-174/infra/terraform
-cp terraform.tfvars.example terraform.tfvars
-# edit terraform.tfvars with your VPC/subnet/AMI
 terraform init
 terraform plan
 terraform apply
