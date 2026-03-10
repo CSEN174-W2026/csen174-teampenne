@@ -56,6 +56,8 @@ class NodeClient:
             "metadata": job.metadata or {},
         }
 
+        print("NODE CLIENT PAYLOAD:", payload)
+
         r = requests.post(url, json=payload, timeout=max(self.timeout_s, 10))
         r.raise_for_status()
         return r.json()

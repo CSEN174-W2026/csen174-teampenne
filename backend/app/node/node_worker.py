@@ -14,7 +14,7 @@ from typing import Deque, Dict, List, Optional
 import psutil
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-
+from fastapi.middleware.cors import CORSMiddleware
 
 # -----------------------------
 # Models (API payloads)
@@ -188,7 +188,7 @@ async def _run_python_job(job: _InternalJob, started_at: int) -> JobRecord:
     try:
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
-            str(script_path),
+            safe_name,
             *(job.args or []),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -287,7 +287,7 @@ async def _worker_loop() -> None:
         try:
             if job.job_type == "simulated":
                 record = await _run_simulated_job(job, started_at)
-            elif job.job_type == "python":
+            elif job.job_type in {"python", "python_script", "ml_script"}:
                 record = await _run_python_job(job, started_at)
             else:
                 finished_at = _now_ms()
@@ -343,7 +343,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="CSEN174 Node Agent", lifespan=lifespan)
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or your frontend origin
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/metrics", response_model=MetricsResponse)
 def get_metrics():
@@ -378,6 +384,10 @@ def get_metrics():
 @app.post("/submit", response_model=SubmitJobResponse)
 async def submit_job(req: SubmitJobRequest):
     queued_at = _now_ms()
+
+    print("NODE RECEIVED JOB TYPE:", req.job_type)
+    print("NODE RECEIVED SCRIPT NAME:", req.script_name)
+    print("NODE RECEIVED HAS CONTENT:", bool(req.script_content))
 
     job = _InternalJob(
         job_id=req.job_id,

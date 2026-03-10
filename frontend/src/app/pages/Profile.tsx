@@ -1,19 +1,30 @@
 // src/pages/Profile.tsx
 import { useEffect, useMemo, useState } from "react";
-import { Bot, History, RefreshCw, User as UserIcon } from "lucide-react";
+import {
+  Activity,
+  Bot,
+  Brain,
+  Cpu,
+  Gauge,
+  RefreshCw,
+  Sparkles,
+} from "lucide-react";
 
 import {
-  getMyLastAgentConfig,
+  getClusterStats,
   getMyAgentHistory,
+  getMyLastAgentConfig,
   getRecentExplanations,
   me,
   type AgentConfig,
   type AuthUser,
+  type ClusterStatsResponse,
 } from "../../lib/api";
 
 import { useAuth } from "../auth/AuthContext";
 
-function fmtTime(ts: number) {
+function fmtTime(ts?: number | null) {
+  if (!ts) return "—";
   const d = new Date(ts);
   return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString();
 }
@@ -23,7 +34,6 @@ function cfgLabel(c: AgentConfig) {
 }
 
 function cfgKey(c: AgentConfig) {
-  // stable-ish equality for selection
   return JSON.stringify({
     learner_kind: c.learner_kind,
     goal_kind: c.goal_kind,
@@ -33,41 +43,115 @@ function cfgKey(c: AgentConfig) {
   });
 }
 
+function shortNumber(v?: number | null) {
+  if (v == null || Number.isNaN(v)) return "0";
+  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;
+  if (v >= 1_000) return `${(v / 1_000).toFixed(1)}K`;
+  return `${Math.round(v)}`;
+}
+
+function formatLatency(v?: number | null) {
+  if (v == null || Number.isNaN(v)) return "---";
+  return `${Math.round(v)}`;
+}
+
+function GlassCard({
+  children,
+  className = "",
+}: {
+  children: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <div
+      className={`rounded-3xl border border-white/10 bg-white/[0.03] backdrop-blur-sm shadow-[0_0_0_1px_rgba(255,255,255,0.02)] ${className}`}
+    >
+      {children}
+    </div>
+  );
+}
+
+function StatCard({
+  title,
+  value,
+  subtitle,
+  icon,
+  accent,
+}: {
+  title: string;
+  value: string;
+  subtitle?: string;
+  icon: React.ReactNode;
+  accent: string;
+}) {
+  return (
+    <div
+      className={`rounded-3xl border ${accent} p-5 md:p-6 bg-gradient-to-br from-white/[0.03] to-white/[0.01] min-h-[148px]`}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-black/20 border border-white/10">
+          {icon}
+        </div>
+        <div className="h-2 w-2 rounded-full bg-current opacity-70 mt-1" />
+      </div>
+
+      <div className="mt-8">
+        <p className="text-3xl md:text-4xl font-bold tracking-tight text-white">
+          {value}
+        </p>
+        <p className="mt-2 text-sm font-medium text-white/90">{title}</p>
+        {subtitle ? <p className="mt-1 text-xs text-white/50">{subtitle}</p> : null}
+      </div>
+    </div>
+  );
+}
+
 export function Profile() {
   const { token } = useAuth() as { token: string | null };
 
   const [user, setUser] = useState<AuthUser | null>(null);
-
-  // last used config
   const [cfg, setCfg] = useState<AgentConfig | null>(null);
-
-  // agent config history
   const [history, setHistory] = useState<{ time_ms: number; config: AgentConfig }[]>([]);
   const [selectedCfg, setSelectedCfg] = useState<AgentConfig | null>(null);
-
-  // explanation events for selected config
   const [agentEvents, setAgentEvents] = useState<any[]>([]);
+  const [clusterStats, setClusterStats] = useState<ClusterStatsResponse | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [eventsLoading, setEventsLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  const learnerLabel = useMemo(() => {
-    if (!cfg) return "No learner used yet";
-    return cfgLabel(cfg);
-  }, [cfg]);
+  const uniqueConfigs = useMemo(() => {
+    const map = new Map<string, AgentConfig>();
+    for (const item of history) {
+      map.set(cfgKey(item.config), item.config);
+    }
+    return Array.from(map.values());
+  }, [history]);
+
+  const trainedAgentsCount = uniqueConfigs.length;
+
+  const totalTasksProcessed = useMemo(() => {
+    if (clusterStats?.jobs_count != null) return clusterStats.jobs_count;
+    return 0;
+  }, [clusterStats]);
+
+  const avgLatency = useMemo(() => {
+    return clusterStats?.avg_latency_ms ?? null;
+  }, [clusterStats]);
+
+  const selectedKey = selectedCfg ? cfgKey(selectedCfg) : null;
 
   async function loadEvents(forCfg: AgentConfig | null) {
     if (!forCfg) {
       setAgentEvents([]);
       return;
     }
+
     setEventsLoading(true);
     try {
       const recent = await getRecentExplanations(forCfg, 25);
       setAgentEvents(recent.events ?? []);
     } catch {
-      // keep UI quiet; refresh() handles main error display
       setAgentEvents([]);
     } finally {
       setEventsLoading(false);
@@ -81,31 +165,30 @@ export function Profile() {
     try {
       if (!token) throw new Error("Missing auth token.");
 
-      // 1) user info
-      const u = await me(token);
-      setUser(u);
+      const [userRes, histRes, lastCfgRes, clusterRes] = await Promise.all([
+        me(token),
+        getMyAgentHistory(token),
+        getMyLastAgentConfig(token),
+        getClusterStats(60, 800).catch(() => null),
+      ]);
 
-      // 2) history list
-      const histRes = await getMyAgentHistory(token);
+      setUser(userRes);
+
       const hist = histRes.history ?? [];
       setHistory(hist);
 
-      // 3) last used config
-      const lastRes = await getMyLastAgentConfig(token);
-      const lastCfg = lastRes?.config ?? null;
+      const lastCfg = lastCfgRes?.config ?? null;
       setCfg(lastCfg);
+      setClusterStats(clusterRes);
 
-      // 4) choose selection (prefer last, else most recent history item)
       const initial = lastCfg ?? hist[0]?.config ?? null;
 
-      // only update selection if it truly changed (prevents flicker)
       setSelectedCfg((prev) => {
         if (!initial && !prev) return prev;
         if (!initial || !prev) return initial;
         return cfgKey(initial) === cfgKey(prev) ? prev : initial;
       });
 
-      // 5) load events for initial selection
       await loadEvents(initial);
     } catch (e: any) {
       setErr(e?.message ?? "Failed to load profile");
@@ -119,196 +202,250 @@ export function Profile() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
 
-  // When user clicks a history item, load events for that selection
   useEffect(() => {
-    // Avoid double-fetch during initial refresh() which already loaded events
-    // If you want absolute simplicity, remove this guard and it will still work.
     if (!selectedCfg) return;
-    // eslint-disable-next-line @typescript-eslint/no-floating-promises
-    loadEvents(selectedCfg);
+    void loadEvents(selectedCfg);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedCfg && cfgKey(selectedCfg)]);
-
-  const selectedKey = selectedCfg ? cfgKey(selectedCfg) : null;
+  }, [selectedCfg ? cfgKey(selectedCfg) : null]);
 
   return (
-    <div className="space-y-8">
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-3xl font-bold tracking-tight">Profile</h1>
-          <p className="text-neutral-400 mt-1">User info + learner/agent configs you’ve used.</p>
-          {err ? <p className="text-sm text-rose-400 mt-2">{err}</p> : null}
-        </div>
-
-        <button
-          onClick={refresh}
-          className="inline-flex items-center gap-2 px-3 py-2 rounded-xl bg-neutral-900/60 border border-neutral-800 hover:bg-neutral-800/60 transition-colors text-sm"
-        >
-          <RefreshCw className={`w-4 h-4 ${loading ? "animate-spin" : ""}`} />
-          Refresh
-        </button>
-      </div>
-
-      {/* Cards */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* User card */}
-        <div className="bg-neutral-900/40 border border-neutral-800 rounded-2xl p-6">
-          <div className="flex items-center gap-3 mb-4">
-            <div className="w-10 h-10 rounded-2xl bg-neutral-800 flex items-center justify-center">
-              <UserIcon className="w-5 h-5" />
-            </div>
-            <div className="min-w-0">
-              <p className="text-sm text-neutral-400">Signed in as</p>
-              <p className="font-semibold truncate">{user?.full_name ?? "—"}</p>
-            </div>
+    <div className="min-h-full bg-[#050505] text-white">
+      <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-8 space-y-8">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div>
+            <p className="text-sm uppercase tracking-[0.24em] text-white/40">
+              Dashboard
+            </p>
+            <h1 className="mt-2 text-4xl md:text-5xl font-bold tracking-tight">
+              User Profile
+            </h1>
+            <p className="mt-3 text-white/55 max-w-2xl">
+              Your trained agents and performance analytics in one place.
+            </p>
+            {err ? <p className="mt-3 text-sm text-rose-400">{err}</p> : null}
           </div>
 
-          <div className="space-y-2 text-sm text-neutral-300">
-            <div className="flex justify-between gap-3">
-              <span className="text-neutral-500">Email</span>
-              <span className="truncate">{user?.email ?? "—"}</span>
+          <div className="flex items-center gap-3">
+            <div className="inline-flex items-center gap-2 rounded-2xl border border-white/10 bg-white/[0.04] px-4 py-2 text-sm text-white/70">
+              <Activity className="h-4 w-4 text-violet-300" />
+              Active
             </div>
-            <div className="flex justify-between gap-3">
-              <span className="text-neutral-500">Role</span>
-              <span>{user?.is_admin ? "Admin" : "User"}</span>
-            </div>
+
+            <button
+              onClick={refresh}
+              className="inline-flex items-center gap-2 rounded-2xl border border-white/10 bg-white/[0.05] px-4 py-2 text-sm text-white hover:bg-white/[0.08] transition"
+            >
+              <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
+              Refresh
+            </button>
           </div>
         </div>
 
-        {/* Current learner card */}
-        <div className="bg-neutral-900/40 border border-neutral-800 rounded-2xl p-6 lg:col-span-2">
-          <div className="flex items-center gap-3 mb-4">
-            <div className="w-10 h-10 rounded-2xl bg-neutral-800 flex items-center justify-center">
-              <Bot className="w-5 h-5" />
-            </div>
-            <div className="min-w-0">
-              <p className="text-sm text-neutral-400">Current learner</p>
-              <p className="font-semibold truncate">{learnerLabel}</p>
-            </div>
-          </div>
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+          <StatCard
+            title="Trained Agents"
+            value={`${trainedAgentsCount}`}
+            subtitle={cfg ? `Last used: ${cfgLabel(cfg)}` : "No learner used yet"}
+            icon={<Brain className="h-5 w-5 text-fuchsia-300" />}
+            accent="border-fuchsia-500/30 text-fuchsia-300"
+          />
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
-            <div className="rounded-xl border border-neutral-800 bg-neutral-900/40 p-4">
-              <p className="text-neutral-500">Learner kind</p>
-              <p className="mt-1 font-medium">{cfg?.learner_kind ?? "—"}</p>
-            </div>
-            <div className="rounded-xl border border-neutral-800 bg-neutral-900/40 p-4">
-              <p className="text-neutral-500">Goal kind</p>
-              <p className="mt-1 font-medium">{cfg?.goal_kind ?? "—"}</p>
-            </div>
-            <div className="rounded-xl border border-neutral-800 bg-neutral-900/40 p-4">
-              <p className="text-neutral-500">Seed</p>
-              <p className="mt-1 font-medium">{cfg?.seed ?? "—"}</p>
-            </div>
-            <div className="rounded-xl border border-neutral-800 bg-neutral-900/40 p-4">
-              <p className="text-neutral-500">Learner kwargs</p>
-              <p className="mt-1 font-mono text-xs break-words">
-                {cfg?.learner_kwargs ? JSON.stringify(cfg.learner_kwargs) : "—"}
-              </p>
-            </div>
-          </div>
-        </div>
-      </div>
+          <StatCard
+            title="Tasks Processed"
+            value={shortNumber(totalTasksProcessed)}
+            subtitle="Cluster-wide completed workload"
+            icon={<Sparkles className="h-5 w-5 text-emerald-300" />}
+            accent="border-emerald-500/30 text-emerald-300"
+          />
 
-      {/* Agent history */}
-      <div className="bg-neutral-900/40 border border-neutral-800 rounded-2xl p-6">
-        <div className="flex items-center gap-2 mb-4">
-          <History className="w-4 h-4" />
-          <h2 className="text-xl font-bold">Agent history (configs you used)</h2>
+          <StatCard
+            title="Avg Agent Latency (ms)"
+            value={formatLatency(avgLatency)}
+            subtitle="Mean latency from cluster stats"
+            icon={<Gauge className="h-5 w-5 text-amber-300" />}
+            accent="border-amber-500/30 text-amber-300"
+          />
         </div>
 
-        {loading ? (
-          <p className="text-sm text-neutral-500">Loading…</p>
-        ) : history.length === 0 ? (
-          <p className="text-sm text-neutral-500">
-            No agent history yet. Run simulation / submit at least 1 job.
-          </p>
-        ) : (
-          <div className="divide-y divide-neutral-800">
-            {history.map((h, i) => {
-              const c = h.config;
-              const active = selectedKey && cfgKey(c) === selectedKey;
+        <div className="space-y-6">
+          <GlassCard className="p-5 md:p-6">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <div className="flex h-10 w-10 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.04]">
+                  <Bot className="h-5 w-5 text-fuchsia-300" />
+                </div>
+                <div>
+                  <h2 className="text-lg font-semibold">Trained Agents</h2>
+                  <p className="text-xs text-white/45">
+                    {trainedAgentsCount} trained
+                  </p>
+                </div>
+              </div>
+            </div>
 
-              return (
-                <button
-                  key={`${h.time_ms}-${i}`}
-                  onClick={() => setSelectedCfg(c)}
-                  className={`w-full text-left py-3 px-2 rounded-xl transition ${
-                    active
-                      ? "bg-indigo-500/10 border border-indigo-500/20"
-                      : "hover:bg-neutral-800/40"
-                  }`}
-                >
-                  <div className="flex items-start justify-between gap-4">
-                    <div className="min-w-0">
-                      <p className="text-sm font-medium truncate">{cfgLabel(c)}</p>
-                      <p className="text-xs text-neutral-500 mt-1">{fmtTime(h.time_ms)}</p>
-                    </div>
+            {!cfg && history.length === 0 ? (
+              <div className="flex min-h-[280px] flex-col items-center justify-center text-center">
+                <div className="flex h-16 w-16 items-center justify-center rounded-full border border-white/10 bg-white/[0.03]">
+                  <Brain className="h-8 w-8 text-white/25" />
+                </div>
+                <p className="mt-5 text-white/65">No agents trained yet</p>
+                <p className="mt-2 text-sm text-white/40">
+                  Visit Simulation to train an agent.
+                </p>
+              </div>
+            ) : (
+              <div className="mt-5 grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,340px)_minmax(0,1fr)]">
+                <div className="space-y-3 max-h-[360px] overflow-y-auto pr-1">
+                  {history.map((h, i) => {
+                    const active = selectedKey && cfgKey(h.config) === selectedKey;
 
-                    <div className="text-xs text-neutral-500 font-mono max-w-[55%] break-words text-right">
-                      {c.seed != null ? `seed=${c.seed}` : ""}
-                      {c.learner_kwargs ? ` kwargs=${JSON.stringify(c.learner_kwargs)}` : ""}
-                    </div>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-        )}
-      </div>
+                    return (
+                      <button
+                        key={`${h.time_ms}-${i}`}
+                        onClick={() => setSelectedCfg(h.config)}
+                        className={`w-full rounded-2xl border p-4 text-left transition ${
+                          active
+                            ? "border-fuchsia-500/30 bg-fuchsia-500/10"
+                            : "border-white/10 bg-white/[0.03] hover:bg-white/[0.05]"
+                        }`}
+                      >
+                        <p className="font-medium text-white">{cfgLabel(h.config)}</p>
+                        <p className="mt-1 text-xs text-white/45">{fmtTime(h.time_ms)}</p>
 
-      {/* Explanations for selected agent */}
-      <div className="bg-neutral-900/40 border border-neutral-800 rounded-2xl p-6">
-        <div className="flex items-center gap-2 mb-4">
-          <History className="w-4 h-4" />
-          <h2 className="text-xl font-bold">
-            Recent learner activity (agent explanations)
-            {selectedCfg ? (
-              <span className="text-sm font-normal text-neutral-500 ml-2">
-                — {cfgLabel(selectedCfg)}
-              </span>
-            ) : null}
-          </h2>
-        </div>
-
-        {loading || eventsLoading ? (
-          <p className="text-sm text-neutral-500">Loading…</p>
-        ) : !selectedCfg ? (
-          <p className="text-sm text-neutral-500">Pick an agent config from history to view events.</p>
-        ) : agentEvents.length === 0 ? (
-          <p className="text-sm text-neutral-500">No agent events yet for this config.</p>
-        ) : (
-          <div className="divide-y divide-neutral-800">
-            {agentEvents.map((ev, i) => (
-              <div key={ev?.id ?? i} className="py-3">
-                <div className="flex items-start justify-between gap-4">
-                  <div className="min-w-0">
-                    <p className="text-sm font-medium truncate">
-                      {ev?.type ?? "event"}{" "}
-                      <span className="text-neutral-500 font-normal">
-                        {ev?.message ? `— ${ev.message}` : ""}
-                      </span>
-                    </p>
-                    <p className="text-xs text-neutral-500 mt-1">
-                      {fmtTime(ev?.ts_ms ?? ev?.time_ms ?? Date.now())}
-                    </p>
-                  </div>
-
-                  <div className="text-xs text-neutral-500 font-mono text-right break-words max-w-[45%]">
-                    {ev?.policy ? `policy=${ev.policy}` : ""}
-                    {ev?.chosen_node ? ` node=${ev.chosen_node}` : ""}
-                  </div>
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          <span className="rounded-full bg-white/[0.05] px-2.5 py-1 text-[11px] text-white/60">
+                            seed: {h.config.seed ?? "—"}
+                          </span>
+                          <span className="rounded-full bg-white/[0.05] px-2.5 py-1 text-[11px] text-white/60">
+                            {h.config.learner_kind}
+                          </span>
+                          <span className="rounded-full bg-white/[0.05] px-2.5 py-1 text-[11px] text-white/60">
+                            {h.config.goal_kind}
+                          </span>
+                        </div>
+                      </button>
+                    );
+                  })}
                 </div>
 
-                {ev?.detail ? (
-                  <pre className="mt-2 text-xs text-neutral-400 bg-neutral-950/40 border border-neutral-800 rounded-xl p-3 overflow-auto">
-                    {JSON.stringify(ev.detail, null, 2)}
-                  </pre>
-                ) : null}
+                <div className="rounded-3xl border border-white/10 bg-white/[0.03] p-5">
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
+                      <p className="text-xs uppercase tracking-wide text-white/40">
+                        Current learner
+                      </p>
+                      <p className="mt-2 font-semibold text-white">
+                        {cfg ? cfg.learner_kind : "—"}
+                      </p>
+                    </div>
+
+                    <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
+                      <p className="text-xs uppercase tracking-wide text-white/40">Goal</p>
+                      <p className="mt-2 font-semibold text-white">
+                        {cfg ? cfg.goal_kind : "—"}
+                      </p>
+                    </div>
+
+                    <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
+                      <p className="text-xs uppercase tracking-wide text-white/40">Seed</p>
+                      <p className="mt-2 font-semibold text-white">
+                        {cfg?.seed ?? "—"}
+                      </p>
+                    </div>
+
+                    <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
+                      <p className="text-xs uppercase tracking-wide text-white/40">User</p>
+                      <p className="mt-2 font-semibold text-white truncate">
+                        {user?.full_name ?? user?.email ?? "—"}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 rounded-2xl border border-white/10 bg-black/20 p-4">
+                    <p className="text-xs uppercase tracking-wide text-white/40">
+                      Learner kwargs
+                    </p>
+                    <pre className="mt-3 overflow-auto text-xs text-white/70 whitespace-pre-wrap break-words">
+                      {cfg?.learner_kwargs
+                        ? JSON.stringify(cfg.learner_kwargs, null, 2)
+                        : "—"}
+                    </pre>
+                  </div>
+                </div>
               </div>
-            ))}
-          </div>
-        )}
+            )}
+          </GlassCard>
+
+          <GlassCard className="p-5 md:p-6">
+            <div className="flex items-center gap-3 mb-5">
+              <div className="flex h-10 w-10 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.04]">
+                <Cpu className="h-5 w-5 text-emerald-300" />
+              </div>
+              <div>
+                <h2 className="text-lg font-semibold">Recent Learner Activity</h2>
+                <p className="text-xs text-white/45">
+                  {selectedCfg ? cfgLabel(selectedCfg) : "Pick a config to inspect"}
+                </p>
+              </div>
+            </div>
+
+            {loading || eventsLoading ? (
+              <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4 text-sm text-white/50">
+                Loading activity...
+              </div>
+            ) : !selectedCfg ? (
+              <div className="rounded-2xl border border-dashed border-white/10 bg-white/[0.03] p-6 text-sm text-white/45">
+                Pick an agent config from the list above to view learner activity.
+              </div>
+            ) : agentEvents.length === 0 ? (
+              <div className="rounded-2xl border border-dashed border-white/10 bg-white/[0.03] p-6 text-sm text-white/45">
+                No agent events yet for this config.
+              </div>
+            ) : (
+              <div className="space-y-3 max-h-[420px] overflow-y-auto pr-1">
+                {agentEvents.map((ev, i) => (
+                  <div
+                    key={ev?.id ?? i}
+                    className="rounded-2xl border border-white/10 bg-white/[0.03] p-4"
+                  >
+                    <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                      <div className="min-w-0">
+                        <p className="font-medium text-white">
+                          {ev?.type ?? "event"}
+                          {ev?.message ? (
+                            <span className="font-normal text-white/55"> — {ev.message}</span>
+                          ) : null}
+                        </p>
+                        <p className="mt-1 text-xs text-white/40">
+                          {fmtTime(ev?.ts_ms ?? ev?.time_ms ?? Date.now())}
+                        </p>
+                      </div>
+
+                      <div className="flex flex-wrap gap-2 md:justify-end">
+                        {ev?.policy ? (
+                          <span className="rounded-full bg-white/[0.05] px-2.5 py-1 text-[11px] text-white/60">
+                            policy={ev.policy}
+                          </span>
+                        ) : null}
+                        {ev?.chosen_node ? (
+                          <span className="rounded-full bg-white/[0.05] px-2.5 py-1 text-[11px] text-white/60">
+                            node={ev.chosen_node}
+                          </span>
+                        ) : null}
+                      </div>
+                    </div>
+
+                    {ev?.detail ? (
+                      <pre className="mt-3 overflow-auto rounded-2xl border border-white/10 bg-black/20 p-3 text-xs text-white/65 whitespace-pre-wrap break-words">
+                        {JSON.stringify(ev.detail, null, 2)}
+                      </pre>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            )}
+          </GlassCard>
+        </div>
       </div>
     </div>
   );

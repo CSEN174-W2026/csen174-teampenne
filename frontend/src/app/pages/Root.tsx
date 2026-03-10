@@ -93,24 +93,24 @@ export function Root() {
             >
               {isSidebarOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
             </button>
-            <div className="relative group">
+            {/* <div className="relative group">
               <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-neutral-500 group-focus-within:text-indigo-400 transition-colors" />
               <input 
                 type="text" 
                 placeholder="Search resources..." 
                 className="bg-neutral-800/50 border border-neutral-700 rounded-full py-1.5 pl-10 pr-4 text-sm focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all w-64 lg:w-96"
               />
-            </div>
+            </div> */}
           </div>
 
           <div className="flex items-center gap-6">
-            <div className="flex items-center gap-2">
+            {/* <div className="flex items-center gap-2">
               <div className="flex -space-x-2">
                 <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
                 <div className="w-2 h-2 rounded-full bg-emerald-500 blur-[2px]" />
               </div>
               <span className="text-xs font-medium text-emerald-500">SYSTEM HEALTHY</span>
-            </div>
+            </div> */}
             
             <button className="relative p-2 text-neutral-400 hover:text-white transition-colors">
               <Bell className="w-5 h-5" />

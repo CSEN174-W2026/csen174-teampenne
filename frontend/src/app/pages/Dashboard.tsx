@@ -216,7 +216,7 @@ export function Dashboard() {
               Recent Activity
               <Clock className="w-4 h-4 text-amber-400" />
             </h2>
-            <button className="text-xs text-indigo-400 font-medium hover:underline">View All</button>
+            {/* <button className="text-xs text-indigo-400 font-medium hover:underline">View All</button> */}
           </div>
 
           <div className="flex-1 space-y-4">

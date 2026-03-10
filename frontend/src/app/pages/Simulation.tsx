@@ -79,7 +79,47 @@ interface AgentState {
 type RealJobUI = JobExecutionRecord & {
   node_host?: string | null;
   node_port?: number | null;
+  progressPct?: number;
 };
+
+type QueuedRealFile = {
+  id: string;
+  name: string;
+  content: string;
+  args: string[];
+  timeout_s: number;
+  autoSubmitted: boolean;
+  submittedJobId?: string | null;
+};
+
+function parseArgs(input: string) {
+  return input
+    .split(" ")
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+// function estimateJobProgress(job: Partial<RealJobUI>) {
+//   const combinedLogs = `${job.stdout ?? ""}\n${job.stderr ?? ""}`;
+//   const percentMatches = Array.from(combinedLogs.matchAll(/(\d{1,3})\s*%/g))
+//     .map((match) => Number(match[1]))
+//     .filter((value) => Number.isFinite(value) && value >= 0 && value <= 100);
+
+//   if (percentMatches.length > 0) {
+//     return percentMatches[percentMatches.length - 1];
+//   }
+
+//   if (job.status === "completed" || job.status === "failed" || job.status === "timeout") {
+//     return 100;
+//   }
+//   if (job.status === "running") {
+//     return 60;
+//   }
+//   if (job.status === "queued") {
+//     return 8;
+//   }
+//   return 0;
+// }
 
 const POLICY_COLORS: Record<Policy, string> = {
   "round-robin": "#6366f1",
@@ -279,13 +319,13 @@ export function Simulation() {
 
   const [manualTask, setManualTask] = useState({ cpu: 20, mem: 128, duration: 10 });
 
-  const [uploadedFileName, setUploadedFileName] = useState("");
-  const [uploadedScript, setUploadedScript] = useState("");
+  const [queuedRealFiles, setQueuedRealFiles] = useState<QueuedRealFile[]>([]);
   const [scriptArgs, setScriptArgs] = useState("");
   const [scriptTimeoutS, setScriptTimeoutS] = useState(60);
   const [realJobError, setRealJobError] = useState<string | null>(null);
   const [submittingRealJob, setSubmittingRealJob] = useState(false);
   const [realJobs, setRealJobs] = useState<RealJobUI[]>([]);
+  const autoSubmittingRealJobsRef = useRef(false);
 
   const POLICY_OPTIONS: { ui: Policy; backend: string; label: string }[] = useMemo(
     () => [
@@ -619,135 +659,188 @@ export function Simulation() {
 
   const onPythonFileSelected = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      if (!file) return;
+      const files = Array.from(e.target.files ?? []);
+      if (files.length === 0) return;
 
-      if (!file.name.toLowerCase().endsWith(".py")) {
-        setRealJobError("Please upload a .py file");
+      const invalidFile = files.find((file) => !file.name.toLowerCase().endsWith(".py"));
+      if (invalidFile) {
+        setRealJobError("Please upload only .py files");
         return;
       }
 
       try {
-        const text = await file.text();
-        setUploadedFileName(file.name);
-        setUploadedScript(text);
+        const loadedFiles = await Promise.all(
+          files.map(async (file) => ({
+            id: `${file.name}-${file.size}-${file.lastModified}-${Math.random()
+              .toString(36)
+              .slice(2)}`,
+            name: file.name,
+            content: await file.text(),
+            args: parseArgs(scriptArgs),
+            timeout_s: scriptTimeoutS,
+            autoSubmitted: false,
+            submittedJobId: null,
+          }))
+        );
+
+        setQueuedRealFiles((prev) => [...prev, ...loadedFiles]);
         setRealJobError(null);
+        e.target.value = "";
       } catch (err) {
         console.error("Failed to read uploaded file:", err);
         setRealJobError("Failed to read the uploaded file");
       }
     },
-    []
+    [scriptArgs, scriptTimeoutS]
   );
 
-  const submitRealJob = useCallback(async () => {
-    if (!uploadedScript.trim()) {
-      setRealJobError("Upload a Python script first.");
+  const submitQueuedRealJob = useCallback(
+    async (file: QueuedRealFile) => {
+      if (!file.content.trim()) {
+        setRealJobError("Upload a Python script first.");
+        return null;
+      }
+
+      if (nodeGroups.length > 0) {
+        if (!selectedSimulationGroup) {
+          setRealJobError("Select a node group before submitting real jobs.");
+          return null;
+        }
+        if (allowedNodeKeys.size === 0) {
+          setRealJobError("No connected nodes in this group. Connect group nodes first.");
+          return null;
+        }
+      }
+
+      const manualPolicyBackend =
+        POLICY_OPTIONS.find((p) => p.ui === policy)?.backend ?? "round_robin";
+
+      const jobId = mkJobId();
+
+      const job = {
+        job_id: jobId,
+        user_id: userId,
+        job_type: "python_script" as const,
+        script_name: file.name || "job.py",
+        script_content: file.content,
+        args: file.args,
+        timeout_s: file.timeout_s,
+        metadata: {
+          selected_group_id: selectedSimulationGroup?.id ?? null,
+          selected_group_name: selectedSimulationGroup?.name ?? null,
+          allowed_node_keys: Array.from(allowedNodeKeys),
+          manual_policy: isAgentControlled ? null : manualPolicyBackend,
+        },
+      };
+
+      try {
+        setSubmittingRealJob(true);
+        setRealJobError(null);
+
+        const resp: any = await submitJob({ config: agentConfig, job });
+
+        const host =
+          resp?.node_response?.node_host ??
+          resp?.decision?.node?.host ??
+          resp?.decision?.host ??
+          null;
+
+        const port =
+          resp?.node_response?.node_port ??
+          resp?.decision?.node?.port ??
+          resp?.decision?.port ??
+          null;
+
+        const nodeName =
+          resp?.node_response?.node_name ??
+          resp?.decision?.node?.name ??
+          resp?.decision?.node_name ??
+          null;
+
+        setRealJobs((prev) => [
+          {
+            job_id: jobId,
+            user_id: userId,
+            job_type: "python_script",
+            script_name: file.name || "job.py",
+            status: "queued",
+            queued_at_ms: Date.now(),
+            started_at_ms: null,
+            finished_at_ms: null,
+            observed_latency_ms: null,
+            service_time_ms: null,
+            exit_code: null,
+            stdout: null,
+            stderr: null,
+            node_name: nodeName ?? null,
+            node_host: host ?? null,
+            node_port: port ?? null,
+            progressPct: 8,
+          },
+          ...prev,
+        ]);
+
+        setQueuedRealFiles((prev) =>
+          prev.map((queued) =>
+            queued.id === file.id
+              ? {
+                  ...queued,
+                  autoSubmitted: true,
+                  submittedJobId: jobId,
+                }
+              : queued
+          )
+        );
+
+        return jobId;
+      } catch (err: any) {
+        console.error("submitRealJob failed:", err);
+        setRealJobError(err?.message ?? "Failed to submit real job");
+        return null;
+      } finally {
+        setSubmittingRealJob(false);
+      }
+    },
+    [
+      nodeGroups.length,
+      selectedSimulationGroup,
+      selectedSimulationGroup?.id,
+      selectedSimulationGroup?.name,
+      allowedNodeKeys,
+      policy,
+      isAgentControlled,
+      agentConfig,
+      userId,
+      POLICY_OPTIONS,
+    ]
+  );
+
+  const submitAllQueuedRealJobs = useCallback(async () => {
+    const pendingFiles = queuedRealFiles.filter((file) => !file.autoSubmitted);
+
+    if (pendingFiles.length === 0) {
+      setRealJobError("Upload one or more Python scripts first.");
       return;
     }
 
-    if (nodeGroups.length > 0) {
-      if (!selectedSimulationGroup) {
-        setRealJobError("Select a node group before submitting real jobs.");
-        return;
-      }
-      if (allowedNodeKeys.size === 0) {
-        setRealJobError("No connected nodes in this group. Connect group nodes first.");
-        return;
-      }
-    }
-
-    const manualPolicyBackend =
-      POLICY_OPTIONS.find((p) => p.ui === policy)?.backend ?? "round_robin";
-
-    const jobId = mkJobId();
-
-    const job = {
-      job_id: jobId,
-      user_id: userId,
-      job_type: "python_script" as const,
-      script_name: uploadedFileName || "job.py",
-      script_content: uploadedScript,
-      args: scriptArgs
-        .split(" ")
-        .map((x) => x.trim())
-        .filter(Boolean),
-      timeout_s: scriptTimeoutS,
-      metadata: {
-        selected_group_id: selectedSimulationGroup?.id ?? null,
-        selected_group_name: selectedSimulationGroup?.name ?? null,
-        allowed_node_keys: Array.from(allowedNodeKeys),
-        manual_policy: isAgentControlled ? null : manualPolicyBackend,
-      },
-    };
-
+    autoSubmittingRealJobsRef.current = true;
     try {
-      setSubmittingRealJob(true);
-      setRealJobError(null);
-
-      const resp: any = await submitJob({ config: agentConfig, job });
-
-      const host =
-        resp?.node_response?.node_host ??
-        resp?.decision?.node?.host ??
-        resp?.decision?.host ??
-        null;
-
-      const port =
-        resp?.node_response?.node_port ??
-        resp?.decision?.node?.port ??
-        resp?.decision?.port ??
-        null;
-
-      const nodeName =
-        resp?.node_response?.node_name ??
-        resp?.decision?.node?.name ??
-        resp?.decision?.node_name ??
-        null;
-
-      setRealJobs((prev) => [
-        {
-          job_id: jobId,
-          user_id: userId,
-          job_type: "python_script",
-          script_name: uploadedFileName || "job.py",
-          status: "queued",
-          queued_at_ms: Date.now(),
-          started_at_ms: null,
-          finished_at_ms: null,
-          observed_latency_ms: null,
-          service_time_ms: null,
-          exit_code: null,
-          stdout: null,
-          stderr: null,
-          node_name: nodeName ?? null,
-          node_host: host ?? null,
-          node_port: port ?? null,
-        },
-        ...prev,
-      ]);
-    } catch (err: any) {
-      console.error("submitRealJob failed:", err);
-      setRealJobError(err?.message ?? "Failed to submit real job");
+      for (const file of pendingFiles) {
+        // eslint-disable-next-line no-await-in-loop
+        await submitQueuedRealJob(file);
+      }
     } finally {
-      setSubmittingRealJob(false);
+      autoSubmittingRealJobsRef.current = false;
     }
-  }, [
-    uploadedScript,
-    uploadedFileName,
-    scriptArgs,
-    scriptTimeoutS,
-    nodeGroups.length,
-    selectedSimulationGroup,
-    selectedSimulationGroup?.id,
-    selectedSimulationGroup?.name,
-    allowedNodeKeys,
-    policy,
-    isAgentControlled,
-    agentConfig,
-    userId,
-    POLICY_OPTIONS,
-  ]);
+  }, [queuedRealFiles, submitQueuedRealJob]);
+
+  const removeQueuedRealFile = useCallback((id: string) => {
+    setQueuedRealFiles((prev) => prev.filter((file) => file.id !== id));
+  }, []);
+
+  const clearQueuedRealFiles = useCallback(() => {
+    setQueuedRealFiles([]);
+  }, []);
 
   const spikeLoad = useCallback(async () => {
     for (let i = 0; i < 10; i++) {
@@ -897,7 +990,12 @@ export function Simulation() {
       const next = await Promise.all(
         realJobs.map(async (job) => {
           if (!job) return job;
-          if (job.status !== "queued" && job.status !== "running") return job;
+          if (job.status !== "queued" && job.status !== "running") {
+            return {
+              ...job,
+              // progressPct: estimateJobProgress(job),
+            };
+          }
 
           let host = job.node_host;
           let port = job.node_port;
@@ -917,11 +1015,16 @@ export function Simulation() {
 
           try {
             const fresh = await getNodeJobStatus(host, port, job.job_id);
-            return {
+            const mergedJob = {
               ...job,
               ...fresh,
               node_host: host,
               node_port: port,
+            } as RealJobUI;
+
+            return {
+              ...mergedJob,
+              // progressPct: estimateJobProgress(mergedJob),
             };
           } catch {
             return job;
@@ -950,7 +1053,7 @@ export function Simulation() {
     if (simStartMsRef.current == null) simStartMsRef.current = nowMs();
 
     void pollManager();
-    pollIntervalRef.current = window.setInterval(() => void pollManager(), 1500);
+    pollIntervalRef.current = window.setInterval(() => void pollManager(), 4000);
 
     const jobsPerSec = Math.max(0, Number(simulationSpeed) || 0);
     if (jobsPerSec > 0) {
@@ -965,6 +1068,15 @@ export function Simulation() {
       pollIntervalRef.current = null;
     };
   }, [isRunning, pollManager, submitOneJob, simulationSpeed]);
+
+  useEffect(() => {
+    if (!isRunning) return;
+    if (queuedRealFiles.length === 0) return;
+    if (autoSubmittingRealJobsRef.current) return;
+    if (!queuedRealFiles.some((file) => !file.autoSubmitted)) return;
+
+    void submitAllQueuedRealJobs();
+  }, [isRunning, queuedRealFiles, submitAllQueuedRealJobs]);
 
   const resetSimulation = () => {
     setIsRunning(false);
@@ -982,8 +1094,7 @@ export function Simulation() {
     setLastChosenNodeLabel("—");
     setScopeError(null);
 
-    setUploadedFileName("");
-    setUploadedScript("");
+    setQueuedRealFiles([]);
     setScriptArgs("");
     setScriptTimeoutS(60);
     setRealJobError(null);
@@ -1107,8 +1218,8 @@ export function Simulation() {
                 </div>
               </div>
 
-              <div className="px-5 py-4 space-y-3">
-                <div className="text-sm leading-relaxed whitespace-pre-wrap">
+              <div className="space-y-3 px-5 py-4">
+                <div className="whitespace-pre-wrap text-sm leading-relaxed">
                   {currentExplanation?.text ?? "(no explanation text)"}
                 </div>
 
@@ -1263,26 +1374,26 @@ export function Simulation() {
 
                 <div className="mb-4 flex items-center gap-2">
                   <div className="h-2 w-2 animate-pulse rounded-full bg-purple-400" />
-                  <h3 className="font-semibold text-purple-300">Agent Intelligence</h3>
+                  <h3 className="font-semibold text-white">Agent Intelligence</h3>
                 </div>
 
-                <div className="relative z-10 space-y-4">
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="font-bold uppercase tracking-tighter text-purple-400">Status</span>
-                    <span className="rounded border border-purple-400/30 bg-purple-500/40 px-2 py-0.5 capitalize text-white">
-                      {agent.status}
-                    </span>
+                <div className="space-y-3">
+                  <div className="space-y-1">
+                    <p className="text-[10px] font-bold uppercase text-purple-400">Status</p>
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-neutral-300">{agent.status}</span>
+                      <span className="font-mono text-white">
+                        {Math.round(agent.explorationRate * 100)}%
+                      </span>
+                    </div>
                   </div>
 
-                  <div className="space-y-3 pt-2">
-                    <div className="flex justify-between text-[10px] text-purple-300">
-                      <span>Exploration Rate</span>
-                      <span className="font-mono">{(agent.explorationRate * 100).toFixed(0)}%</span>
-                    </div>
-                    <div className="h-1 overflow-hidden rounded-full bg-purple-900/50">
+                  <div className="space-y-1">
+                    <p className="text-[10px] font-bold uppercase text-purple-400">Exploration Rate</p>
+                    <div className="h-1 overflow-hidden rounded-full bg-purple-900/30">
                       <Motion.div
-                        animate={{ width: `${agent.explorationRate * 100}%` }}
-                        className="h-full bg-purple-400"
+                        animate={{ width: `${Math.max(5, agent.explorationRate * 100)}%` }}
+                        className="h-full bg-purple-500"
                       />
                     </div>
                   </div>
@@ -1555,6 +1666,7 @@ export function Simulation() {
               <input
                 type="file"
                 accept=".py"
+                multiple
                 onChange={onPythonFileSelected}
                 className="block w-full text-sm text-zinc-300"
               />
@@ -1578,19 +1690,54 @@ export function Simulation() {
               />
 
               <div className="rounded-xl border border-white/10 bg-zinc-950/50 p-3">
-                <div className="text-sm text-zinc-400">Uploaded file</div>
-                <div className="mt-1 text-sm text-white">{uploadedFileName || "None"}</div>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-sm text-zinc-400">Uploaded files</div>
+                  <div className="text-xs text-zinc-500">{queuedRealFiles.length} queued</div>
+                </div>
+                {queuedRealFiles.length === 0 ? (
+                  <div className="mt-1 text-sm text-white">None</div>
+                ) : (
+                  <div className="mt-2 max-h-40 space-y-2 overflow-auto pr-1">
+                    {queuedRealFiles.map((file) => (
+                      <div
+                        key={file.id}
+                        className="flex items-center justify-between gap-3 rounded-lg border border-white/10 bg-black/20 px-3 py-2"
+                      >
+                        <div className="min-w-0">
+                          <div className="truncate text-sm text-white">{file.name}</div>
+                          <div className="text-[11px] text-zinc-500">
+                            {file.autoSubmitted ? "Submitted" : "Ready to submit"}
+                          </div>
+                        </div>
+                        <button
+                          onClick={() => removeQueuedRealFile(file.id)}
+                          className="rounded-md px-2 py-1 text-xs text-zinc-400 transition-colors hover:bg-white/5 hover:text-white"
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
                 <div className="mt-3 text-xs text-zinc-500">
-                  This submits a real executable Python job instead of a fake timed workload.
+                  This submits real executable Python jobs instead of fake timed workloads. Start the simulation to auto-submit the whole queue, or use the button below.
                 </div>
               </div>
 
               <button
-                onClick={submitRealJob}
-                disabled={submittingRealJob}
+                onClick={() => void submitAllQueuedRealJobs()}
+                disabled={submittingRealJob || queuedRealFiles.length === 0}
                 className="w-full rounded-xl bg-indigo-500 px-4 py-2 text-sm font-medium text-white disabled:opacity-50"
               >
-                {submittingRealJob ? "Submitting..." : "Submit Python Job"}
+                {submittingRealJob ? "Submitting..." : "Submit All Python Jobs"}
+              </button>
+
+              <button
+                onClick={clearQueuedRealFiles}
+                disabled={queuedRealFiles.length === 0}
+                className="w-full rounded-xl border border-white/10 bg-zinc-950/40 px-4 py-2 text-sm font-medium text-zinc-200 disabled:opacity-50"
+              >
+                Clear Queue
               </button>
 
               {realJobError && <div className="text-sm text-red-400">{realJobError}</div>}
@@ -1797,7 +1944,7 @@ export function Simulation() {
             <div className="mb-4 flex items-center justify-between">
               <h3 className="text-lg font-semibold text-white">Live Real Job Monitor</h3>
               <span className="text-xs text-zinc-400">
-                Upload a Python script and watch its execution status
+                Upload Python scripts and watch their execution status
               </span>
             </div>
 
@@ -1807,44 +1954,67 @@ export function Simulation() {
               </div>
             ) : (
               <div className="space-y-3">
-                {realJobs.map((job) => (
-                  <div
-                    key={job.job_id}
-                    className="rounded-xl border border-white/10 bg-zinc-950/40 p-4"
-                  >
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div>
-                        <div className="text-sm font-medium text-white">
-                          {job.script_name || job.job_id}
+                {realJobs.map((job) => {
+                  // const progressPct = estimateJobProgress(job);
+                  // const progressTone =
+                  //   job.status === "completed"
+                  //     ? "bg-emerald-500"
+                  //     : job.status === "failed" || job.status === "timeout"
+                  //       ? "bg-rose-500"
+                  //       : "bg-cyan-500";
+
+                  return (
+                    <div
+                      key={job.job_id}
+                      className="rounded-xl border border-white/10 bg-zinc-950/40 p-4"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                          <div className="text-sm font-medium text-white">
+                            {job.script_name || job.job_id}
+                          </div>
+                          <div className="text-xs text-zinc-500">{job.job_id}</div>
                         </div>
-                        <div className="text-xs text-zinc-500">{job.job_id}</div>
+                        <div className="text-xs text-zinc-300">
+                          {job.node_name ? `Node: ${job.node_name}` : "Node pending"}
+                        </div>
                       </div>
-                      <div className="text-xs text-zinc-300">
-                        {job.node_name ? `Node: ${job.node_name}` : "Node pending"}
+
+                      {/* <div className="mt-3">
+                        <div className="mb-1 flex items-center justify-between text-[11px] text-zinc-400">
+                          <span>Progress</span>
+                          <span>{Math.round(progressPct)}%</span>
+                        </div>
+                        <div className="h-2 overflow-hidden rounded-full bg-white/5">
+                          <div
+                            className={`h-full transition-all duration-500 ${progressTone}`}
+                            style={{ width: `${Math.max(0, Math.min(100, progressPct))}%` }}
+                          />
+                        </div>
+                      </div> */}
+
+                      <div className="mt-3 grid gap-2 text-xs text-zinc-300 md:grid-cols-4">
+                        <div>Status: {job.status}</div>
+                        <div>Exit code: {job.exit_code ?? "-"}</div>
+                        <div>Latency: {job.observed_latency_ms ?? "-"} ms</div>
+                        <div>Type: {job.job_type}</div>
                       </div>
-                    </div>
 
-                    <div className="mt-3 grid gap-2 text-xs text-zinc-300 md:grid-cols-4">
-                      <div>Status: {job.status}</div>
-                      <div>Exit code: {job.exit_code ?? "-"}</div>
-                      <div>Latency: {job.observed_latency_ms ?? "-"} ms</div>
-                      <div>Type: {job.job_type}</div>
-                    </div>
-
-                    {(job.stdout || job.stderr) && (
-                      <details className="mt-3 rounded-lg bg-black/30 p-3">
-                        <summary className="cursor-pointer text-sm text-zinc-200">Logs</summary>
-                        <pre className="mt-2 whitespace-pre-wrap text-xs text-zinc-300">
+                      {(job.stdout || job.stderr) && (
+                        <details className="mt-3 rounded-lg bg-black/30 p-3">
+                          <summary className="cursor-pointer text-sm text-zinc-200">Logs</summary>
+                          <pre className="mt-2 whitespace-pre-wrap text-xs text-zinc-300">
 {`STDOUT:
 ${job.stdout ?? ""}
 
 STDERR:
 ${job.stderr ?? ""}`}
-                        </pre>
-                      </details>
-                    )}
-                  </div>
-                ))}
+                          </pre>
+                        </details>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>
@@ -1879,11 +2049,9 @@ ${job.stderr ?? ""}`}
                           key={p}
                           type="monotone"
                           dataKey={p}
-                          name={p.replace("-", " ")}
                           stroke={POLICY_COLORS[p]}
                           dot={false}
                           strokeWidth={2}
-                          isAnimationActive={false}
                         />
                       ))}
                     </LineChart>
@@ -1891,83 +2059,40 @@ ${job.stderr ?? ""}`}
                 </div>
               </div>
 
-              <div className="overflow-x-auto">
-                <table className="w-full text-left">
-                  <thead>
-                    <tr className="border-b border-neutral-800 text-[10px] uppercase tracking-wider text-neutral-500">
-                      <th className="pb-3 font-medium">Rank</th>
-                      <th className="pb-3 font-medium">Policy</th>
-                      <th className="pb-3 text-right font-medium">Tasks</th>
-                      <th className="pb-3 text-right font-medium">Avg Latency</th>
-                      <th className="pb-3 text-right font-medium">Reward</th>
-                      <th className="pb-3 text-right font-medium">Optimization</th>
+              <div className="overflow-hidden rounded-2xl border border-neutral-800">
+                <table className="min-w-full divide-y divide-neutral-800 text-sm">
+                  <thead className="bg-neutral-950/70">
+                    <tr className="text-left text-[10px] font-bold uppercase tracking-widest text-neutral-500">
+                      <th className="px-4 py-3">Rank</th>
+                      <th className="px-4 py-3">Policy</th>
+                      <th className="px-4 py-3">Tasks</th>
+                      <th className="px-4 py-3">Avg Latency</th>
+                      <th className="px-4 py-3">Reward</th>
+                      <th className="px-4 py-3">Opt-in</th>
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-neutral-800/50">
-                    {leaderboard.map((stat, index) => (
-                      <tr key={stat.policy} className={policy === stat.policy ? "bg-indigo-500/5" : ""}>
-                        <td className="py-3">
-                          <div
-                            className={`flex h-5 w-5 items-center justify-center rounded-full text-[10px] font-bold ${
-                              index === 0
-                                ? "border border-amber-500/30 bg-amber-500/20 text-amber-500"
-                                : "bg-neutral-800 text-neutral-500"
-                            }`}
-                          >
-                            {index + 1}
-                          </div>
-                        </td>
-
-                        <td className="py-3">
+                  <tbody className="divide-y divide-neutral-800 bg-neutral-900">
+                    {leaderboard.map((item, idx) => (
+                      <tr key={item.policy} className="text-neutral-300">
+                        <td className="px-4 py-3">
                           <span
-                            className={`text-sm font-medium capitalize ${
-                              policy === stat.policy
-                                ? "font-bold text-indigo-400"
-                                : "text-neutral-400"
+                            className={`inline-flex h-5 w-5 items-center justify-center rounded-full text-[10px] font-bold ${
+                              idx === 0
+                                ? "bg-amber-500/20 text-amber-300"
+                                : "bg-neutral-800 text-neutral-400"
                             }`}
                           >
-                            {stat.policy.replace("-", " ")}
-                          </span>
-                          <div className="text-[10px] text-neutral-600">
-                            selected {stat.selectionPct.toFixed(0)}%
-                          </div>
-                        </td>
-
-                        <td className="py-3 text-right text-xs font-mono text-neutral-500">
-                          {stat.completedTasks}
-                        </td>
-
-                        <td className="py-3 text-right text-xs font-mono">
-                          <span className={stat.avgLatency > 0 ? "text-neutral-200" : "text-neutral-500"}>
-                            {stat.avgLatency > 0 ? `${stat.avgLatency.toFixed(0)}ms` : "---"}
+                            {idx + 1}
                           </span>
                         </td>
-
-                        <td className="py-3 text-right text-xs font-mono">
-                          <span className={Number.isFinite(stat.reward) ? "text-neutral-200" : "text-neutral-500"}>
-                            {Number.isFinite(stat.reward) ? stat.reward.toFixed(3) : "---"}
-                          </span>
+                        <td className="px-4 py-3 capitalize">{item.policy.replace("-", " ")}</td>
+                        <td className="px-4 py-3 font-mono">{item.completedTasks}</td>
+                        <td className="px-4 py-3 font-mono">
+                          {item.avgLatency > 0 ? `${Math.round(item.avgLatency)} ms` : "—"}
                         </td>
-
-                        <td className="py-3 text-right">
-                          <div className="flex justify-end gap-1">
-                            {stat.recentLatency.slice(-6).map((l, i, arr) => {
-                              const prev = i === 0 ? null : arr[i - 1];
-                              const improved = prev == null ? null : l < prev;
-                              return (
-                                <div
-                                  key={i}
-                                  className={`h-3 w-1 rounded-full ${
-                                    improved == null
-                                      ? "bg-neutral-700/60"
-                                      : improved
-                                        ? "bg-emerald-500/40"
-                                        : "bg-rose-500/40"
-                                  }`}
-                                />
-                              );
-                            })}
-                          </div>
+                        <td className="px-4 py-3 font-mono">{item.reward.toFixed(3)}</td>
+                        <td className="px-4 py-3 font-mono">
+                          {item.selectionPct > 0 ? `${item.selectionPct.toFixed(0)}%` : "selected"}
                         </td>
                       </tr>
                     ))}
@@ -1976,105 +2101,109 @@ ${job.stderr ?? ""}`}
               </div>
             </div>
 
-            <div className="flex flex-col rounded-2xl border border-neutral-800 bg-neutral-900 p-6">
-              <div className="mb-6 flex items-center gap-2">
-                <Activity className="h-5 w-5 text-indigo-400" />
-                <h3 className="text-sm font-semibold">System Diagnostics</h3>
-              </div>
-
-              <div className="flex-1 space-y-6">
-                <div className="rounded-xl border border-neutral-700/30 bg-neutral-800/30 p-4">
-                  <p className="mb-3 text-[10px] font-bold uppercase text-neutral-500">
-                    Live Saturation Flow
-                  </p>
-                  <div className="h-[120px]">
-                    <ResponsiveContainer width="100%" height="100%">
-                      <BarChart data={chartData}>
-                        <XAxis dataKey="name" hide />
-                        <YAxis hide domain={[0, 100]} />
-                        <Bar dataKey="cpu" radius={[2, 2, 0, 0]}>
-                          {chartData.map((entry, index) => (
-                            <Cell
-                              key={`cell-${index}`}
-                              fill={
-                                entry.cpu > 80
-                                  ? "#f43f5e"
-                                  : isAgentControlled
-                                    ? "#a855f7"
-                                    : "#6366f1"
-                              }
-                            />
-                          ))}
-                        </Bar>
-                      </BarChart>
-                    </ResponsiveContainer>
-                  </div>
+            <div className="space-y-6">
+              <div className="rounded-2xl border border-neutral-800 bg-neutral-900 p-6">
+                <div className="mb-6 flex items-center gap-2">
+                  <Activity className="h-5 w-5 text-indigo-400" />
+                  <h3 className="font-semibold">System Diagnostics</h3>
                 </div>
 
-                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <History className="h-4 w-4 text-neutral-300" />
-                      <div className="text-sm font-semibold">Latest Explanation</div>
-                    </div>
-                    <div className="text-xs text-neutral-400">
-                      {latestExplanation?.policy ? String(latestExplanation.policy) : "—"}
+                <div className="space-y-5">
+                  <div>
+                    <p className="mb-2 text-[10px] font-bold uppercase tracking-widest text-neutral-500">
+                      Live Saturation Flow
+                    </p>
+                    <div className="h-[160px] rounded-2xl border border-neutral-800 bg-neutral-950 p-4">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <BarChart data={chartData}>
+                          <XAxis dataKey="name" hide />
+                          <YAxis hide domain={[0, 100]} />
+                          <Tooltip />
+                          <Bar dataKey="cpu" radius={[6, 6, 0, 0]}>
+                            {chartData.map((_, index) => (
+                              <Cell key={index} fill="#6366f1" />
+                            ))}
+                          </Bar>
+                        </BarChart>
+                      </ResponsiveContainer>
                     </div>
                   </div>
 
-                  <div className="mt-3 whitespace-pre-wrap text-sm leading-relaxed text-neutral-200">
-                    {latestExplanation?.text
-                      ? latestExplanation.text
-                      : "No policy switches yet. When the agent switches strategies, you’ll see the explanation here (and the sim will pause)."}
+                  <div className="rounded-2xl border border-neutral-800 bg-neutral-950 p-4">
+                    <div className="mb-2 flex items-center justify-between">
+                      <p className="text-sm font-medium text-white">Latest Explanation</p>
+                      <span className="text-xs text-neutral-500">—</span>
+                    </div>
+                    <p className="text-sm leading-relaxed text-neutral-300">
+                      {latestExplanation?.text
+                        ? latestExplanation.text
+                        : "No policy switches yet. When the agent switches strategies, you'll see the explanation here (and the sim will pause)."}
+                    </p>
                   </div>
 
-                  {latestExplanation?.meta?.from_policy && latestExplanation?.meta?.to_policy ? (
-                    <div className="mt-3 text-xs text-neutral-400">
-                      Switch: {String(latestExplanation.meta.from_policy)} →{" "}
-                      {String(latestExplanation.meta.to_policy)}
-                    </div>
-                  ) : null}
-                </div>
+                  <div className="flex items-center justify-between text-xs text-neutral-500">
+                    <span>System Throughput</span>
+                    <span className="font-mono text-emerald-400">{throughput.toFixed(1)} j/s</span>
+                  </div>
 
-                <div className="mt-auto space-y-3">
-                  <div className="flex justify-between text-xs">
-                    <span className="text-neutral-500">System Throughput</span>
-                    <span className="font-mono font-bold text-emerald-500">
-                      {throughput.toFixed(1)} j/s
+                  <div className="flex items-center justify-between text-xs text-neutral-500">
+                    <span>Mean Latency</span>
+                    <span className="font-mono text-indigo-400">
+                      {overallAvgLatencyMs > 0 ? `${Math.round(overallAvgLatencyMs)} ms` : "—"}
                     </span>
                   </div>
 
-                  <div className="flex justify-between text-xs">
-                    <span className="text-neutral-500">Avg Observed Latency</span>
-                    <span className="font-mono font-bold text-neutral-200">
-                      {overallAvgLatencyMs > 0 ? `${overallAvgLatencyMs.toFixed(0)}ms` : "---"}
-                    </span>
-                  </div>
-
-                  <div className="flex justify-between text-xs">
-                    <span className="text-neutral-500">Optimization Trend</span>
-                    <span className="font-mono font-bold">
-                      {overallLatencyTrail.length >= 2
-                        ? overallLatencyTrail[overallLatencyTrail.length - 1] <
-                          overallLatencyTrail[overallLatencyTrail.length - 2]
-                          ? "Improving"
-                          : "Worsening"
-                        : "---"}
-                    </span>
-                  </div>
-
-                  <div className="flex justify-between text-xs">
-                    <span className="text-neutral-500">Best Policy (by reward)</span>
-                    <span className="font-mono font-bold text-purple-400">
-                      {bestByReward ? bestByReward.replace("-", " ") : "---"}
+                  <div className="flex items-center justify-between text-xs text-neutral-500">
+                    <span>Best Policy</span>
+                    <span className="font-mono capitalize text-purple-400">
+                      {bestByReward.replace("-", " ")}
                     </span>
                   </div>
                 </div>
               </div>
             </div>
           </div>
+
+          {/* <div className="rounded-2xl border border-neutral-800 bg-neutral-900 p-6">
+            <div className="mb-4 flex items-center gap-2">
+              <History className="h-5 w-5 text-neutral-400" />
+              <h3 className="font-semibold">Recent Policy Latencies</h3>
+            </div>
+
+            <div className="h-[220px]">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart
+                  data={leaderboard.flatMap((item) =>
+                    item.recentLatency.map((value, i) => ({
+                      idx: i,
+                      value,
+                      policy: item.policy,
+                    }))
+                  )}
+                >
+                  <XAxis dataKey="idx" />
+                  <YAxis />
+                  <Tooltip />
+                  <Legend />
+                  {leaderboard.map((item) => (
+                    <Line
+                      key={item.policy}
+                      type="monotone"
+                      dataKey={(d: any) => (d.policy === item.policy ? d.value : null)}
+                      name={item.policy}
+                      stroke={POLICY_COLORS[item.policy]}
+                      dot={false}
+                      strokeWidth={2}
+                    />
+                  ))}
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          </div> */}
         </div>
       </div>
     </div>
   );
 }
+
+export default Simulation;

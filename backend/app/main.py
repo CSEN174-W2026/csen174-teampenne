@@ -78,7 +78,7 @@ app.add_middleware(
 # OBSERVE_LOCK = threading.Lock()
 
 # Cache ManagerAgent instances so learning persists per config
-POLL_S = 2.0 # How often to poll nodes for metrics
+POLL_S = 4.0 # How often to poll nodes for metrics
 METRICS_SINK_URL = os.getenv("METRICS_SINK_URL", "http://127.0.0.1:3000/api/metrics/node-samples")
 METRICS_SINK_TIMEOUT_S = float(os.getenv("METRICS_SINK_TIMEOUT_S", "0.8"))
 OBSERVE_DEUP: Set[str] = set() # To track which nodes we've already observed during discovery
@@ -914,6 +914,10 @@ def submit_job(request: SubmitJobRequest):
             cpus=0,
             memory_mb=0,
         )
+
+        print("JOB TYPE SENT TO NODE:", job.job_type)
+        print("SCRIPT NAME:", job.script_name)
+        print("HAS SCRIPT CONTENT:", bool(job.script_content))
 
         node_resp = client.submit_job(node_stub, job)
 
