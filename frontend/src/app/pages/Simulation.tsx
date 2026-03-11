@@ -41,6 +41,7 @@ import {
   getRecentExplanations,
   getNodeJobStatus,
   cancelScopedJobs,
+  pushRunEvent,
   type AgentConfig,
   type NodeGroup,
   type JobExecutionRecord,
@@ -205,6 +206,12 @@ function safePct(x: any) {
   return Math.max(0, Math.min(100, n));
 }
 
+function formatExplanationText(text: unknown) {
+  const raw = String(text ?? "").trim();
+  if (!raw) return "";
+  return raw.replace(/\*\*(.*?)\*\*/g, "$1");
+}
+
 function mkJobId() {
   return `job_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
 }
@@ -359,13 +366,10 @@ function buildPolicyStatsFromBackend(
 export function Simulation() {
   const [isRunning, setIsRunning] = useState(false);
 
-  const [explainOpen, setExplainOpen] = useState(false);
-  const [currentExplanation, setCurrentExplanation] = useState<any | null>(null);
   const [latestExplanation, setLatestExplanation] = useState<any | null>(null);
   const [aiExplainLoading, setAiExplainLoading] = useState(false);
   const [spikeEvents, setSpikeEvents] = useState(0);
   const lastExplainTmsRef = useRef<number>(0);
-  const resumeRunningRef = useRef<boolean>(false);
 
   const [isAgentControlled, setIsAgentControlled] = useState(false);
   const [policy, setPolicy] = useState<ManualOverridePolicy>("none");
@@ -391,6 +395,7 @@ export function Simulation() {
   const [incomingJobs, setIncomingJobs] = useState(0);
   const [submittedJobs, setSubmittedJobs] = useState(0);
   const simStartMsRef = useRef<number | null>(null);
+  const simRunIdRef = useRef<string | null>(null);
 
   const [policyStats, setPolicyStats] = useState<Record<Policy, PolicyStatUI>>({
     "round-robin": {
@@ -661,10 +666,9 @@ export function Simulation() {
   }, [selectedSimulationGroup, selectedSimulationGroupNodeKeys, connectedNodeKeySet]);
 
   const allowedNodeKeys = useMemo(() => {
-    if (selectedSimulationGroup) return selectedGroupConnectedNodeKeys;
-    if (nodeGroups.length > 0) return new Set<string>();
-    return connectedNodeKeySet;
-  }, [connectedNodeKeySet, nodeGroups.length, selectedSimulationGroup, selectedGroupConnectedNodeKeys]);
+    if (!selectedSimulationGroup) return new Set<string>();
+    return selectedGroupConnectedNodeKeys;
+  }, [selectedSimulationGroup, selectedGroupConnectedNodeKeys]);
 
   const renderNodes = useMemo<NodeUI[]>(() => {
     if (nodes.length > 0) return nodes;
@@ -765,15 +769,13 @@ export function Simulation() {
 
   const submitOneJob = useCallback(
     async (metadata: Json = {}) => {
-      if (nodeGroups.length > 0) {
-        if (!selectedSimulationGroup) {
-          setScopeError("Select a node group before submitting jobs.");
-          return;
-        }
-        if (allowedNodeKeys.size === 0) {
-          setScopeError("No connected nodes in this group. Connect group nodes first.");
-          return;
-        }
+      if (allowedNodeKeys.size === 0) {
+        setScopeError(
+          selectedSimulationGroup
+            ? "No connected nodes in this group. Connect group nodes first."
+            : "No connected nodes available. Connect nodes first."
+        );
+        return;
       }
 
       const manualPolicyBackend =
@@ -839,7 +841,6 @@ export function Simulation() {
       isAgentControlled,
       policy,
       POLICY_OPTIONS,
-      nodeGroups.length,
       selectedSimulationGroup,
       selectedSimulationGroup?.id,
       selectedSimulationGroup?.name,
@@ -878,15 +879,13 @@ export function Simulation() {
       return;
     }
 
-    if (nodeGroups.length > 0) {
-      if (!selectedSimulationGroup) {
-        setRealJobError("Select a node group before submitting real jobs.");
-        return;
-      }
-      if (allowedNodeKeys.size === 0) {
-        setRealJobError("No connected nodes in this group. Connect group nodes first.");
-        return;
-      }
+    if (allowedNodeKeys.size === 0) {
+      setRealJobError(
+        selectedSimulationGroup
+          ? "No connected nodes in this group. Connect group nodes first."
+          : "No connected nodes available. Connect nodes first."
+      );
+      return;
     }
 
     const manualPolicyBackend =
@@ -969,7 +968,6 @@ export function Simulation() {
     uploadedFileName,
     scriptArgs,
     scriptTimeoutS,
-    nodeGroups.length,
     selectedSimulationGroup,
     selectedSimulationGroup?.id,
     selectedSimulationGroup?.name,
@@ -1107,12 +1105,11 @@ export function Simulation() {
 
   const spikeIntervalRef = useRef<number | null>(null);
   const spikeLoadRef = useRef(spikeLoad);
+  useEffect(() => { spikeLoadRef.current = spikeLoad; }, [spikeLoad]);
 
-  useEffect(() => {
-    spikeLoadRef.current = spikeLoad;
-  }, [spikeLoad]);
+  const spikeBusyRef = useRef(false);
 
-  const toggleSpiking = useCallback(async () => {
+  const toggleSpiking = useCallback(() => {
     if (!isRunning) {
       setScopeError("Start Sim before enabling spike mode.");
       return;
@@ -1123,14 +1120,11 @@ export function Simulation() {
       setIsSpiking(false);
       return;
     }
-
-    const started = await spikeLoadRef.current();
-    if (!started) {
-      setIsSpiking(false);
-      return;
-    }
+    if (spikeBusyRef.current) return;
+    spikeBusyRef.current = true;
 
     setIsSpiking(true);
+    void spikeLoadRef.current().finally(() => { spikeBusyRef.current = false; });
     spikeIntervalRef.current = window.setInterval(() => void spikeLoadRef.current(), 3500);
   }, [isRunning, isSpiking]);
 
@@ -1164,10 +1158,109 @@ export function Simulation() {
     }
   }, [agentConfig]);
 
-  const maybePauseForExplanation = useCallback(async () => {
+  const buildAiExplanationFromSwitch = useCallback(
+    async (ev: any) => {
+      const start = simStartMsRef.current;
+      const elapsedS = start ? (nowMs() - start) / 1000 : 0;
+      const throughputNow = elapsedS > 0 ? submittedJobs / elapsedS : 0;
+      const activePolicies = selectedPolicies.length
+        ? selectedPolicies
+        : (Object.keys(policyStats) as Policy[]);
+      const bestPolicyNow = activePolicies.reduce(
+        (best, p) => (policyStats[p].reward >= policyStats[best].reward ? p : best),
+        activePolicies[0] || "round-robin"
+      );
+
+      const res = await explainSimulation({
+        config: agentConfig,
+        context: {
+          is_running: isRunning,
+          is_agent_controlled: isAgentControlled,
+          switch_event: {
+            kind: ev?.kind ?? null,
+            policy: ev?.policy ?? null,
+            from_policy: ev?.meta?.from_policy ?? null,
+            to_policy: ev?.meta?.to_policy ?? null,
+            reward: ev?.reward ?? null,
+            latency_ms: ev?.latency_ms ?? null,
+            t_ms: ev?.t_ms ?? null,
+            text: ev?.text ?? null,
+          },
+          current_route_strategy: currentRouteStrategy,
+          learner_kind: learnerKind,
+          goal_kind: goalKind,
+          goal_kwargs: agentConfig.goal_kwargs ?? {},
+          selected_policies: selectedPolicies,
+          best_policy_by_reward: bestPolicyNow,
+          throughput_jps: Number(throughputNow.toFixed(2)),
+          avg_latency_ms: Number(overallAvgLatencyMs.toFixed(2)),
+          spike_events: spikeEvents,
+          node_scope: {
+            selected_group_id: selectedSimulationGroup?.id ?? null,
+            selected_group_name: selectedSimulationGroup?.name ?? null,
+            allowed_node_keys_count: allowedNodeKeys.size,
+            connected_visible_nodes: nodes.length,
+          },
+          policies: Object.values(policyStats).map((s) => ({
+            policy: s.policy,
+            completed_tasks: s.completedTasks,
+            avg_latency_ms: Number(s.avgLatency.toFixed(3)),
+            reward: Number(s.reward.toFixed(6)),
+            selection_pct: Number(s.selectionPct.toFixed(2)),
+            recent_latency_ms: s.recentLatency.slice(-6),
+          })),
+          diagnostics: {
+            incoming_jobs: incomingJobs,
+            submitted_jobs: submittedJobs,
+            overall_latency_trail: overallLatencyTrail.slice(-10),
+            last_chosen_node: lastChosenNodeLabel,
+          },
+        },
+      });
+
+      return {
+        ...ev,
+        kind: "ai",
+        text: res.explanation || ev?.text || "No explanation returned.",
+        t_ms: res.time_ms ?? Number(ev?.t_ms ?? Date.now()),
+        meta: {
+          ...(ev?.meta ?? {}),
+          switched: true,
+          source: res.provider || "unknown",
+          reason: res.reason || "",
+          from_policy: ev?.meta?.from_policy ?? ev?.from_policy ?? null,
+          to_policy: ev?.meta?.to_policy ?? ev?.to_policy ?? ev?.policy ?? null,
+        },
+      };
+    },
+    [
+      agentConfig,
+      allowedNodeKeys.size,
+      currentRouteStrategy,
+      goalKind,
+      incomingJobs,
+      isAgentControlled,
+      isRunning,
+      lastChosenNodeLabel,
+      learnerKind,
+      nodes.length,
+      overallAvgLatencyMs,
+      overallLatencyTrail,
+      policyStats,
+      selectedPolicies,
+      selectedSimulationGroup?.id,
+      selectedSimulationGroup?.name,
+      spikeEvents,
+      submittedJobs,
+    ]
+  );
+
+  const buildAiExplanationRef = useRef(buildAiExplanationFromSwitch);
+  useEffect(() => { buildAiExplanationRef.current = buildAiExplanationFromSwitch; }, [buildAiExplanationFromSwitch]);
+
+  const checkForPolicySwitch = useCallback(async () => {
     if (!isRunning) return;
     if (!isAgentControlled) return;
-    if (explainOpen) return;
 
     const ev = await fetchLatestExplanation();
     const t = Number(ev?.t_ms ?? 0);
@@ -1175,20 +1268,27 @@ export function Simulation() {
     if (t <= lastExplainTmsRef.current) return;
 
     lastExplainTmsRef.current = t;
-    resumeRunningRef.current = isRunning;
-
     setLatestExplanation(ev);
-    setCurrentExplanation(ev);
-    setExplainOpen(true);
-    setIsRunning(false);
-  }, [explainOpen, fetchLatestExplanation, isAgentControlled, isRunning]);
+  }, [
+    fetchLatestExplanation,
+    isAgentControlled,
+    isRunning,
+  ]);
 
-  const continueAfterExplanation = useCallback(() => {
-    setExplainOpen(false);
-    setCurrentExplanation(null);
-    if (resumeRunningRef.current) setIsRunning(true);
-    resumeRunningRef.current = false;
-  }, []);
+  const requestAiExplanation = useCallback(async () => {
+    setAiExplainLoading(true);
+    try {
+      const ev = latestExplanation ?? (await fetchLatestExplanation());
+      if (ev) {
+        const explained = await buildAiExplanationRef.current(ev);
+        setLatestExplanation(explained);
+      }
+    } catch {
+      // Gemini failed; keep whatever explanation is already showing.
+    } finally {
+      setAiExplainLoading(false);
+    }
+  }, [latestExplanation, fetchLatestExplanation]);
 
   const pollManager = useCallback(async () => {
     try {
@@ -1265,17 +1365,23 @@ export function Simulation() {
         };
       });
 
-      await maybePauseForExplanation();
+      await checkForPolicySwitch();
     } catch {
       setIncomingJobs(0);
     }
-  }, [agentConfig, isAgentControlled, selectedPolicies, maybePauseForExplanation]);
+  }, [agentConfig, isAgentControlled, selectedPolicies, checkForPolicySwitch]);
+
+  const submitOneJobRef = useRef(submitOneJob);
+  useEffect(() => { submitOneJobRef.current = submitOneJob; }, [submitOneJob]);
+
+  const pollManagerRef = useRef(pollManager);
+  useEffect(() => { pollManagerRef.current = pollManager; }, [pollManager]);
 
   // Push agent config and manual override changes through immediately.
   useEffect(() => {
     if (!isRunning) return;
-    void pollManager();
-  }, [isRunning, pollManager, agentConfig, policy, isAgentControlled]);
+    void pollManagerRef.current();
+  }, [isRunning, agentConfig, policy, isAgentControlled]);
 
   useEffect(() => {
     void pollNodes();
@@ -1343,15 +1449,18 @@ export function Simulation() {
       return;
     }
 
-    if (simStartMsRef.current == null) simStartMsRef.current = nowMs();
+    if (!simStartMsRef.current) simStartMsRef.current = nowMs();
 
-    void pollManager();
-    pollIntervalRef.current = window.setInterval(() => void pollManager(), 1500);
+    void pollManagerRef.current();
+    pollIntervalRef.current = window.setInterval(() => void pollManagerRef.current(), 1500);
 
     const jobsPerSec = Math.max(0, Number(simulationSpeed) || 0);
     if (jobsPerSec > 0) {
       const intervalMs = Math.max(50, Math.floor(1000 / jobsPerSec));
-      submitIntervalRef.current = window.setInterval(() => void submitOneJob(), intervalMs);
+      submitIntervalRef.current = window.setInterval(
+        () => void submitOneJobRef.current(),
+        intervalMs
+      );
     }
 
     return () => {
@@ -1360,7 +1469,7 @@ export function Simulation() {
       submitIntervalRef.current = null;
       pollIntervalRef.current = null;
     };
-  }, [isRunning, pollManager, submitOneJob, simulationSpeed]);
+  }, [isRunning, simulationSpeed]);
 
   useEffect(() => {
     return () => {
@@ -1487,191 +1596,8 @@ export function Simulation() {
     );
   }, [policyStats, selectedPolicies]);
 
-  const requestAiExplanation = useCallback(async () => {
-    try {
-      setAiExplainLoading(true);
-      const res = await explainSimulation({
-        config: agentConfig,
-        context: {
-          is_running: isRunning,
-          is_agent_controlled: isAgentControlled,
-          current_manual_policy: policy,
-          current_route_strategy: currentRouteStrategy,
-          learner_kind: learnerKind,
-          goal_kind: goalKind,
-          goal_kwargs: agentConfig.goal_kwargs ?? {},
-          selected_policies: selectedPolicies,
-          best_policy_by_reward: bestByReward,
-          throughput_jps: Number(throughput.toFixed(2)),
-          avg_latency_ms: Number(overallAvgLatencyMs.toFixed(2)),
-          optimization_trend:
-            overallLatencyTrail.length >= 2
-              ? overallLatencyTrail[overallLatencyTrail.length - 1] <
-                overallLatencyTrail[overallLatencyTrail.length - 2]
-                ? "improving"
-                : "worsening"
-              : "unknown",
-          spike_events: spikeEvents,
-          node_scope: {
-            selected_group_id: selectedSimulationGroup?.id ?? null,
-            selected_group_name: selectedSimulationGroup?.name ?? null,
-            allowed_node_keys_count: allowedNodeKeys.size,
-            connected_visible_nodes: nodes.length,
-          },
-          policies: Object.values(policyStats).map((s) => ({
-            policy: s.policy,
-            completed_tasks: s.completedTasks,
-            avg_latency_ms: Number(s.avgLatency.toFixed(3)),
-            reward: Number(s.reward.toFixed(6)),
-            selection_pct: Number(s.selectionPct.toFixed(2)),
-            recent_latency_ms: s.recentLatency.slice(-6),
-          })),
-          diagnostics: {
-            incoming_jobs: incomingJobs,
-            submitted_jobs: submittedJobs,
-            overall_latency_trail: overallLatencyTrail.slice(-10),
-            last_chosen_node: lastChosenNodeLabel,
-          },
-        },
-      });
-      setLatestExplanation({
-        kind: "ai",
-        policy: currentRouteStrategy,
-        text: res.explanation || "No explanation returned.",
-        t_ms: res.time_ms ?? Date.now(),
-        meta: {
-          source: res.provider || "unknown",
-          reason: res.reason || "",
-          switched: false,
-        },
-      });
-    } catch (e: any) {
-      setLatestExplanation({
-        kind: "ai",
-        policy: currentRouteStrategy,
-        text: `Failed to generate Gemini explanation: ${e?.message ?? "unknown error"}`,
-        t_ms: Date.now(),
-        meta: {
-          source: "error",
-          reason: e?.message ?? "unknown error",
-          switched: false,
-        },
-      });
-    } finally {
-      setAiExplainLoading(false);
-    }
-  }, [
-    agentConfig,
-    allowedNodeKeys.size,
-    bestByReward,
-    currentRouteStrategy,
-    incomingJobs,
-    isAgentControlled,
-    isRunning,
-    lastChosenNodeLabel,
-    learnerKind,
-    nodes.length,
-    overallAvgLatencyMs,
-    overallLatencyTrail,
-    policy,
-    policyStats,
-    selectedPolicies,
-    selectedSimulationGroup?.id,
-    selectedSimulationGroup?.name,
-    spikeEvents,
-    submittedJobs,
-    throughput,
-    goalKind,
-  ]);
-
   return (
     <div className="space-y-8 pb-12">
-      <AnimatePresence>
-        {explainOpen && currentExplanation ? (
-          <Motion.div
-            className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-          >
-            <Motion.div
-              className="w-full max-w-2xl rounded-2xl border border-white/10 bg-neutral-950 shadow-2xl"
-              initial={{ scale: 0.96, y: 10, opacity: 0 }}
-              animate={{ scale: 1, y: 0, opacity: 1 }}
-              exit={{ scale: 0.98, y: 10, opacity: 0 }}
-              transition={{ type: "spring", stiffness: 260, damping: 22 }}
-            >
-              <div className="flex items-center justify-between gap-4 border-b border-white/10 px-5 py-4">
-                <div className="flex items-center gap-2">
-                  <div className="h-2.5 w-2.5 rounded-full bg-emerald-400" />
-                  <div className="text-sm font-semibold">Decision explanation</div>
-                </div>
-                <div className="text-xs text-neutral-400">
-                  {currentExplanation?.kind ? String(currentExplanation.kind).toUpperCase() : "EVENT"} •{" "}
-                  {currentExplanation?.policy ? String(currentExplanation.policy) : "policy"}
-                </div>
-              </div>
-
-              <div className="px-5 py-4 space-y-3">
-                <div className="text-sm leading-relaxed whitespace-pre-wrap">
-                  {currentExplanation?.text ?? "(no explanation text)"}
-                </div>
-
-                <div className="grid grid-cols-1 gap-3 text-xs text-neutral-300 md:grid-cols-3">
-                  <div className="rounded-xl border border-white/10 bg-white/5 p-3">
-                    <div className="text-neutral-400">Job</div>
-                    <div className="mt-1 break-all font-mono">{currentExplanation?.job_id ?? "—"}</div>
-                  </div>
-                  <div className="rounded-xl border border-white/10 bg-white/5 p-3">
-                    <div className="text-neutral-400">Node</div>
-                    <div className="mt-1 break-all font-mono">{currentExplanation?.node ?? "—"}</div>
-                  </div>
-                  <div className="rounded-xl border border-white/10 bg-white/5 p-3">
-                    <div className="text-neutral-400">Reward / Latency</div>
-                    <div className="mt-1 font-mono">
-                      {typeof currentExplanation?.reward === "number"
-                        ? currentExplanation.reward.toFixed(3)
-                        : "—"}{" "}
-                      /{" "}
-                      {typeof currentExplanation?.latency_ms === "number"
-                        ? Math.round(currentExplanation.latency_ms)
-                        : "—"}
-                      ms
-                    </div>
-                  </div>
-                </div>
-
-                <details className="rounded-xl border border-white/10 bg-white/5 p-3">
-                  <summary className="cursor-pointer select-none text-xs text-neutral-300">
-                    Raw metadata (for debugging)
-                  </summary>
-                  <pre className="mt-2 max-h-56 overflow-auto text-[11px] leading-snug text-neutral-400">
-                    {JSON.stringify(
-                      {
-                        meta: currentExplanation?.meta,
-                        context: currentExplanation?.context,
-                        learner: currentExplanation?.learner_snapshot,
-                      },
-                      null,
-                      2
-                    )}
-                  </pre>
-                </details>
-              </div>
-
-              <div className="flex items-center justify-end gap-2 border-t border-white/10 px-5 py-4">
-                <button
-                  className="rounded-xl bg-white px-4 py-2 text-sm font-semibold text-black hover:opacity-90"
-                  onClick={continueAfterExplanation}
-                >
-                  Continue
-                </button>
-              </div>
-            </Motion.div>
-          </Motion.div>
-        ) : null}
-      </AnimatePresence>
-
       <div className="flex flex-col justify-between gap-4 md:flex-row md:items-center">
         <div>
           <h1 className="text-3xl font-bold tracking-tight">Agentic Resource Simulator</h1>
@@ -1713,33 +1639,86 @@ export function Simulation() {
           <button
             onClick={async () => {
               if (!isRunning) {
-                if (nodeGroups.length > 0 && !selectedSimulationGroup) {
+                if (!selectedSimulationGroup) {
                   setScopeError("Select a node group before starting the simulation.");
                   return;
                 }
-                if (selectedSimulationGroup && selectedSimulationGroupNodeKeys.size === 0) {
+                if (selectedSimulationGroupNodeKeys.size === 0) {
                   setScopeError("Selected group has no nodes.");
                   return;
                 }
-                if (selectedSimulationGroup && selectedGroupConnectedNodeKeys.size === 0) {
+                if (selectedGroupConnectedNodeKeys.size === 0) {
                   setScopeError("No connected nodes in this group. Connect group nodes first.");
                   return;
                 }
                 setScopeError(null);
+
+                // Reset graph / metric state so every Start is a fresh session.
+                setRewardHistory([]);
+                rewardTickRef.current = 0;
+                setSeenPolicies(new Set());
+                setSubmittedJobs(0);
+                setIncomingJobs(0);
+                setOverallAvgLatencyMs(0);
+                setOverallLatencyTrail([]);
+                simStartMsRef.current = nowMs();
+                setLastChosenNodeId(null);
+                setLastChosenNodeLabel("—");
+                setSpikeDispatches([]);
+
+                // Record this run in the agent_run / agent_run_node tables.
+                const runId = crypto.randomUUID();
+                simRunIdRef.current = runId;
+                const groupNodes = selectedSimulationGroup?.nodes ?? [];
+                pushRunEvent({
+                  kind: "run_started",
+                  runId,
+                  config: {
+                    goal_kind: agentConfig.goal_kind,
+                    learner_kind: agentConfig.learner_kind,
+                    policy_pool: (agentConfig.learner_kwargs?.policy_allowlist as string[]) ?? [],
+                    learner_kwargs: agentConfig.learner_kwargs ?? {},
+                    goal_kwargs: agentConfig.goal_kwargs ?? {},
+                    workload: { kind: "interactive_sim" },
+                  },
+                  nodes: groupNodes.map((n) => ({
+                    name: n.nodeName || `${n.host}:${n.port}`,
+                    host: n.host,
+                    port: n.port,
+                    cpus: null,
+                    memory_mb: null,
+                  })),
+                }).catch((err) => console.error("pushRunEvent(run_started):", err));
+
                 setIsRunning(true);
                 return;
               }
+
+              // Pause: stop new submissions and terminate all queued/running jobs.
               setIsRunning(false);
               setIncomingJobs(0);
-              try {
-                await cancelScopedJobs({
-                  user_id: userId,
-                  allowed_node_keys: Array.from(allowedNodeKeys),
-                  include_running: true,
-                });
-              } catch (err) {
-                console.error("cancelScopedJobs failed:", err);
+
+              // Record run completion in agent_run table.
+              if (simRunIdRef.current) {
+                pushRunEvent({
+                  kind: "run_finished",
+                  runId: simRunIdRef.current,
+                  status: "paused",
+                  summary: {
+                    submitted_jobs: submittedJobs,
+                    avg_latency_ms: overallAvgLatencyMs,
+                    throughput_jps: throughput,
+                    best_policy: bestByReward,
+                  },
+                }).catch((err) => console.error("pushRunEvent(run_finished):", err));
+                simRunIdRef.current = null;
               }
+
+              cancelScopedJobs({
+                user_id: userId,
+                allowed_node_keys: Array.from(allowedNodeKeys),
+                include_running: true,
+              }).catch((err) => console.error("cancelScopedJobs:", err));
             }}
             className={`flex items-center gap-2 rounded-lg px-4 py-2 font-medium transition-all ${
               isRunning
@@ -2644,53 +2623,47 @@ ${job.stderr ?? ""}`}
                   </div>
                 </div>
 
-                <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                  <div className="flex items-center justify-between gap-2">
+                <div className="rounded-2xl border border-white/10 bg-white/5 p-4 flex flex-col gap-3">
+                  {/* Header */}
+                  <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
-                      <History className="h-4 w-4 text-neutral-300" />
-                      <div className="text-sm font-semibold">Latest Explanation</div>
+                      <History className="h-4 w-4 text-neutral-400" />
+                      <span className="text-sm font-semibold text-neutral-100">Latest Explanation</span>
                     </div>
-                    <div className="flex items-center gap-2">
-                      <button
-                        onClick={() => void requestAiExplanation()}
-                        disabled={aiExplainLoading}
-                        className="rounded-lg border border-indigo-500/30 bg-indigo-500/10 px-2.5 py-1 text-xs text-indigo-300 hover:bg-indigo-500/20 disabled:opacity-50"
-                      >
-                        {aiExplainLoading ? "Analyzing..." : "Explain with Gemini"}
-                      </button>
-                      <div className="text-xs text-neutral-400">
-                        {latestExplanation?.policy ? String(latestExplanation.policy) : "—"}
-                      </div>
-                    </div>
+                    <button
+                      onClick={() => void requestAiExplanation()}
+                      disabled={aiExplainLoading}
+                      className="rounded-lg border border-indigo-500/30 bg-indigo-500/10 px-3 py-1 text-xs font-medium text-indigo-300 hover:bg-indigo-500/20 disabled:opacity-50 transition-colors"
+                    >
+                      {aiExplainLoading ? "Analyzing…" : "Explain with Gemini"}
+                    </button>
                   </div>
 
-                  <div className="mt-3 whitespace-pre-wrap text-sm leading-relaxed text-neutral-200">
+                  {/* Tags */}
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="rounded-full bg-neutral-800 px-2.5 py-0.5 text-[11px] font-mono text-neutral-300">
+                      {latestExplanation?.policy ? String(latestExplanation.policy) : "—"}
+                    </span>
+                    {latestExplanation?.meta?.from_policy && latestExplanation?.meta?.to_policy && (
+                      <span className="rounded-full bg-neutral-800 px-2.5 py-0.5 text-[11px] text-neutral-400">
+                        {String(latestExplanation.meta.from_policy)} → {String(latestExplanation.meta.to_policy)}
+                      </span>
+                    )}
+                    <span className={`ml-auto rounded-full px-2.5 py-0.5 text-[11px] font-medium ${
+                      latestExplanation?.kind === "ai"
+                        ? "bg-indigo-500/15 text-indigo-300"
+                        : "bg-neutral-800 text-neutral-500"
+                    }`}>
+                      {latestExplanation?.kind === "ai" ? "Gemini" : "Event"}
+                    </span>
+                  </div>
+
+                  {/* Body */}
+                  <div className="rounded-xl border border-white/5 bg-black/20 px-3.5 py-3 text-[13px] leading-relaxed text-neutral-200 max-h-[180px] overflow-y-auto">
                     {latestExplanation?.text
-                      ? latestExplanation.text
-                      : "No policy switches yet. When the agent switches strategies, you’ll see the explanation here (and the sim will pause)."}
+                      ? formatExplanationText(latestExplanation.text)
+                      : "No policy switches yet. When the agent switches strategies, the explanation will appear here."}
                   </div>
-
-                  {latestExplanation?.meta?.from_policy && latestExplanation?.meta?.to_policy ? (
-                    <div className="mt-3 text-xs text-neutral-400">
-                      Switch: {String(latestExplanation.meta.from_policy)} →{" "}
-                      {String(latestExplanation.meta.to_policy)}
-                    </div>
-                  ) : null}
-                  {latestExplanation?.meta?.source ? (
-                    <div className="mt-2 text-[11px] text-neutral-500">
-                      Source: {String(latestExplanation.meta.source)}
-                      {latestExplanation?.meta?.reason
-                        ? ` (${String(latestExplanation.meta.reason)})`
-                        : ""}
-                    </div>
-                  ) : null}
-                  {latestExplanation?.kind === "ai" ? (
-                    <div className="mt-2 text-[11px] text-indigo-300">AI-generated simulation explanation</div>
-                  ) : (
-                    <div className="mt-2 text-[11px] text-neutral-500">
-                      Switch explanation generated by routing events
-                    </div>
-                  )}
                 </div>
 
                 <div className="mt-auto space-y-3">

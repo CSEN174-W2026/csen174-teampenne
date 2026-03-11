@@ -1,5 +1,5 @@
 // Dashboard.tsx
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Server,
   Activity,
@@ -9,7 +9,6 @@ import {
   ShieldCheck,
   Clock,
   ChevronRight,
-  MoreHorizontal,
 } from "lucide-react";
 
 import { MetricCard } from "../components/MetricCard";
@@ -32,85 +31,91 @@ export function Dashboard() {
   const [cluster, setCluster] = useState<ClusterStatsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // ---- Poll /nodes (for table + CPU/Mem chart)
-  useEffect(() => {
-    let alive = true;
+  const pollNodes = useCallback(async () => {
+    try {
+      const data = await getNodes();
+      setNodes(data.nodes ?? []);
+      setNodesTimeMs(data.time_ms ?? Date.now());
+      setError(null);
 
-    async function tick() {
-      try {
-        const data = await getNodes();
-        if (!alive) return;
+      const cpuAvg =
+        (data.nodes ?? []).reduce((acc, n) => acc + (Number(n.cpu_pct) || 0), 0) /
+        Math.max((data.nodes ?? []).length, 1);
 
-        setNodes(data.nodes ?? []);
-        setNodesTimeMs(data.time_ms ?? Date.now());
-        setError(null);
+      const memAvg =
+        (data.nodes ?? []).reduce((acc, n) => acc + (Number(n.mem_pct) || 0), 0) /
+        Math.max((data.nodes ?? []).length, 1);
 
-        const cpuAvg =
-          (data.nodes ?? []).reduce((acc, n) => acc + (Number(n.cpu_pct) || 0), 0) /
-          Math.max((data.nodes ?? []).length, 1);
-
-        const memAvg =
-          (data.nodes ?? []).reduce((acc, n) => acc + (Number(n.mem_pct) || 0), 0) /
-          Math.max((data.nodes ?? []).length, 1);
-
-        setSeries((prev) => {
-          const next = [...prev, { t: data.time_ms ?? Date.now(), cpu: cpuAvg, mem: memAvg }];
-          return next.slice(-120);
-        });
-      } catch (e: any) {
-        if (!alive) return;
-        setError(e?.message ?? "Failed to load nodes");
-      }
+      setSeries((prev) => {
+        const next = [...prev, { t: data.time_ms ?? Date.now(), cpu: cpuAvg, mem: memAvg }];
+        return next.slice(-120);
+      });
+    } catch (e: any) {
+      setError(e?.message ?? "Failed to load nodes");
     }
-
-    tick();
-    const id = setInterval(tick, 2000);
-    return () => {
-      alive = false;
-      clearInterval(id);
-    };
   }, []);
 
-  // ---- Poll /cluster/stats (Avg Latency / Throughput / Disk Usage)
-  useEffect(() => {
-    let alive = true;
-
-    async function tick() {
-      try {
-        const stats = await getClusterStats(60, 200); // 60s window
-        if (!alive) return;
-        setCluster(stats);
-      } catch {
-        if (!alive) return;
-        // don't hard-fail the dashboard if this endpoint errors; just show warning
-        setCluster(null);
-      }
+  const pollCluster = useCallback(async () => {
+    try {
+      const stats = await getClusterStats(60, 200);
+      setCluster(stats);
+    } catch {
+      setCluster(null);
     }
-
-    tick();
-    const id = setInterval(tick, 2000);
-    return () => {
-      alive = false;
-      clearInterval(id);
-    };
   }, []);
+
+  // Keep dashboard cards/table fresh, and refresh immediately when tab regains focus.
+  useEffect(() => {
+    let active = true;
+    const safePoll = async () => {
+      if (!active) return;
+      await Promise.all([pollNodes(), pollCluster()]);
+    };
+    void safePoll();
+    const id = window.setInterval(() => void safePoll(), 1500);
+    const onFocus = () => void safePoll();
+    const onVisibility = () => {
+      if (!document.hidden) void safePoll();
+    };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      active = false;
+      window.clearInterval(id);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [pollCluster, pollNodes]);
 
   const totalNodes = nodes.length;
 
   // Convert real nodes into your table format
   const nodeRows = useMemo(() => {
     return nodes.map((n) => {
+      const online = !(n as any).error && (n.cpu_pct != null || n.mem_pct != null);
       const cpu = Number(n.cpu_pct) || 0;
       const mem = Number(n.mem_pct) || 0;
-      const load = Math.round(Math.max(cpu, mem));
-      const status = load >= 85 ? "warning" : "healthy";
+      const queueLen = Math.max(0, Number((n as any).queue_len) || 0);
+      const inFlight = Math.max(0, Number((n as any).in_flight) || 0);
+
+      // Reflect actual node work by including queue + in-flight pressure,
+      // not just host resource utilization.
+      const backlogPressurePct = Math.min(100, queueLen * 12 + inFlight * 22);
+      const load = Math.round(Math.max(cpu, mem, backlogPressurePct));
+      const status: "healthy" | "warning" | "offline" = !online
+        ? "offline"
+        : load >= 85
+          ? "warning"
+          : "healthy";
 
       return {
         name: n.name ?? `${n.host}:${n.port}`,
         region: n.host ?? "—",
-        load,
+        cpu,
+        mem,
         status,
-        uptime: "—",
+        jobs: queueLen + inFlight,
+        ewmaLatencyMs: Number((n as any).ewma_latency_ms) || 0,
       };
     });
   }, [nodes]);
@@ -274,10 +279,10 @@ export function Dashboard() {
               <tr className="bg-neutral-800/30 text-neutral-400 text-xs uppercase tracking-wider font-bold">
                 <th className="px-6 py-4">Node Name</th>
                 <th className="px-6 py-4">Host</th>
-                <th className="px-6 py-4">Current Load</th>
+                <th className="px-6 py-4">CPU / Mem</th>
                 <th className="px-6 py-4">Health Status</th>
-                <th className="px-6 py-4">Uptime</th>
-                <th className="px-6 py-4 text-right">Actions</th>
+                <th className="px-6 py-4">Jobs</th>
+                <th className="px-6 py-4">EWMA Latency</th>
               </tr>
             </thead>
 
@@ -296,16 +301,14 @@ export function Dashboard() {
                   <td className="px-6 py-4 text-sm text-neutral-400">{node.region}</td>
 
                   <td className="px-6 py-4">
-                    <div className="flex items-center gap-3">
-                      <div className="flex-1 h-2 bg-neutral-800 rounded-full max-w-[100px] overflow-hidden">
-                        <motion.div
-                          initial={{ width: 0 }}
-                          animate={{ width: `${node.load}%` }}
-                          transition={{ duration: 0.6, ease: "easeOut" }}
-                          className={`h-full ${node.load > 85 ? "bg-rose-500" : "bg-indigo-500"}`}
-                        />
-                      </div>
-                      <span className="text-xs font-medium text-neutral-300">{node.load}%</span>
+                    <div className="flex items-center gap-3 text-xs font-mono">
+                      <span className={node.cpu > 80 ? "text-rose-400" : "text-indigo-300"}>
+                        {Math.round(node.cpu)}%
+                      </span>
+                      <span className="text-neutral-600">/</span>
+                      <span className={node.mem > 80 ? "text-rose-400" : "text-emerald-300"}>
+                        {Math.round(node.mem)}%
+                      </span>
                     </div>
                   </td>
 
@@ -314,24 +317,28 @@ export function Dashboard() {
                       className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium border ${
                         node.status === "healthy"
                           ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                          : node.status === "offline"
+                            ? "bg-rose-500/10 text-rose-400 border-rose-500/20"
                           : "bg-amber-500/10 text-amber-400 border-amber-500/20"
                       }`}
                     >
                       <div
                         className={`w-1.5 h-1.5 rounded-full ${
-                          node.status === "healthy" ? "bg-emerald-400" : "bg-amber-400 animate-pulse"
+                          node.status === "healthy"
+                            ? "bg-emerald-400"
+                            : node.status === "offline"
+                              ? "bg-rose-400"
+                              : "bg-amber-400 animate-pulse"
                         }`}
                       />
                       {node.status.toUpperCase()}
                     </span>
                   </td>
 
-                  <td className="px-6 py-4 text-sm text-neutral-400">{node.uptime}</td>
+                  <td className="px-6 py-4 text-sm text-neutral-300">{node.jobs}</td>
 
-                  <td className="px-6 py-4 text-right">
-                    <button className="text-neutral-500 hover:text-white transition-colors">
-                      <MoreHorizontal className="w-5 h-5" />
-                    </button>
+                  <td className="px-6 py-4 text-sm text-neutral-400">
+                    {node.ewmaLatencyMs > 0 ? `${Math.round(node.ewmaLatencyMs)} ms` : "—"}
                   </td>
                 </tr>
               ))}

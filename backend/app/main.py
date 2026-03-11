@@ -14,6 +14,7 @@ import time
 import shutil
 import uuid
 import statistics
+import sqlite3
 from pathlib import Path
 from dataclasses import asdict, is_dataclass, dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -82,6 +83,7 @@ app.add_middleware(
 POLL_S = 2.0 # How often to poll nodes for metrics
 METRICS_SINK_URL = os.getenv("METRICS_SINK_URL", "http://127.0.0.1:3000/api/metrics/node-samples")
 METRICS_SINK_TIMEOUT_S = float(os.getenv("METRICS_SINK_TIMEOUT_S", "0.8"))
+VMINFO_SINK_URL = os.getenv("VMINFO_SINK_URL", "http://127.0.0.1:3000/api/vm-info/sync")
 OBSERVE_DEUP: Set[str] = set() # To track which nodes we've already observed during discovery
 OBSERVE_LOCK = threading.Lock() # To synchronize access to OBSERVE_DEUP -> protect against race conditions
 # Track last config used per user
@@ -92,6 +94,13 @@ USER_LAST_CFG_LOCK = threading.Lock()
 USER_AGENT_HISTORY: Dict[str, List[Dict[str, Any]]] = {}
 USER_AGENT_HISTORY_LOCK = threading.Lock()
 USER_AGENT_HISTORY_MAX = 30
+TRAINED_AGENTS_DB_PATH = Path(
+    os.getenv(
+        "TRAINED_AGENTS_DB_PATH",
+        str(Path(__file__).resolve().parents[1] / "data" / "manager_meta.db"),
+    )
+)
+TRAINED_AGENTS_DB_LOCK = threading.Lock()
 EC2_ADMIN_EMAIL = (os.getenv("EC2_ADMIN_EMAIL", "shypine8@gmail.com") or "").strip().lower()
 
 # Cache ManagerAgent instances so learning persists per (learner, goal, kwargs, etc...)
@@ -328,16 +337,191 @@ def persist_node_samples(snaps: List[NodeSnapshot], captured_at_ms: int) -> None
         print(f"[WARN] metrics sink unreachable: {e}")
 
 
+def persist_vm_info(snaps: List[NodeSnapshot], captured_at_ms: int) -> None:
+    """
+    Best-effort sync of discovered nodes into Postgres vm_info via web API.
+    This keeps vm_info aligned with real live nodes returned by /nodes.
+    """
+    if not VMINFO_SINK_URL or not snaps:
+        return
+
+    payload = {
+        "capturedAtMs": captured_at_ms,
+        "nodes": [
+            {
+                "name": s.name,
+                "host": s.host,
+                "port": s.port,
+                "cpus": s.cpus,
+                "memoryMb": s.memory_mb,
+                "isActive": True,
+            }
+            for s in snaps
+        ],
+    }
+
+    try:
+        r = requests.post(VMINFO_SINK_URL, json=payload, timeout=METRICS_SINK_TIMEOUT_S)
+        if r.status_code >= 400:
+            print(f"[WARN] vm_info sink returned {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[WARN] vm_info sink unreachable: {e}")
+
+
 
 def _cfg_key(cfg: AgentConfig) -> str:
     return json.dumps(cfg.dict(), sort_keys=True)
+
+
+def _trained_agents_connect() -> sqlite3.Connection:
+    TRAINED_AGENTS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(TRAINED_AGENTS_DB_PATH), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_trained_agents_db() -> None:
+    with TRAINED_AGENTS_DB_LOCK:
+        conn = _trained_agents_connect()
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trained_agents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    cfg_key TEXT NOT NULL,
+                    config_json TEXT NOT NULL,
+                    learner_kind TEXT,
+                    goal_kind TEXT,
+                    seed INTEGER,
+                    first_seen_ms INTEGER NOT NULL,
+                    last_used_ms INTEGER NOT NULL,
+                    use_count INTEGER NOT NULL DEFAULT 1,
+                    UNIQUE(user_id, cfg_key)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_trained_agents_user_last_used ON trained_agents(user_id, last_used_ms DESC)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _read_trained_agents_history(user_id: str, limit: int = USER_AGENT_HISTORY_MAX) -> List[Dict[str, Any]]:
+    with TRAINED_AGENTS_DB_LOCK:
+        conn = _trained_agents_connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT last_used_ms, config_json
+                FROM trained_agents
+                WHERE user_id = ?
+                ORDER BY last_used_ms DESC, id DESC
+                LIMIT ?
+                """,
+                (user_id, int(limit)),
+            ).fetchall()
+        finally:
+            conn.close()
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        try:
+            cfg_obj = json.loads(r["config_json"])
+        except Exception:
+            cfg_obj = None
+        if not isinstance(cfg_obj, dict):
+            continue
+        out.append({"time_ms": int(r["last_used_ms"]), "config": cfg_obj})
+    return out
+
+
+def _read_last_trained_agent(user_id: str) -> Optional[Dict[str, Any]]:
+    hist = _read_trained_agents_history(user_id, limit=1)
+    return hist[0] if hist else None
+
+
+def _read_trained_agents_rows(user_id: str, limit: int = USER_AGENT_HISTORY_MAX) -> List[Dict[str, Any]]:
+    with TRAINED_AGENTS_DB_LOCK:
+        conn = _trained_agents_connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, cfg_key, learner_kind, goal_kind, seed, first_seen_ms, last_used_ms, use_count, config_json
+                FROM trained_agents
+                WHERE user_id = ?
+                ORDER BY last_used_ms DESC, id DESC
+                LIMIT ?
+                """,
+                (user_id, int(limit)),
+            ).fetchall()
+        finally:
+            conn.close()
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        try:
+            cfg_obj = json.loads(r["config_json"])
+        except Exception:
+            cfg_obj = None
+        out.append(
+            {
+                "id": int(r["id"]),
+                "cfg_key": r["cfg_key"],
+                "learner_kind": r["learner_kind"],
+                "goal_kind": r["goal_kind"],
+                "seed": r["seed"],
+                "first_seen_ms": int(r["first_seen_ms"]),
+                "last_used_ms": int(r["last_used_ms"]),
+                "use_count": int(r["use_count"]),
+                "config": cfg_obj if isinstance(cfg_obj, dict) else None,
+            }
+        )
+    return out
+
 
 def record_user_agent_config(user_id: str, cfg: AgentConfig) -> None:
     if not user_id:
         return
 
-    item = {"time_ms": now_ms(), "config": cfg.dict()}
+    ts = now_ms()
+    cfg_dict = cfg.dict()
+    item = {"time_ms": ts, "config": cfg_dict}
     key = _cfg_key(cfg)
+
+    with TRAINED_AGENTS_DB_LOCK:
+        conn = _trained_agents_connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO trained_agents (
+                    user_id, cfg_key, config_json, learner_kind, goal_kind, seed,
+                    first_seen_ms, last_used_ms, use_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                ON CONFLICT(user_id, cfg_key) DO UPDATE SET
+                    config_json = excluded.config_json,
+                    learner_kind = excluded.learner_kind,
+                    goal_kind = excluded.goal_kind,
+                    seed = excluded.seed,
+                    last_used_ms = excluded.last_used_ms,
+                    use_count = trained_agents.use_count + 1
+                """,
+                (
+                    user_id,
+                    key,
+                    json.dumps(cfg_dict, sort_keys=True),
+                    cfg_dict.get("learner_kind"),
+                    cfg_dict.get("goal_kind"),
+                    cfg_dict.get("seed"),
+                    ts,
+                    ts,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     with USER_AGENT_HISTORY_LOCK:
         hist = USER_AGENT_HISTORY.get(user_id, [])
@@ -356,6 +540,9 @@ def record_user_agent_config(user_id: str, cfg: AgentConfig) -> None:
             hist = hist[:USER_AGENT_HISTORY_MAX]
 
         USER_AGENT_HISTORY[user_id] = hist
+
+
+_init_trained_agents_db()
 
 # Universal object -> dictionary converter
 # Standardizes everything into JSON-serializable dictionary
@@ -582,6 +769,7 @@ def _gemini_sim_explanation(payload: Dict[str, Any]) -> Tuple[str, str, str]:
         "You are explaining only ONE thing: why the currently preferred routing policy is favored over alternatives.\n"
         "Write exactly 2-3 short sentences (max 70 words total).\n"
         "Must include: preferred policy name, direct comparison against at least one alternative, and evidence from reward/latency/tasks.\n"
+        "Explain how scheduling decisions affect system performance such as latency and reward, if that is evident from the data.\n"
         "Mention learner+goal and whether manual override limits interpretation.\n"
         "Do NOT include generic system advice, trend commentary, or action recommendations.\n\n"
         "Simulation snapshot JSON:\n"
@@ -880,6 +1068,7 @@ def nodes():
     snaps = live_snapshots()
     t_ms = now_ms()
     persist_node_samples(snaps, t_ms)
+    persist_vm_info(snaps, t_ms)
     return {"count": len(snaps), "nodes": [to_dict(s) for s in snaps], "time_ms": t_ms}
 
 
@@ -1389,6 +1578,9 @@ def get_run_status(run_id: str):
 @app.get("/users/me/last_agent_config")
 def users_me_last_agent_config(user: Dict[str, Any] = Depends(require_user)):
     uid = user["id"]
+    db_last = _read_last_trained_agent(uid)
+    if db_last:
+        return {"time_ms": db_last.get("time_ms", now_ms()), "config": db_last.get("config")}
     with USER_LAST_CFG_LOCK:
         last = USER_LAST_CFG.get(uid)
     return last or {"time_ms": now_ms(), "config": None}
@@ -1415,9 +1607,22 @@ def users_me_activity(
 @app.get("/users/me/agent_history")
 def users_me_agent_history(user: Dict[str, Any] = Depends(require_user)):
     uid = user["id"]
+    db_hist = _read_trained_agents_history(uid, USER_AGENT_HISTORY_MAX)
+    if db_hist:
+        return {"time_ms": now_ms(), "history": db_hist}
     with USER_AGENT_HISTORY_LOCK:
         hist = USER_AGENT_HISTORY.get(uid, [])
     return {"time_ms": now_ms(), "history": hist}   
+
+
+@app.get("/users/me/trained_agents")
+def users_me_trained_agents(
+    limit: int = Query(USER_AGENT_HISTORY_MAX, ge=1, le=200),
+    user: Dict[str, Any] = Depends(require_user),
+):
+    uid = user["id"]
+    rows = _read_trained_agents_rows(uid, limit=limit)
+    return {"time_ms": now_ms(), "rows": rows}
 
 
 

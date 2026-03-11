@@ -17,6 +17,36 @@ type IterationRecordInput = {
   metadata?: Record<string, unknown>;
 };
 
+function pickString(v: Record<string, unknown>, ...keys: string[]): string | null {
+  for (const k of keys) {
+    const x = v[k];
+    if (typeof x === "string" && x.trim()) return x.trim();
+  }
+  return null;
+}
+
+function pickNumber(v: Record<string, unknown>, ...keys: string[]): number | null {
+  for (const k of keys) {
+    const x = Number(v[k]);
+    if (Number.isFinite(x)) return x;
+  }
+  return null;
+}
+
+function pickBoolean(v: Record<string, unknown>, ...keys: string[]): boolean | null {
+  for (const k of keys) {
+    const x = v[k];
+    if (typeof x === "boolean") return x;
+    if (typeof x === "string") {
+      const s = x.trim().toLowerCase();
+      if (s === "true") return true;
+      if (s === "false") return false;
+    }
+    if (typeof x === "number") return x !== 0;
+  }
+  return null;
+}
+
 function parseOptionalNumber(value: string): number | null {
   if (value.toLowerCase() === "none") return null;
   const n = Number(value);
@@ -60,29 +90,37 @@ function toRecordInput(value: unknown): IterationRecordInput | null {
   if (!value || typeof value !== "object") return null;
 
   const v = value as Record<string, unknown>;
-  const iteration = Number(v.iteration);
-  const targetPort = Number(v.targetPort);
-  const latencyMs = Number(v.latencyMs);
+  const iteration = pickNumber(v, "iteration");
+  const targetPort = pickNumber(v, "targetPort", "target_port");
+  const latencyMs = pickNumber(v, "latencyMs", "latency_ms");
+  const policyName = pickString(v, "policyName", "policy_name");
+  const nodeName = pickString(v, "nodeName", "node_name");
+  const targetHost = pickString(v, "targetHost", "target_host");
+  const success = pickBoolean(v, "success");
+  const learnerArm = pickString(v, "learnerArm", "learner_arm");
+  const sampleCount = pickNumber(v, "sampleCount", "sample_count");
+  const hValue = pickNumber(v, "hValue", "h_value");
+  const qValue = pickNumber(v, "qValue", "q_value");
 
-  if (!Number.isInteger(iteration)) return null;
-  if (!Number.isInteger(targetPort)) return null;
-  if (!Number.isFinite(latencyMs)) return null;
-  if (typeof v.policyName !== "string" || typeof v.nodeName !== "string" || typeof v.targetHost !== "string") {
+  if (iteration == null || !Number.isInteger(iteration)) return null;
+  if (targetPort == null || !Number.isInteger(targetPort)) return null;
+  if (latencyMs == null || !Number.isFinite(latencyMs)) return null;
+  if (!policyName || !nodeName || !targetHost) {
     return null;
   }
 
   return {
     iteration,
-    policyName: v.policyName,
-    nodeName: v.nodeName,
-    targetHost: v.targetHost,
+    policyName,
+    nodeName,
+    targetHost,
     targetPort,
-    success: typeof v.success === "boolean" ? v.success : true,
+    success: success ?? true,
     latencyMs: Math.round(latencyMs),
-    learnerArm: typeof v.learnerArm === "string" ? v.learnerArm : null,
-    sampleCount: Number.isInteger(v.sampleCount) ? (v.sampleCount as number) : null,
-    hValue: typeof v.hValue === "number" && Number.isFinite(v.hValue) ? v.hValue : null,
-    qValue: typeof v.qValue === "number" && Number.isFinite(v.qValue) ? v.qValue : null,
+    learnerArm,
+    sampleCount: sampleCount != null && Number.isInteger(sampleCount) ? sampleCount : null,
+    hValue,
+    qValue,
     metadata: typeof v.metadata === "object" && v.metadata !== null ? (v.metadata as Record<string, unknown>) : {},
   };
 }
@@ -137,6 +175,33 @@ export async function POST(req: NextRequest) {
     await em.persistAndFlush(rows);
 
     return NextResponse.json({ inserted: rows.length });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : "unknown error";
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
+}
+
+export async function GET(req: NextRequest) {
+  try {
+    const userId = (req.nextUrl.searchParams.get("userId") ?? "").trim();
+    const runId = (req.nextUrl.searchParams.get("runId") ?? "").trim();
+    const limit = Math.max(1, Math.min(Number(req.nextUrl.searchParams.get("limit") ?? 200), 2000));
+
+    const orm = await getOrm();
+    const em = orm.em.fork();
+    const where: Record<string, unknown> = {};
+    if (userId) where.userId = userId;
+    if (runId) where.runId = runId;
+
+    const rows = await em.find(
+      DistributedManagerIteration,
+      where,
+      {
+        orderBy: { createdAt: "desc" },
+        limit,
+      }
+    );
+    return NextResponse.json({ rows, count: rows.length });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "unknown error";
     return NextResponse.json({ error: message }, { status: 500 });

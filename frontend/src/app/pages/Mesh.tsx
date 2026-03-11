@@ -19,6 +19,8 @@ export function Mesh() {
   const [error, setError] = useState<string | null>(null);
   const [positions, setPositions] = useState<Record<string, Point>>({});
   const [draggingId, setDraggingId] = useState<string | null>(null);
+  const dragStartPos = useRef<Point | null>(null);
+  const didDrag = useRef(false);
   const [activeGroupId, setActiveGroupId] = useState<number | null>(null);
   const [zoom, setZoom] = useState(1);
   const canvasRef = useRef<HTMLDivElement | null>(null);
@@ -187,6 +189,11 @@ export function Mesh() {
       if (!rect) return;
       const x = Math.max(60, Math.min(rect.width - 60, (ev.clientX - rect.left) / zoom));
       const y = Math.max(50, Math.min(rect.height - 50, (ev.clientY - rect.top) / zoom));
+      if (dragStartPos.current) {
+        const dx = ev.clientX - dragStartPos.current.x;
+        const dy = ev.clientY - dragStartPos.current.y;
+        if (Math.abs(dx) > 4 || Math.abs(dy) > 4) didDrag.current = true;
+      }
       setPositions((p) => ({ ...p, [draggingId]: { x, y } }));
     };
     const onUp = () => setDraggingId(null);
@@ -326,11 +333,18 @@ export function Mesh() {
                 : groupViewNodes.map((g) => {
                     const pos = positions[g.id] ?? { x: 140, y: 120 };
                     return (
-                      <button
+                      <div
                         key={g.id}
-                        className="absolute -translate-x-1/2 -translate-y-1/2 w-64 rounded-xl border bg-neutral-900 p-3 text-left shadow-[0_0_14px_rgba(34,211,238,0.35)] hover:shadow-[0_0_18px_rgba(34,211,238,0.55)] transition"
+                        className="absolute -translate-x-1/2 -translate-y-1/2 w-64 rounded-xl border bg-neutral-900 p-3 text-left cursor-grab active:cursor-grabbing select-none shadow-[0_0_14px_rgba(34,211,238,0.35)] hover:shadow-[0_0_18px_rgba(34,211,238,0.55)] transition"
                         style={{ left: pos.x, top: pos.y, borderColor: `${g.color}99` }}
-                        onClick={() => setActiveGroupId(g.groupId)}
+                        onMouseDown={(ev) => {
+                          dragStartPos.current = { x: ev.clientX, y: ev.clientY };
+                          didDrag.current = false;
+                          setDraggingId(g.id);
+                        }}
+                        onMouseUp={() => {
+                          if (!didDrag.current) setActiveGroupId(g.groupId);
+                        }}
                       >
                         <div className="flex items-center justify-between mb-1">
                           <div className="flex items-center gap-2">
@@ -343,7 +357,7 @@ export function Mesh() {
                         </div>
                         <p className="text-[11px] text-neutral-400">Nodes: {g.nodeCount}</p>
                         <p className="text-[11px] text-neutral-400">Online: {g.onlineCount}</p>
-                      </button>
+                      </div>
                     );
                   })}
             </div>

@@ -83,8 +83,13 @@ export function Nodes() {
       }
     };
     void load();
+    const id = window.setInterval(() => void load(), 3000);
+    const onFocus = () => void load();
+    window.addEventListener("focus", onFocus);
     return () => {
       active = false;
+      window.clearInterval(id);
+      window.removeEventListener("focus", onFocus);
     };
   }, [userId]);
 

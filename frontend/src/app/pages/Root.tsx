@@ -3,20 +3,15 @@ import React from "react";
 import { 
   LayoutDashboard, 
   Server, 
-  Activity, 
   Terminal, 
-  Settings, 
-  Bell, 
-  Search,
+  
   Menu,
   X,
-  Cpu,
-  Database,
-  Globe,
   Zap,
   Users,
   Network,
-  Shield
+  Shield,
+  Cpu
 } from "lucide-react";
 import { useState } from "react";
 import { motion as Motion, AnimatePresence } from "motion/react";
@@ -28,6 +23,67 @@ export function Root() {
   const { user, isAdmin, logout } = useAuth();
   const nav = useNavigate();
   const canManageEc2 = (user?.email ?? "").trim().toLowerCase() === "shypine8@gmail.com";
+  const neonPalette = [
+    {
+      border: "rgba(74, 222, 128, 0.95)", // green
+      glow: "0 0 14px rgba(74,222,128,0.9), 0 0 30px rgba(74,222,128,0.45), inset 0 0 10px rgba(74,222,128,0.35)",
+      fill: "rgba(10, 20, 14, 0.72)",
+    },
+    {
+      border: "rgba(56, 189, 248, 0.95)", // blue
+      glow: "0 0 14px rgba(56,189,248,0.9), 0 0 30px rgba(56,189,248,0.45), inset 0 0 10px rgba(56,189,248,0.35)",
+      fill: "rgba(8, 16, 24, 0.72)",
+    },
+    {
+      border: "rgba(192, 132, 252, 0.95)", // purple
+      glow: "0 0 14px rgba(192,132,252,0.9), 0 0 30px rgba(192,132,252,0.45), inset 0 0 10px rgba(192,132,252,0.35)",
+      fill: "rgba(22, 12, 26, 0.72)",
+    },
+    {
+      border: "rgba(251, 146, 60, 0.95)", // orange
+      glow: "0 0 14px rgba(251,146,60,0.9), 0 0 30px rgba(251,146,60,0.45), inset 0 0 10px rgba(251,146,60,0.35)",
+      fill: "rgba(24, 14, 8, 0.72)",
+    },
+    {
+      border: "rgba(250, 204, 21, 0.95)", // yellow
+      glow: "0 0 14px rgba(250,204,21,0.9), 0 0 30px rgba(250,204,21,0.45), inset 0 0 10px rgba(250,204,21,0.35)",
+      fill: "rgba(24, 20, 8, 0.72)",
+    },
+    {
+      border: "rgba(248, 113, 113, 0.95)", // red
+      glow: "0 0 14px rgba(248,113,113,0.9), 0 0 30px rgba(248,113,113,0.45), inset 0 0 10px rgba(248,113,113,0.35)",
+      fill: "rgba(24, 10, 10, 0.72)",
+    },
+  ];
+  const headerFloaters = [
+    { top: "6%", size: 8, duration: 9, delay: 0.1 },
+    { top: "10%", size: 16, duration: 18, delay: 0 },
+    { top: "14%", size: 10, duration: 11, delay: 2.2 },
+    { top: "18%", size: 7, duration: 8, delay: 1.5 },
+    { top: "22%", size: 11, duration: 15, delay: 1.1 },
+    { top: "26%", size: 9, duration: 10, delay: 0.7 },
+    { top: "33%", size: 20, duration: 21, delay: 0.6 },
+    { top: "38%", size: 6, duration: 7, delay: 3.1 },
+    { top: "45%", size: 14, duration: 16, delay: 2.3 },
+    { top: "50%", size: 9, duration: 12, delay: 1.9 },
+    { top: "56%", size: 9, duration: 13, delay: 0.2 },
+    { top: "61%", size: 13, duration: 17, delay: 2.9 },
+    { top: "66%", size: 12, duration: 19, delay: 1.7 },
+    { top: "71%", size: 8, duration: 9, delay: 0.5 },
+    { top: "78%", size: 17, duration: 22, delay: 2.8 },
+    { top: "82%", size: 9, duration: 10, delay: 1.3 },
+    { top: "88%", size: 10, duration: 14, delay: 3.3 },
+    { top: "93%", size: 7, duration: 8, delay: 2.5 },
+    { top: "8%", size: 7, duration: 8.5, delay: 0.9 },
+    { top: "16%", size: 12, duration: 12.5, delay: 1.4 },
+    { top: "24%", size: 8, duration: 9.5, delay: 2.6 },
+    { top: "31%", size: 15, duration: 14.5, delay: 0.4 },
+    { top: "41%", size: 10, duration: 11.5, delay: 2.0 },
+    { top: "54%", size: 7, duration: 8.8, delay: 3.0 },
+    { top: "63%", size: 11, duration: 12.8, delay: 0.8 },
+    { top: "74%", size: 9, duration: 10.2, delay: 1.6 },
+    { top: "86%", size: 12, duration: 13.6, delay: 2.4 },
+  ];
 
   const navItems = [
     { icon: LayoutDashboard, label: "Dashboard", path: "/" },
@@ -49,11 +105,9 @@ export function Root() {
         className="border-r border-neutral-800 bg-neutral-900/50 backdrop-blur-xl flex flex-col transition-all duration-300"
       >
         <div className="p-6 flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-indigo-500 flex items-center justify-center">
-            <Globe className="w-5 h-5 text-white" />
-          </div>
+          <Cpu className="w-7 h-7 text-white flex-shrink-0" />
           {isSidebarOpen && (
-            <span className="font-bold text-lg tracking-tight whitespace-nowrap"> ARMSE</span>
+            <span className="font-bold text-2xl tracking-tight whitespace-nowrap">ARMSE</span>
           )}
         </div>
 
@@ -74,18 +128,43 @@ export function Root() {
           ))}
         </nav>
 
-        <div className="p-4 border-t border-neutral-800">
-          <div className="flex items-center gap-3 px-3 py-2 text-neutral-400 hover:text-white cursor-pointer transition-colors">
-            <Settings className="w-5 h-5 flex-shrink-0" />
-            {isSidebarOpen && <span className="font-medium">Settings</span>}
-          </div>
-        </div>
       </Motion.aside>
 
       {/* Main Content */}
       <main className="flex-1 flex flex-col overflow-hidden">
         {/* Header */}
-        <header className="h-16 border-b border-neutral-800 flex items-center justify-between px-8 bg-neutral-900/50 backdrop-blur-md">
+        <header className="relative h-16 overflow-hidden border-b border-neutral-800 bg-neutral-900/50 px-8 backdrop-blur-md">
+          <div className="pointer-events-none absolute inset-0 z-0">
+            <div className="absolute inset-0 bg-neutral-900/40" />
+            {headerFloaters.map((block, idx) => {
+              const color = neonPalette[idx % neonPalette.length];
+              return (
+                <Motion.div
+                  key={`${block.top}-${idx}`}
+                  className="absolute rounded-sm border"
+                  style={{
+                    left: "-14vw",
+                    top: block.top,
+                    width: block.size,
+                    height: block.size,
+                    borderColor: color.border,
+                    backgroundColor: color.fill,
+                    boxShadow: color.glow,
+                  }}
+                  initial={{ x: "0vw", opacity: 0 }}
+                  animate={{ x: "130vw", opacity: [0, 0.92, 0.56, 0.92, 0] }}
+                  transition={{
+                    duration: block.duration,
+                    delay: block.delay,
+                    repeat: Infinity,
+                    ease: "linear",
+                  }}
+                />
+              );
+            })}
+          </div>
+
+          <div className="relative z-10 flex h-full items-center justify-between">
           <div className="flex items-center gap-4">
             <button 
               onClick={() => setIsSidebarOpen(!isSidebarOpen)}
@@ -93,14 +172,6 @@ export function Root() {
             >
               {isSidebarOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
             </button>
-            <div className="relative group">
-              <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-neutral-500 group-focus-within:text-indigo-400 transition-colors" />
-              <input 
-                type="text" 
-                placeholder="Search resources..." 
-                className="bg-neutral-800/50 border border-neutral-700 rounded-full py-1.5 pl-10 pr-4 text-sm focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all w-64 lg:w-96"
-              />
-            </div>
           </div>
 
           <div className="flex items-center gap-6">
@@ -111,11 +182,6 @@ export function Root() {
               </div>
               <span className="text-xs font-medium text-emerald-500">SYSTEM HEALTHY</span>
             </div>
-            
-            <button className="relative p-2 text-neutral-400 hover:text-white transition-colors">
-              <Bell className="w-5 h-5" />
-              <span className="absolute top-2 right-2 w-2 h-2 bg-rose-500 rounded-full border-2 border-neutral-900" />
-            </button>
             
             <div
                 onClick={() => nav("/profile")}
@@ -138,6 +204,7 @@ export function Root() {
                 Logout
               </button>
             </div>
+          </div>
           </div>
         </header>
 

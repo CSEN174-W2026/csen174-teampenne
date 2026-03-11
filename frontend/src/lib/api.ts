@@ -586,3 +586,10 @@ export async function cancelScopedJobs(payload: {
     body: JSON.stringify(payload),
   });
 }
+
+export async function pushRunEvent(payload: Record<string, unknown>) {
+  return webHttp<{ ok: boolean }>("/api/runs/events", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
