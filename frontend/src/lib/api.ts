@@ -1,6 +1,8 @@
 // src/lib/api.ts
 const env = (import.meta as ImportMeta & { env?: Record<string, string> }).env ?? {};
+// Manager API requests default to the local proxy so frontend and backend can share an origin in dev.
 const API_BASE = env.VITE_API_BASE ?? "/manager-api";
+// Web API requests target the Next.js app endpoints that persist UI-facing data.
 const WEB_API_BASE = env.VITE_WEB_API_BASE ?? "/web-api";
 
 async function http<T>(path: string, init?: RequestInit): Promise<T> {
@@ -13,12 +15,14 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
   });
 
   if (!res.ok) {
+    // Surface the response body to make backend validation errors visible in the UI.
     const text = await res.text();
     throw new Error(`${res.status} ${res.statusText}: ${text}`);
   }
   return res.json() as Promise<T>;
 }
 
+// Separate helper because some frontend state is stored by the web app instead of the manager service.
 async function webHttp<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${WEB_API_BASE}${path}`, {
     ...init,
@@ -313,6 +317,7 @@ export async function resetManager() {
 // ----------------------------------------------------
 
 export async function getSystemLogs(sinceMs = 0, limit = 500) {
+  // Clamp client requests so a bad caller cannot ask the backend for an unbounded log page.
   const safeLimit = Math.max(1, Math.min(limit, 2000));
   return http<SystemLogsResponse>(
     `/system/logs?since_ms=${encodeURIComponent(sinceMs)}&limit=${encodeURIComponent(safeLimit)}`
@@ -330,23 +335,7 @@ export async function postSystemLog(payload: {
     body: JSON.stringify(payload),
   });
 }
-//   return http<{ events: any[]; time_ms?: number }>(`/agents/explanations/recent?limit=${limit}`, {
-//     method: "POST",
-//     body: JSON.stringify(cfg),
-//   });
-// }
 
-// export async function getLatencyStats(cfg: AgentConfig) {
-//   return http<any>("/agents/latency_stats", { method: "POST", body: JSON.stringify(cfg) });
-// }
-
-// export async function getStats(cfg: AgentConfig) {
-//   return http<any>("/agents/stats", { method: "POST", body: JSON.stringify(cfg) });
-// }
-
-// export async function resetManager() {
-//   return http<{ ok: boolean; time_ms: number }>("/reset", { method: "POST" });
-// }
 
 export async function startRun(payload: Record<string, unknown>) {
   return http<RunStartResponse>("/runs/start", {
@@ -532,31 +521,9 @@ export async function listEc2Nodes(token: string) {
 }
 
 
-// // Dockerize Functions
-// export async function createDockerNode(token: string, port: number) {
-//   return http("/docker/nodes/create", {
-//     method: "POST",
-//     headers: { Authorization: `Bearer ${token}` },
-//     body: JSON.stringify({ port }),
-//   });
-// }
-
-// export async function stopDockerNode(token: string, name: string) {
-//   return http(`/docker/nodes/${name}/stop`, {
-//     method: "POST",
-//     headers: { Authorization: `Bearer ${token}` },
-//   });
-// }
-
-// export async function deleteDockerNode(token: string, name: string) {
-//   return http(`/docker/nodes/${name}`, {
-//     method: "DELETE",
-//     headers: { Authorization: `Bearer ${token}` },
-//   });
-// }
-
 
 export async function getNodeRecentJobs(host: string, port: number, limit = 20) {
+  // This talks to a node directly because the manager API does not proxy the node's recent-jobs endpoint.
   const res = await fetch(`http://${host}:${port}/jobs?limit=${limit}`);
   if (!res.ok) {
     throw new Error(`Failed to fetch node jobs: ${res.status} ${res.statusText}`);

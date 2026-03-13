@@ -75,9 +75,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# POLL_S = 2.0
-# OBSERVE_DEUP: Set[str] = set()
-# OBSERVE_LOCK = threading.Lock()
 
 # Cache ManagerAgent instances so learning persists per config
 POLL_S = 2.0 # How often to poll nodes for metrics
@@ -86,6 +83,7 @@ METRICS_SINK_TIMEOUT_S = float(os.getenv("METRICS_SINK_TIMEOUT_S", "0.8"))
 VMINFO_SINK_URL = os.getenv("VMINFO_SINK_URL", "http://127.0.0.1:3000/api/vm-info/sync")
 OBSERVE_DEUP: Set[str] = set() # To track which nodes we've already observed during discovery
 OBSERVE_LOCK = threading.Lock() # To synchronize access to OBSERVE_DEUP -> protect against race conditions
+
 # Track last config used per user
 USER_LAST_CFG: Dict[str, Dict[str, Any]] = {}
 USER_LAST_CFG_LOCK = threading.Lock()

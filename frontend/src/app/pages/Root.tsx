@@ -22,7 +22,7 @@ export function Root() {
   const location = useLocation();
   const { user, isAdmin, logout } = useAuth();
   const nav = useNavigate();
-  const canManageEc2 = (user?.email ?? "").trim().toLowerCase() === "shypine8@gmail.com";
+  const canManageEc2 = (user?.email ?? "").trim().toLowerCase() === "jackdoquan1234@gmail.com";
   const neonPalette = [
     {
       border: "rgba(74, 222, 128, 0.95)", // green

@@ -45,7 +45,7 @@ locals {
 }
 
 resource "aws_security_group" "node_sg" {
-  name        = "${var.project_name}-node-sg"
+  name        = "${var.project_name}-node-sg-2"
   description = "Security group for CSEN174 node workers"
   vpc_id      = var.vpc_id
 
