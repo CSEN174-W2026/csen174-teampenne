@@ -23,7 +23,7 @@ fi
 mkdir -p /opt/csen174
 cd /opt
 
-git clone --branch Josh-Manager-Agent --depth 1 https://github.com/CSEN174-W2026/csen174-teampenne.git /opt/csen174
+git clone --branch vm-info --depth 1 https://github.com/CSEN174-W2026/csen174-teampenne.git /opt/csen174
 
 cd /opt/csen174/backend
 if ! python3 -m venv venv; then

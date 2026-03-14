@@ -162,19 +162,6 @@ export type RunStatusResponse = {
   events: Array<Record<string, unknown>>;
 };
 
-export type StoredNodeSample = {
-  id: number;
-  nodeName: string;
-  host: string;
-  port: number;
-  cpuPct?: number | null;
-  memPct?: number | null;
-  queueLen?: number | null;
-  capturedAtMs: string;
-  source: string;
-  createdAt: string;
-};
-
 export type AuthUser = {
   id: string;
   email: string;
@@ -224,10 +211,6 @@ export type Ec2Node = {
   instance_type?: string | null;
 };
 
-export async function getHealth() {
-  return http<{ ok: boolean; time_ms: number }>("/health");
-}
-
 export async function getNodes() {
   return http<NodesResponse>("/nodes");
 }
@@ -259,10 +242,6 @@ export async function getLearnerStats(cfg: AgentConfig) {
     method: "POST",
     body: JSON.stringify(cfg),
   });
-}
-
-export async function listAgents() {
-  return http<any>("/agents");
 }
 
 export async function getPending(cfg: AgentConfig) {
@@ -324,18 +303,6 @@ export async function getSystemLogs(sinceMs = 0, limit = 500) {
   );
 }
 
-export async function postSystemLog(payload: {
-  level?: SystemLogLevel | string;
-  topic?: string;
-  message: string;
-  data?: Record<string, any> | null;
-}) {
-  return http<{ ok: boolean; time_ms: number }>("/system/logs", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-}
-
 
 export async function startRun(payload: Record<string, unknown>) {
   return http<RunStartResponse>("/runs/start", {
@@ -353,10 +320,6 @@ export async function getRunStatus(runId: string) {
   return http<RunStatusResponse>(`/runs/${runId}`);
 }
 
-export async function getStoredNodeSamples(limit = 20) {
-  return webHttp<{ rows: StoredNodeSample[] }>(`/api/metrics/node-samples?limit=${limit}`);
-}
-
 export async function listNodeGroups(userId: string) {
   return webHttp<{ rows: NodeGroup[] }>(`/api/node-groups?userId=${encodeURIComponent(userId)}`);
 }
@@ -370,16 +333,6 @@ export async function createNodeGroup(payload: {
 }) {
   return webHttp<{ row: NodeGroup }>("/api/node-groups", {
     method: "POST",
-    body: JSON.stringify(payload),
-  });
-}
-
-export async function updateNodeGroup(
-  groupId: number,
-  payload: { name?: string; color?: string; nodes?: SavedNodeRef[] }
-) {
-  return webHttp<{ row: NodeGroup }>(`/api/node-groups/${groupId}`, {
-    method: "PUT",
     body: JSON.stringify(payload),
   });
 }
@@ -409,13 +362,6 @@ export async function saveNodeGroupSelection(payload: {
 
 export async function me(token: string) {
   return http<AuthUser>("/auth/me", {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-}
-
-export async function logout(token: string) {
-  return http<{ ok: boolean; message: string }>("/auth/logout", {
-    method: "POST",
     headers: { Authorization: `Bearer ${token}` },
   });
 }
@@ -458,12 +404,6 @@ export async function deleteUser(token: string, userId: string) {
 
 export async function getMyLastAgentConfig(token: string) {
   return http<{ time_ms: number; config: AgentConfig | null }>("/users/me/last_agent_config", {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-}
-
-export async function getMyActivity(token: string, limit = 200) {
-  return http<{ time_ms: number; events: any[] }>(`/users/me/activity?limit=${limit}`, {
     headers: { Authorization: `Bearer ${token}` },
   });
 }
@@ -518,17 +458,6 @@ export async function listEc2Nodes(token: string) {
   return http<{ nodes: Ec2Node[]; count: number; time_ms: number }>("/ec2/nodes", {
     headers: { Authorization: `Bearer ${token}` },
   });
-}
-
-
-
-export async function getNodeRecentJobs(host: string, port: number, limit = 20) {
-  // This talks to a node directly because the manager API does not proxy the node's recent-jobs endpoint.
-  const res = await fetch(`http://${host}:${port}/jobs?limit=${limit}`);
-  if (!res.ok) {
-    throw new Error(`Failed to fetch node jobs: ${res.status} ${res.statusText}`);
-  }
-  return res.json() as Promise<JobExecutionRecord[]>;
 }
 
 export async function getNodeJobStatus(host: string, port: number, jobId: string) {

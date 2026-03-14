@@ -1,4 +1,4 @@
-import { Activity, Layers, Play, Square, RefreshCcw, MoreVertical } from "lucide-react";
+import { Layers, Play, Square, RefreshCcw, MoreVertical } from "lucide-react";
 
 export function Services() {
   const services = [
